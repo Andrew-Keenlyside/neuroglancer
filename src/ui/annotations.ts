@@ -43,6 +43,7 @@ import {
   AnnotationType,
   annotationTypeHandlers,
   formatNumericProperty,
+  isAnnotationTagPropertySpec,
   propertyTypeDataType,
 } from "#src/annotation/index.js";
 import {
@@ -545,7 +546,6 @@ export class AnnotationLayerView extends Tab {
     this.virtualList.element.addEventListener("mouseleave", () => {
       this.displayState.hoverState.value = undefined;
     });
-
     const bindings = getDefaultAnnotationListBindings();
     this.registerDisposer(
       new MouseEventBinder(this.virtualList.element, bindings),
@@ -2306,9 +2306,17 @@ export function UserLayerWithAnnotationsMixin<
                 label.appendChild(idValueElement);
                 parent.appendChild(label);
 
+                const activeTags: string[] = [];
+
                 for (let i = 0, count = allProperties.length; i < count; ++i) {
                   const property = allProperties[i];
                   const value = allValues[i];
+                  if (isAnnotationTagPropertySpec(property) && property.tag) {
+                    if (value !== 0) {
+                      activeTags.push(property.tag);
+                    }
+                    continue;
+                  }
                   // Readonly if regular property and source is readonly
                   // or if we have a default property
                   const annotationPropertyIndex =
@@ -2501,6 +2509,46 @@ export function UserLayerWithAnnotationsMixin<
                     valueElementWrapper.appendChild(valueElement);
                   }
                   label.appendChild(valueElementWrapper);
+                  parent.appendChild(label);
+                }
+
+                if (activeTags.length) {
+                  const label = document.createElement("label");
+                  label.classList.add("neuroglancer-annotation-property");
+                  const idElement = document.createElement("span");
+                  idElement.classList.add(
+                    "neuroglancer-annotation-property-label",
+                  );
+                  idElement.textContent = "tags";
+                  label.appendChild(idElement);
+                  const valueElement = document.createElement("span");
+                  valueElement.classList.add(
+                    "neuroglancer-annotation-property-value",
+                  );
+                  valueElement.textContent = activeTags
+                    .map((x) => `#${x}`)
+                    .join(" ");
+                  label.appendChild(valueElement);
+                  parent.appendChild(label);
+                }
+
+                if (activeTags.length) {
+                  const label = document.createElement("label");
+                  label.classList.add("neuroglancer-annotation-property");
+                  const idElement = document.createElement("span");
+                  idElement.classList.add(
+                    "neuroglancer-annotation-property-label",
+                  );
+                  idElement.textContent = "tags";
+                  label.appendChild(idElement);
+                  const valueElement = document.createElement("span");
+                  valueElement.classList.add(
+                    "neuroglancer-annotation-property-value",
+                  );
+                  valueElement.textContent = activeTags
+                    .map((x) => `#${x}`)
+                    .join(" ");
+                  label.appendChild(valueElement);
                   parent.appendChild(label);
                 }
 
@@ -2876,6 +2924,26 @@ export function makeAnnotationListElement(
     description.classList.add("neuroglancer-annotation-description");
     description.textContent = annotation.description;
     element.appendChild(description);
+  }
+  const {
+    properties: { value: properties },
+  } = state.source;
+  const activeTags: string[] = [];
+  for (let i = 0, count = properties.length; i < count; ++i) {
+    const property = properties[i];
+    const value = annotation.properties[i];
+    activeTags;
+    if (isAnnotationTagPropertySpec(property) && property.tag) {
+      if (value !== 0) {
+        activeTags.push(property.tag);
+      }
+    }
+  }
+  if (activeTags.length) {
+    const tags = document.createElement("div");
+    tags.classList.add("neuroglancer-annotation-tags");
+    tags.textContent = activeTags.map((x) => `#${x}`).join(" ");
+    element.appendChild(tags);
   }
   icon.style.gridRow = `span ${numRows}`;
   if (deleteButton !== undefined) {

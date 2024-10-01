@@ -115,6 +115,7 @@ export interface AnnotationNumericPropertySpec
   min?: number;
   max?: number;
   step?: number;
+  tag?: string;
 }
 
 export function isAnnotationTypeNumeric(
@@ -149,6 +150,18 @@ export type AnnotationPropertySpec =
   | AnnotationColorPropertySpec
   | AnnotationNumericPropertySpec
   | AnnotationBoolPropertySpec;
+
+export interface AnnotationTagPropertySpec
+  extends AnnotationNumericPropertySpec {
+  type: "int8";
+  tag: string;
+}
+
+export function isAnnotationTagPropertySpec(
+  spec: AnnotationPropertySpec,
+): spec is AnnotationTagPropertySpec {
+  return spec.type === "uint8" && spec.tag !== undefined;
+}
 
 export interface AnnotationPropertyTypeHandler {
   serializedBytes(rank: number): number;
@@ -645,6 +658,7 @@ function parseAnnotationPropertySpec(obj: unknown): AnnotationPropertySpec {
   );
   let enumValues: number[] | undefined;
   let enumLabels: string[] | undefined;
+  let tag: string | undefined;
   switch (type) {
     case "rgb":
     case "rgba":
@@ -669,6 +683,7 @@ function parseAnnotationPropertySpec(obj: unknown): AnnotationPropertySpec {
           ),
         );
       }
+      tag = verifyOptionalObjectProperty(obj, "tag", verifyString);
     }
   }
   return {
@@ -678,6 +693,7 @@ function parseAnnotationPropertySpec(obj: unknown): AnnotationPropertySpec {
     default: defaultValue,
     enumValues,
     enumLabels,
+    tag,
   } as AnnotationPropertySpec;
 }
 
@@ -690,6 +706,7 @@ function annotationPropertySpecToJson(spec: Readonly<AnnotationPropertySpec>) {
       ? spec.enumValues.map(handler.serializeJson)
       : undefined;
   const enumLabels = isNumeric ? spec.enumLabels : undefined;
+  const tag = isNumeric ? spec.tag : undefined;
   return {
     id: spec.identifier,
     description: spec.description,
@@ -698,6 +715,7 @@ function annotationPropertySpecToJson(spec: Readonly<AnnotationPropertySpec>) {
       defaultValue === 0 ? undefined : handler.serializeJson(defaultValue),
     enum_labels: enumLabels,
     enum_values: enumValues,
+    tag,
   };
 }
 
@@ -1713,6 +1731,11 @@ export class LocalAnnotationSource extends AnnotationSource {
     }
     this.properties.changed.dispatch();
   }
+
+  getTagProperties = () => {
+    const { properties } = this;
+    return properties.value.filter(isAnnotationTagPropertySpec);
+  };
 
   ensureUpdated() {
     const transform = this.watchableTransform.value;
