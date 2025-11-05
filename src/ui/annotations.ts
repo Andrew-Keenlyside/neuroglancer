@@ -187,6 +187,21 @@ export class MergedAnnotationStates
   }
 }
 
+function getFirstVertexPosition(pos: Float32Array, annotation: Annotation) {
+  switch (annotation.type) {
+    case AnnotationType.AXIS_ALIGNED_BOUNDING_BOX:
+    case AnnotationType.LINE:
+      pos.set(annotation.pointA);
+      break;
+    case AnnotationType.POINT:
+      pos.set(annotation.point);
+      break;
+    case AnnotationType.ELLIPSOID:
+      pos.set(annotation.center);
+      break;
+  }
+}
+
 function getCenterPosition(center: Float32Array, annotation: Annotation) {
   switch (annotation.type) {
     case AnnotationType.AXIS_ALIGNED_BOUNDING_BOX:
@@ -207,6 +222,7 @@ function getCenterPosition(center: Float32Array, annotation: Annotation) {
       break;
   }
 }
+getCenterPosition;
 
 function setLayerPosition(
   layer: UserLayer,
@@ -260,7 +276,7 @@ const moveToAnnotation = (
   const { layerRank } = chunkTransform;
   const chunkPosition = new Float32Array(layerRank);
   const layerPosition = new Float32Array(layerRank);
-  getCenterPosition(chunkPosition, annotation);
+  getFirstVertexPosition(chunkPosition, annotation);
   matrix.transformPoint(
     layerPosition,
     chunkTransform.chunkToLayerTransform,
