@@ -829,7 +829,7 @@ void main() {
 }
 ```
 
-**With adjustable center and half-range sliders:**
+**With adjustable center and half-range sliders (symmetric):**
 ```glsl
 #uicontrol float center    slider(min=-1000, max=1000, default=0, step=1)
 #uicontrol float halfRange slider(min=1, max=2000, default=500, step=1)
@@ -842,6 +842,33 @@ void main() {
   emitRGB(colormapCoolwarm(clamp(t, 0.0, 1.0)));
 }
 ```
+
+**With independent cool min, midpoint, and hot max (asymmetric):**
+
+Use this when the data range above the midpoint differs from the range below it — for example, a skewed distribution, or when you want to emphasize one side more than the other.
+
+```glsl
+#uicontrol float midpoint slider(min=-1000, max=1000, default=0,    step=1)
+#uicontrol float coolMin  slider(min=-2000, max=0,    default=-500, step=1)
+#uicontrol float hotMax   slider(min=0,     max=2000, default=500,  step=1)
+
+// paste colormapCoolwarm here
+
+void main() {
+  float raw = float(toRaw(getDataValue()));
+  float t;
+  if (raw <= midpoint) {
+    // Map [coolMin, midpoint] → [0.0, 0.5]
+    t = 0.5 * (raw - coolMin) / max(midpoint - coolMin, 1e-6);
+  } else {
+    // Map [midpoint, hotMax] → [0.5, 1.0]
+    t = 0.5 + 0.5 * (raw - midpoint) / max(hotMax - midpoint, 1e-6);
+  }
+  emitRGB(colormapCoolwarm(clamp(t, 0.0, 1.0)));
+}
+```
+
+The `max(..., 1e-6)` guards against division by zero if the user collapses a range to zero. Adjust the `slider` `min`/`max`/`default` values to match the actual data range.
 
 ---
 
