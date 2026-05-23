@@ -200,12 +200,16 @@ void main() {
 
 **Per-value categorical coloring**:
 ```glsl
+#uicontrol vec3 color0 color(default="gray")
+#uicontrol vec3 color1 color(default="red")
+#uicontrol vec3 color2 color(default="green")
+#uicontrol vec3 color3 color(default="blue")
 void main() {
   float v = toRaw(getDataValue());
-  vec3 color = vec3(0.2, 0.2, 0.2);
-  if (v == 1.0) color = vec3(1.0, 0.2, 0.2);
-  if (v == 2.0) color = vec3(0.2, 1.0, 0.2);
-  if (v == 3.0) color = vec3(0.2, 0.2, 1.0);
+  vec3 color = color0;
+  if (v == 1.0) color = color1;
+  if (v == 2.0) color = color2;
+  if (v == 3.0) color = color3;
   emitRGB(color);
 }
 ```
@@ -426,14 +430,17 @@ void main() {
 
 **Categorical coloring by integer label**:
 ```glsl
+#uicontrol vec3 color1   color(default="red")
+#uicontrol vec3 color2   color(default="green")
+#uicontrol vec3 color3   color(default="blue")
+#uicontrol vec3 colorOther color(default="gray")
 #uicontrol float opacity slider(min=0.0, max=1.0, default=1.0, step=0.05)
 void main() {
   uint label = prop_label();
-  vec3 c;
-  if (label == 1u)      c = vec3(0.92, 0.16, 0.22);  // red
-  else if (label == 2u) c = vec3(0.16, 0.72, 0.31);  // green
-  else if (label == 3u) c = vec3(0.16, 0.38, 0.92);  // blue
-  else                  c = vec3(0.6, 0.6, 0.6);      // gray (unknown)
+  vec3 c = colorOther;
+  if (label == 1u)      c = color1;
+  else if (label == 2u) c = color2;
+  else if (label == 3u) c = color3;
   setColor(vec4(c, opacity));
 }
 ```
