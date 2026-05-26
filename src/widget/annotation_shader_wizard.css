@@ -1,0 +1,102 @@
+/**
+ * @license
+ * Copyright 2026 Google Inc.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+.neuroglancer-annotation-wizard {
+  font-family: sans-serif;
+  border: 1px solid #444;
+  margin: 4px 0;
+  padding: 6px;
+  background-color: #181818;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.neuroglancer-annotation-wizard-row {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  align-items: center;
+  gap: 4px 6px;
+  color: #ddd;
+}
+
+.neuroglancer-annotation-wizard-row-label {
+  color: #aaa;
+}
+
+.neuroglancer-annotation-wizard-row-detail {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.neuroglancer-annotation-wizard-row-detail:empty {
+  display: none;
+}
+
+.neuroglancer-annotation-wizard-row-detail label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #aaa;
+}
+
+.neuroglancer-annotation-wizard-row select,
+.neuroglancer-annotation-wizard-row input[type="number"] {
+  background-color: #222;
+  color: #fff;
+  border: 1px solid #555;
+  font: inherit;
+  padding: 1px 3px;
+}
+
+.neuroglancer-annotation-wizard-row input[type="number"] {
+  width: 56px;
+}
+
+.neuroglancer-annotation-wizard-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.neuroglancer-annotation-wizard-generate {
+  background-color: #2d5a8c;
+  color: #fff;
+  border: 1px solid #4a7ab0;
+  padding: 4px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.neuroglancer-annotation-wizard-generate:hover {
+  background-color: #386aa0;
+}
+
+.neuroglancer-annotation-wizard-generate:disabled {
+  background-color: #333;
+  color: #888;
+  border-color: #444;
+  cursor: not-allowed;
+}
+
+.neuroglancer-annotation-wizard-note {
+  color: #888;
+  font-style: italic;
+  font-size: 11px;
+}

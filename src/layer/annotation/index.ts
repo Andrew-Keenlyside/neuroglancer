@@ -45,7 +45,6 @@ import { getWatchableRenderLayerTransform } from "#src/render_coordinate_transfo
 import { RenderLayerRole } from "#src/renderlayer.js";
 import type { SegmentationDisplayState } from "#src/segmentation_display_state/frontend.js";
 import {
-  ElementVisibilityFromTrackableBoolean,
   TrackableBoolean,
   TrackableBooleanCheckbox,
 } from "#src/trackable_boolean.js";
@@ -76,6 +75,8 @@ import {
   verifyStringArray,
 } from "#src/util/json.js";
 import { NullarySignal } from "#src/util/signal.js";
+import { ShaderWizardWidget } from "#src/widget/annotation_shader_wizard.js";
+import { CheckboxIcon } from "#src/widget/checkbox_icon.js";
 import { DependentViewWidget } from "#src/widget/dependent_view_widget.js";
 import {
   addLayerControlToOptionsTab,
@@ -829,28 +830,53 @@ class RenderingOptionsTab extends Tab {
         },
       ),
     ).element;
-
-    layer.registerDisposer(
-      new ElementVisibilityFromTrackableBoolean(
-        layer.codeVisible,
-        shaderProperties,
-      ),
-    );
-
     element.appendChild(shaderProperties);
-    element.appendChild(
-      makeShaderCodeWidgetTopRow(
-        this.layer,
-        this.codeWidget,
-        ShaderCodeOverlay,
-        {
-          title: "Documentation on image layer rendering",
-          href: "https://github.com/google/neuroglancer/blob/master/src/annotation/rendering.md",
-        },
-        "neuroglancer-annotation-dropdown-shader-top-row",
+
+    const wizard = this.registerDisposer(
+      new ShaderWizardWidget(
+        layer.annotationDisplayState.shader,
+        layer.codeVisible,
+        layer.annotationDisplayState.annotationProperties,
       ),
     );
 
+    const topRow = makeShaderCodeWidgetTopRow(
+      this.layer,
+      this.codeWidget,
+      ShaderCodeOverlay,
+      {
+        title: "Documentation on image layer rendering",
+        href: "https://github.com/google/neuroglancer/blob/master/src/annotation/rendering.md",
+      },
+      "neuroglancer-annotation-dropdown-shader-top-row",
+    );
+    const wandButton = this.registerDisposer(
+      new CheckboxIcon(wizard.visible, {
+        svg: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5 19L12 12"/><path d="M16 2V14"/><path d="M10 8H22"/></svg>`,
+        text: "Wizard",
+        enableTitle: "Open shader wizard",
+        disableTitle: "Close shader wizard",
+        backgroundScheme: "dark",
+      }),
+    ).element;
+    wandButton.style.gap = "4px";
+    wandButton.style.padding = "1px 8px";
+    wandButton.style.marginRight = "4px";
+    wandButton.style.border = "1px solid #555";
+    // Hide the code editor whenever the wizard becomes visible.
+    this.registerDisposer(
+      wizard.visible.changed.add(() => {
+        if (wizard.visible.value) {
+          layer.codeVisible.value = false;
+        }
+      }),
+    );
+    // Place the wand as the first button on the right group: just after the
+    // flex spacer, before the existing code-visibility toggle.
+    topRow.insertBefore(wandButton, topRow.children[1] ?? null);
+    element.appendChild(topRow);
+
+    element.appendChild(wizard.element);
     element.appendChild(this.codeWidget.element);
     element.appendChild(
       this.registerDisposer(
