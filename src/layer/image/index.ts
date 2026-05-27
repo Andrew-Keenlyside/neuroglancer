@@ -80,8 +80,10 @@ import {
   ShaderControlState,
 } from "#src/webgl/shader_ui_controls.js";
 import { ChannelDimensionsWidget } from "#src/widget/channel_dimensions_widget.js";
+import { CheckboxIcon } from "#src/widget/checkbox_icon.js";
 import { makeCopyButton } from "#src/widget/copy_button.js";
 import type { DependentViewContext } from "#src/widget/dependent_view_widget.js";
+import { ImageShaderWizardWidget } from "#src/widget/image_shader_wizard.js";
 import type { LayerControlDefinition } from "#src/widget/layer_control.js";
 import {
   addLayerControlToOptionsTab,
@@ -542,18 +544,50 @@ class RenderingOptionsTab extends Tab {
       );
     }
 
-    element.appendChild(
-      makeShaderCodeWidgetTopRow(
-        this.layer,
-        this.codeWidget,
-        ShaderCodeOverlay,
-        {
-          title: "Documentation on image layer rendering",
-          href: "https://github.com/google/neuroglancer/blob/master/src/sliceview/image_layer_rendering.md",
-        },
-        "neuroglancer-image-dropdown-top-row",
+    const wizard = this.registerDisposer(
+      new ImageShaderWizardWidget(
+        layer.fragmentMain,
+        layer.codeVisible,
+        layer.channelSpace,
       ),
     );
+
+    const topRow = makeShaderCodeWidgetTopRow(
+      this.layer,
+      this.codeWidget,
+      ShaderCodeOverlay,
+      {
+        title: "Documentation on image layer rendering",
+        href: "https://github.com/google/neuroglancer/blob/master/src/sliceview/image_layer_rendering.md",
+      },
+      "neuroglancer-image-dropdown-top-row",
+    );
+    const wandButton = this.registerDisposer(
+      new CheckboxIcon(wizard.visible, {
+        svg: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5 19L12 12"/><path d="M16 2V14"/><path d="M10 8H22"/></svg>`,
+        text: "Wizard",
+        enableTitle: "Open shader wizard",
+        disableTitle: "Close shader wizard",
+        backgroundScheme: "dark",
+      }),
+    ).element;
+    wandButton.style.gap = "4px";
+    wandButton.style.padding = "1px 8px";
+    wandButton.style.marginRight = "4px";
+    wandButton.style.border = "1px solid #555";
+    this.registerDisposer(
+      wizard.visible.changed.add(() => {
+        if (wizard.visible.value) {
+          layer.codeVisible.value = false;
+        }
+      }),
+    );
+    // Place the wand as the first button on the right group: just after the
+    // flex spacer, before the existing code-visibility toggle.
+    topRow.insertBefore(wandButton, topRow.children[1] ?? null);
+    element.appendChild(topRow);
+
+    element.appendChild(wizard.element);
     element.appendChild(
       this.registerDisposer(
         new ChannelDimensionsWidget(layer.channelCoordinateSpaceCombiner),
