@@ -52,8 +52,12 @@ import { getWheelZoomAmount } from "#src/util/wheel_zoom.js";
 import type { WatchableVisibilityPriority } from "#src/visibility_priority/frontend.js";
 import { GLBuffer, getMemoizedBuffer } from "#src/webgl/buffer.js";
 import {
+  type ColormapBinName,
   type ColormapName,
-  computeColormapColor,
+  colormapDataLoaded,
+  getColormapBytes,
+  getColormapDataPromise,
+  getGrayscaleFallbackBytes,
 } from "#src/webgl/colormaps.js";
 import type { GL } from "#src/webgl/context.js";
 import type { HistogramSpecifications } from "#src/webgl/empirical_cdf.js";
@@ -114,6 +118,26 @@ const defaultTransferFunctionSizes: Record<DataType, number> = {
 };
 
 /**
+ * Samples a named colormap's 256-entry RGB byte LUT at normalized position `t`,
+ * with linear interpolation between adjacent entries. Returns RGB as 0-1 floats.
+ * Falls back to a grayscale ramp until the colormap byte data has loaded; the
+ * caller is responsible for refreshing once {@link colormapDataLoaded} fires.
+ */
+function sampleColormap(
+  name: ColormapBinName,
+  t: number,
+): [number, number, number] {
+  const bytes = getColormapBytes(name) ?? getGrayscaleFallbackBytes();
+  const x = Math.min(1, Math.max(0, t)) * 255;
+  const lo = Math.floor(x);
+  const hi = Math.min(255, lo + 1);
+  const f = x - lo;
+  const ch = (c: number) =>
+    (bytes[lo * 3 + c] * (1 - f) + bytes[hi * 3 + c] * f) / 255;
+  return [ch(0), ch(1), ch(2)];
+}
+
+/**
  * Options to update a lookup table texture with a direct lookup table
  */
 export interface LookupTableTextureOptions {
@@ -140,7 +164,7 @@ export interface ControlPointTextureOptions {
    * When set, the lookup table RGB is driven by this colormap (control-point
    * RGB is ignored; control points still define the alpha curve).
    */
-  colormap?: ColormapName;
+  colormap?: ColormapBinName;
   /** When true, the colormap is evaluated in reverse (1 - t). */
   reverseColormap?: boolean;
 }
@@ -360,7 +384,7 @@ export class LookupTable {
   updateFromControlPoints(
     sortedControlPoints: SortedControlPoints,
     window: DataTypeInterval | undefined = undefined,
-    colormap: ColormapName | undefined = undefined,
+    colormap: ColormapBinName | undefined = undefined,
     reverseColormap: boolean = false,
   ) {
     const range = window ? window : sortedControlPoints.range;
@@ -383,7 +407,7 @@ export class LookupTable {
             ? 0
             : Math.min(1, Math.max(0, (i - colormapFirstIndex) / span));
         if (reverseColormap) t = 1 - t;
-        const [r, g, b] = computeColormapColor(colormap, t);
+        const [r, g, b] = sampleColormap(colormap, t);
         out[index] = Math.round(r * 255);
         out[index + 1] = Math.round(g * 255);
         out[index + 2] = Math.round(b * 255);
@@ -677,12 +701,25 @@ class DirectLookupTableTexture extends BaseLookupTexture {
 
 export class ControlPointTexture extends BaseLookupTexture {
   declare protected priorOptions: ControlPointTextureOptions | undefined;
+  // Whether the last built lookup table used the grayscale fallback because the
+  // colormap byte data had not loaded yet. Used to force a rebuild once the real
+  // colormap data becomes available.
+  private priorColormapUsedFallback = false;
   constructor(public gl: GL | null) {
     super(gl);
   }
   optionsEqual(newOptions: ControlPointTextureOptions): boolean {
     const existingOptions = this.priorOptions;
     if (existingOptions === undefined) return false;
+    // If the previous build fell back to grayscale (colormap data not yet
+    // loaded) but the real colormap bytes are now available, force a rebuild.
+    if (
+      newOptions.colormap !== undefined &&
+      this.priorColormapUsedFallback &&
+      getColormapBytes(newOptions.colormap) !== undefined
+    ) {
+      return false;
+    }
     const controlPointsEqual = arraysEqualWithPredicate(
       existingOptions.sortedControlPoints.controlPoints,
       newOptions.sortedControlPoints.controlPoints,
@@ -717,6 +754,9 @@ export class ControlPointTexture extends BaseLookupTexture {
     this.setTextureWidthAndHeightFromSize(lookupTableSize);
     const lookupTable = new LookupTable(lookupTableSize);
     const sortedControlPoints = options.sortedControlPoints;
+    this.priorColormapUsedFallback =
+      options.colormap !== undefined &&
+      getColormapBytes(options.colormap) === undefined;
     lookupTable.updateFromControlPoints(
       sortedControlPoints,
       undefined,
@@ -788,6 +828,7 @@ class TransferFunctionPanel extends IndirectRenderedPanel {
         (value: TransferFunctionParameters) => {
           parent.trackable.value = value;
         },
+        parent.display,
       ),
     );
     this.dataValuesBuffer = this.registerDisposer(
@@ -972,7 +1013,7 @@ class TransferFunctionPanel extends IndirectRenderedPanel {
                 Math.max(0, (inputValue - firstNodeInput) / nodeInputSpan),
               );
         if (reverseColormap) t = 1 - t;
-        const [r, g, b] = computeColormapColor(colormap, t);
+        const [r, g, b] = sampleColormap(colormap, t);
         colorArray[colorIndex] = r;
         colorArray[colorIndex + 1] = g;
         colorArray[colorIndex + 2] = b;
@@ -1380,6 +1421,7 @@ class TransferFunctionController extends RefCounted {
     private transferFunction: TransferFunction,
     public getModel: () => TransferFunctionParameters,
     public setModel: (value: TransferFunctionParameters) => void,
+    private display: DisplayContext,
   ) {
     super();
     element.title = inputEventMap.describe();
@@ -1389,8 +1431,14 @@ class TransferFunctionController extends RefCounted {
       "add-or-drag-point",
       (actionEvent) => {
         const mouseEvent = actionEvent.detail;
+        // Treat editing control points like spinning the volume: flag
+        // continuous motion so volume rendering drops to the faster,
+        // lower-resolution interactive path while dragging (full quality is
+        // restored shortly after the drag ends via the motion debounce).
+        this.display.flagContinuousCameraMotion();
         this.updateValue(this.addControlPoint(mouseEvent));
         startRelativeMouseDrag(mouseEvent, (newEvent: MouseEvent) => {
+          this.display.flagContinuousCameraMotion();
           this.updateValue(this.moveControlPoint(newEvent));
         });
       },
@@ -1445,6 +1493,7 @@ class TransferFunctionController extends RefCounted {
       "zoom-via-wheel",
       (actionEvent) => {
         const wheelEvent = actionEvent.detail;
+        this.display.flagContinuousCameraMotion();
         const zoomAmount = getWheelZoomAmount(wheelEvent);
         const relativeX = this.getTargetFraction(wheelEvent);
         const { dataType } = this;
@@ -1784,6 +1833,16 @@ class TransferFunctionWidget extends Tab {
         this.generateDefaultControlPoints(this.autoRangeFinder.computedRange);
       }),
     );
+    // Colormap byte data loads asynchronously. Start the fetch and, once it
+    // arrives, rebuild the panel preview and trigger a layer redraw (which
+    // rebuilds the GPU lookup-table texture with the real colormap colors).
+    void getColormapDataPromise();
+    this.registerDisposer(
+      colormapDataLoaded.add(() => {
+        this.updateControlPointsAndDraw();
+        this.display.scheduleRedraw();
+      }),
+    );
   }
   private createClearButton() {
     const clearButton = document.createElement("button");
@@ -2075,6 +2134,12 @@ export function enableTransferFunctionShader(
   reverseColormap: boolean = false,
 ) {
   const { gl } = shader;
+  // Ensure the colormap byte data is being fetched (idempotent) so the lookup
+  // table can be rebuilt with real colors once it arrives, even when no
+  // colormap widget/legend is open to trigger the load.
+  if (colormap !== undefined) {
+    void getColormapDataPromise();
+  }
   const texture = shader.transferFunctionTextures.get(
     `TransferFunction.${name}`,
   );
