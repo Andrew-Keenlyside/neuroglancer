@@ -21,9 +21,11 @@ import {
   type AnnotationPropertySpec,
 } from "#src/annotation/index.js";
 import {
+  additiveDefaultColor,
   defaultWizardConfig,
   generateWizardShader,
   type WizardBorderRule,
+  type WizardColorChannel,
   type WizardColorRule,
   type WizardConfig,
   type WizardSizeRule,
@@ -143,6 +145,13 @@ function makeRule(label: string): {
   return { row, mode, detail };
 }
 
+interface AdditiveChannelHandle {
+  element: HTMLElement;
+  propertySelect: HTMLSelectElement;
+  colorInput: HTMLInputElement;
+  clampCheckbox: HTMLInputElement;
+}
+
 function makeColorRule(
   initialProps: readonly AnnotationPropertySpec[],
 ): RuleHandle<WizardColorRule> {
@@ -151,6 +160,7 @@ function makeColorRule(
     ["default", "Default (layer color)"],
     ["constant", "Constant color"],
     ["byProperty", "By property + colormap"],
+    ["additive", "Additive (properties × colors)"],
   ] as const) {
     const option = document.createElement("option");
     option.value = value;
@@ -163,6 +173,69 @@ function makeColorRule(
   const clampCheckbox = document.createElement("input");
   clampCheckbox.type = "checkbox";
   clampCheckbox.checked = true;
+
+  // Additive-blend channel list (mode === "additive").
+  let currentProps = initialProps;
+  const channels: AdditiveChannelHandle[] = [];
+  const additiveList = document.createElement("div");
+  additiveList.classList.add("neuroglancer-annotation-wizard-channels");
+  const addChannelButton = document.createElement("button");
+  addChannelButton.type = "button";
+  addChannelButton.classList.add("neuroglancer-annotation-wizard-add-channel");
+  addChannelButton.textContent = "+ Add color";
+
+  function defaultPropertyFor(index: number): string {
+    const numeric = filterProperties(currentProps, "numeric");
+    if (numeric.length === 0) return "";
+    return numeric[Math.min(index, numeric.length - 1)].identifier;
+  }
+
+  function makeChannel(color: string, property: string): AdditiveChannelHandle {
+    const element = document.createElement("div");
+    element.classList.add("neuroglancer-annotation-wizard-channel");
+    const channelPropertySelect = makePropertySelect(currentProps, "numeric");
+    if (property !== "") channelPropertySelect.value = property;
+    const channelColorInput = makeColorInput(color);
+    const channelClamp = document.createElement("input");
+    channelClamp.type = "checkbox";
+    channelClamp.checked = true;
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.classList.add("neuroglancer-annotation-wizard-channel-remove");
+    removeButton.textContent = "Remove";
+    const handle: AdditiveChannelHandle = {
+      element,
+      propertySelect: channelPropertySelect,
+      colorInput: channelColorInput,
+      clampCheckbox: channelClamp,
+    };
+    removeButton.addEventListener("click", () => {
+      const idx = channels.indexOf(handle);
+      if (idx === -1) return;
+      channels.splice(idx, 1);
+      element.remove();
+    });
+    element.append(
+      makeLabeled("property ", channelPropertySelect),
+      makeLabeled("color ", channelColorInput),
+      makeLabeled("clamp ", channelClamp),
+      removeButton,
+    );
+    return handle;
+  }
+
+  function addChannel(color?: string, property?: string) {
+    const index = channels.length;
+    const handle = makeChannel(
+      color ?? additiveDefaultColor(index),
+      property ?? defaultPropertyFor(index),
+    );
+    channels.push(handle);
+    additiveList.appendChild(handle.element);
+  }
+  addChannelButton.addEventListener("click", () => addChannel());
+  // Seed with three channels (red, green, blue).
+  for (let i = 0; i < 3; ++i) addChannel();
 
   function render() {
     detail.replaceChildren();
@@ -180,6 +253,15 @@ function makeColorRule(
           makeLabeled("colormap ", colormapSelect),
           makeLabeled("clamp ", clampCheckbox),
         );
+      }
+    } else if (mode.value === "additive") {
+      if (filterProperties(currentProps, "numeric").length === 0) {
+        const note = document.createElement("span");
+        note.classList.add("neuroglancer-annotation-wizard-note");
+        note.textContent = "no numeric properties available";
+        detail.append(note);
+      } else {
+        detail.append(additiveList, addChannelButton);
       }
     }
   }
@@ -201,10 +283,27 @@ function makeColorRule(
           clamp: clampCheckbox.checked,
         };
       }
+      if (mode.value === "additive") {
+        const ruleChannels: WizardColorChannel[] = [];
+        for (const channel of channels) {
+          if (channel.propertySelect.value === "") continue;
+          ruleChannels.push({
+            property: channel.propertySelect.value,
+            color: channel.colorInput.value,
+            clamp: channel.clampCheckbox.checked,
+          });
+        }
+        if (ruleChannels.length === 0) return { mode: "default" };
+        return { mode: "additive", channels: ruleChannels };
+      }
       return { mode: "default" };
     },
     refreshProperties(properties) {
+      currentProps = properties;
       populatePropertySelect(propertySelect, properties, "numeric");
+      for (const channel of channels) {
+        populatePropertySelect(channel.propertySelect, properties, "numeric");
+      }
       render();
     },
   };

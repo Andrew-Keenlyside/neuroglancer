@@ -100,3 +100,32 @@
   font-style: italic;
   font-size: 11px;
 }
+
+.neuroglancer-annotation-wizard-channels {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+
+.neuroglancer-annotation-wizard-channel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.neuroglancer-annotation-wizard-add-channel,
+.neuroglancer-annotation-wizard-channel-remove {
+  background-color: #333;
+  color: #ddd;
+  border: 1px solid #555;
+  font: inherit;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+
+.neuroglancer-annotation-wizard-add-channel:hover,
+.neuroglancer-annotation-wizard-channel-remove:hover {
+  background-color: #444;
+}

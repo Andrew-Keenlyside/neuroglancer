@@ -29,8 +29,27 @@ import {
 } from "#src/annotation/index.js";
 import type { ColormapName } from "#src/webgl/colormaps.js";
 
-export type ColorMode = "default" | "constant" | "byProperty";
+export type ColorMode = "default" | "constant" | "byProperty" | "additive";
 export type SizeMode = "default" | "constant" | "byProperty";
+
+/** A single channel of an additive color blend. */
+export interface WizardColorChannel {
+  /** Annotation property identifier driving this channel's invlerp. */
+  property: string;
+  /** Hex color string like "#ff0000" scaling this channel. */
+  color: string;
+  clamp?: boolean;
+}
+
+/**
+ * Default per-channel colors for the additive blend: a pure red, green, blue
+ * series, falling back to white for any channel beyond the third.
+ */
+export const ADDITIVE_DEFAULT_COLORS = ["#ff0000", "#00ff00", "#0000ff"];
+
+export function additiveDefaultColor(index: number): string {
+  return ADDITIVE_DEFAULT_COLORS[index] ?? "#ffffff";
+}
 export type BorderMode =
   | "default"
   | "remove"
@@ -45,6 +64,8 @@ export interface WizardColorRule {
   property?: string;
   colormap?: ColormapName;
   clamp?: boolean;
+  /** Channels of the additive blend, used when mode === "additive". */
+  channels?: WizardColorChannel[];
 }
 
 export interface WizardSizeRule {
@@ -144,6 +165,10 @@ function emitColor(
     builder.body.push("setColor(vec4(color_constant, 1.0));");
     return;
   }
+  if (rule.mode === "additive") {
+    emitAdditiveColor(rule.channels ?? [], properties, builder);
+    return;
+  }
   // byProperty
   const prop = findProperty(properties, rule.property);
   if (prop === undefined || !isAnnotationNumericPropertySpec(prop)) {
@@ -153,6 +178,42 @@ function emitColor(
   emitInvlerp(builder, "color_invlerp", prop.identifier, rule.clamp);
   emitColormap(builder, "color_cmap", rule.colormap ?? "viridis");
   builder.body.push("setColor(vec4(color_cmap(color_invlerp()), 1.0));");
+}
+
+/**
+ * Emits the additive-blend color: each valid channel contributes
+ * `tint_i * invlerp_i()` to the RGB sum, and the alpha is the max of the
+ * channels' invlerps so low-signal annotations fade out. Falls back to the
+ * layer default color when no channel resolves to a numeric property.
+ */
+function emitAdditiveColor(
+  channels: readonly WizardColorChannel[],
+  properties: readonly AnnotationPropertySpec[],
+  builder: Builder,
+): void {
+  const rgbTerms: string[] = [];
+  const alphaTerms: string[] = [];
+  channels.forEach((channel) => {
+    const prop = findProperty(properties, channel.property);
+    if (prop === undefined || !isAnnotationNumericPropertySpec(prop)) return;
+    const i = rgbTerms.length;
+    const invlerpName = `blend${i}_invlerp`;
+    const colorName = `blend${i}_color`;
+    emitInvlerp(builder, invlerpName, prop.identifier, channel.clamp);
+    builder.directives.push(
+      `#uicontrol vec3 ${colorName} color(default="${channel.color}")`,
+    );
+    rgbTerms.push(`${colorName} * ${invlerpName}()`);
+    alphaTerms.push(`${invlerpName}()`);
+  });
+  if (rgbTerms.length === 0) {
+    builder.body.push("setColor(defaultColor());");
+    return;
+  }
+  const rgb = rgbTerms.join(" + ");
+  // Right-fold into max(t0, max(t1, t2)); a single term yields just that term.
+  const alpha = alphaTerms.reduceRight((acc, term) => `max(${term}, ${acc})`);
+  builder.body.push(`setColor(vec4(${rgb}, ${alpha}));`);
 }
 
 interface SizeTargetInfo {

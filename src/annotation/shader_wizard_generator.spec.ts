@@ -73,6 +73,79 @@ describe("generateWizardShader", () => {
     );
   });
 
+  it("color additive blends per-channel invlerp × color with max alpha", () => {
+    const shader = generateWizardShader(
+      {
+        ...defaultWizardConfig(),
+        color: {
+          mode: "additive",
+          channels: [
+            { property: "score", color: "#ff0000", clamp: true },
+            { property: "confidence", color: "#00ff00", clamp: true },
+            { property: "score", color: "#0000ff", clamp: true },
+          ],
+        },
+      },
+      PROPS,
+    );
+    expect(shader).toContain(
+      `#uicontrol invlerp blend0_invlerp(property="score", clamp=true)`,
+    );
+    expect(shader).toContain(
+      `#uicontrol vec3 blend0_color color(default="#ff0000")`,
+    );
+    expect(shader).toContain(
+      `#uicontrol invlerp blend1_invlerp(property="confidence", clamp=true)`,
+    );
+    expect(shader).toContain(
+      `#uicontrol vec3 blend1_color color(default="#00ff00")`,
+    );
+    expect(shader).toContain(
+      `#uicontrol vec3 blend2_color color(default="#0000ff")`,
+    );
+    expect(shader).toContain(
+      "setColor(vec4(blend0_color * blend0_invlerp() + blend1_color * blend1_invlerp() + blend2_color * blend2_invlerp(), max(blend0_invlerp(), max(blend1_invlerp(), blend2_invlerp()))));",
+    );
+  });
+
+  it("single-channel additive omits max() for alpha", () => {
+    const shader = generateWizardShader(
+      {
+        ...defaultWizardConfig(),
+        color: {
+          mode: "additive",
+          channels: [{ property: "score", color: "#ff0000" }],
+        },
+      },
+      PROPS,
+    );
+    expect(shader).toContain(
+      `#uicontrol invlerp blend0_invlerp(property="score", clamp=true)`,
+    );
+    expect(shader).toContain(
+      "setColor(vec4(blend0_color * blend0_invlerp(), blend0_invlerp()));",
+    );
+    expect(shader).not.toContain("max(");
+  });
+
+  it("additive with no valid numeric channels falls back to default", () => {
+    const shader = generateWizardShader(
+      {
+        ...defaultWizardConfig(),
+        color: {
+          mode: "additive",
+          channels: [
+            { property: "is_good", color: "#ff0000" },
+            { property: "does_not_exist", color: "#00ff00" },
+          ],
+        },
+      },
+      PROPS,
+    );
+    expect(shader).toContain("setColor(defaultColor());");
+    expect(shader).not.toContain("blend0");
+  });
+
   it("color constant emits a color picker", () => {
     const shader = generateWizardShader(
       {
