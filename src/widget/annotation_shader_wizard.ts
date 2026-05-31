@@ -35,6 +35,8 @@ import {
 import type { WatchableValueInterface } from "#src/trackable_value.js";
 import { RefCounted } from "#src/util/disposable.js";
 import { COLORMAP_NAMES, colormapDisplayName } from "#src/webgl/colormaps.js";
+import type { ShaderControlState } from "#src/webgl/shader_ui_controls.js";
+import { autoRangeInvlerpControls } from "#src/widget/shader_wizard_auto_range.js";
 
 type PropertyFilter = "numeric" | "numericOrBool";
 
@@ -399,6 +401,7 @@ export class ShaderWizardWidget extends RefCounted {
     private annotationProperties: WatchableValueInterface<
       readonly AnnotationPropertySpec[] | undefined
     >,
+    private shaderControlState: ShaderControlState,
   ) {
     super();
 
@@ -460,6 +463,9 @@ export class ShaderWizardWidget extends RefCounted {
       };
       const props = this.annotationProperties.value ?? [];
       this.shader.value = generateWizardShader(config, props);
+      // The new property invlerp controls default to the data-type range; ask
+      // them to auto-range from the data that is currently loaded.
+      autoRangeInvlerpControls(this.shaderControlState);
       this.codeVisible.value = false;
       this.visible.value = false;
     });

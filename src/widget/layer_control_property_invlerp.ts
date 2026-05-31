@@ -96,18 +96,24 @@ export function propertyInvlerpLayerControl<LayerType extends UserLayer>(
       const derivedWatchableValue = {
         changed: watchableValue.changed,
         get value(): InvlerpParameters {
-          let { dataType, window, range } = watchableValue.value;
+          let { dataType, window, range, autoCompute } = watchableValue.value;
           if (range === undefined) {
             range = defaultDataTypeRange[dataType];
           }
           return {
             window: normalizeDataTypeInterval(window ?? range),
             range,
+            autoCompute,
           };
         },
         set value(newValue: InvlerpParameters) {
-          const { window, range } = newValue;
-          watchableValue.value = { ...watchableValue.value, window, range };
+          const { window, range, autoCompute } = newValue;
+          watchableValue.value = {
+            ...watchableValue.value,
+            window,
+            range,
+            autoCompute,
+          };
         },
       };
       const derivedDataTypeWatchable = makeCachedDerivedWatchableValue(

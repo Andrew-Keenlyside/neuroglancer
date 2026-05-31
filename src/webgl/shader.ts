@@ -263,6 +263,8 @@ export class ShaderProgram extends RefCounted {
     sortedControlPoints: SortedControlPoints,
     dataType: DataType,
     lookupTableSize: number,
+    colormap?: ColormapBinName,
+    reverseColormap?: boolean,
   ) {
     const textureUnit = this.textureUnits.get(symbol);
     if (textureUnit === undefined) {
@@ -279,6 +281,8 @@ export class ShaderProgram extends RefCounted {
       sortedControlPoints,
       dataType,
       lookupTableSize,
+      colormap,
+      reverseColormap,
     });
   }
 

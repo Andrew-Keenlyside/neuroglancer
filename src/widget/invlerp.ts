@@ -832,7 +832,9 @@ export class InvlerpWidget extends Tab {
 
     if (this.trackable.value.autoCompute) {
       this.autoRangeFinder.autoComputeRange(0.01, 0.99);
-      this.trackable.value.autoCompute = false;
+      // Clear via assignment (not in-place mutation) so adapter-backed trackables
+      // (e.g. property invlerp) persist the cleared flag rather than dropping it.
+      this.trackable.value = { ...this.trackable.value, autoCompute: false };
     }
   }
 }

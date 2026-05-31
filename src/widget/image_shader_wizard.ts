@@ -35,7 +35,13 @@ import {
 import type { WatchableValueInterface } from "#src/trackable_value.js";
 import { RefCounted } from "#src/util/disposable.js";
 import { valueOrThrow, type ValueOrError } from "#src/util/error.js";
-import { COLORMAP_NAMES, colormapDisplayName } from "#src/webgl/colormaps.js";
+import {
+  COLORMAP_NAMES,
+  type ColormapName,
+  colormapDisplayName,
+} from "#src/webgl/colormaps.js";
+import type { ShaderControlState } from "#src/webgl/shader_ui_controls.js";
+import { autoRangeInvlerpControls } from "#src/widget/shader_wizard_auto_range.js";
 
 const DEFAULT_TINT = "#ffaa00";
 
@@ -88,6 +94,28 @@ function makeColormapSelect(initial: string): HTMLSelectElement {
     select.appendChild(option);
   }
   select.value = initial;
+  return select;
+}
+
+/**
+ * Colormap select for the transfer-function treatment. Includes a leading
+ * "Manual (seed color)" entry (value ""); any other value is a colormap name.
+ */
+function makeTfColormapSelect(
+  initial: ColormapName | undefined,
+): HTMLSelectElement {
+  const select = document.createElement("select");
+  const manual = document.createElement("option");
+  manual.value = "";
+  manual.textContent = "Manual (seed color)";
+  select.appendChild(manual);
+  for (const name of COLORMAP_NAMES) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = colormapDisplayName(name);
+    select.appendChild(option);
+  }
+  select.value = initial ?? "";
   return select;
 }
 
@@ -160,6 +188,11 @@ function makeTreatmentControl(
   const tfColorInput = makeColorInput(
     initial.type === "transfer-function" ? initial.defaultColor : DEFAULT_TINT,
   );
+  // Transfer-function coloring: a colormap dropdown (default viridis) with a
+  // leading "Manual (seed color)" entry to opt out and color nodes by hand.
+  const tfColormapSelect = makeTfColormapSelect(
+    initial.type === "transfer-function" ? initial.colormap : "viridis",
+  );
 
   function render() {
     detail.replaceChildren();
@@ -171,7 +204,10 @@ function makeTreatmentControl(
         detail.append(colormapSelect);
         break;
       case "transfer-function":
-        detail.append(makeLabeled("seed color ", tfColorInput));
+        detail.append(
+          makeLabeled("colors ", tfColormapSelect),
+          makeLabeled("seed color ", tfColorInput),
+        );
         break;
     }
   }
@@ -200,6 +236,10 @@ function makeTreatmentControl(
           return {
             type: "transfer-function",
             defaultColor: tfColorInput.value,
+            colormap:
+              tfColormapSelect.value === ""
+                ? undefined
+                : (tfColormapSelect.value as ColormapName),
           };
       }
       return { type: "single-color", color: DEFAULT_TINT };
@@ -490,6 +530,7 @@ export class ImageShaderWizardWidget extends RefCounted {
     private fragmentMain: WatchableValueInterface<string>,
     private codeVisible: TrackableBoolean,
     channelSpace: WatchableValueInterface<ValueOrError<ChannelSpace>>,
+    private shaderControlState: ShaderControlState,
   ) {
     super();
 
@@ -585,6 +626,9 @@ export class ImageShaderWizardWidget extends RefCounted {
         channelRank: cs2?.channelCoordinateSpace.rank ?? 0,
       };
       this.fragmentMain.value = generateImageWizardShader(config, ctx);
+      // The new invlerp controls default to the data-type range; ask them to
+      // auto-range from the data that is currently loaded.
+      autoRangeInvlerpControls(this.shaderControlState);
       this.codeVisible.value = false;
       this.visible.value = false;
     });

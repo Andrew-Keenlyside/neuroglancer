@@ -837,6 +837,7 @@ class RenderingOptionsTab extends Tab {
         layer.annotationDisplayState.shader,
         layer.codeVisible,
         layer.annotationDisplayState.annotationProperties,
+        layer.annotationDisplayState.shaderControls,
       ),
     );
 

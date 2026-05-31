@@ -60,7 +60,7 @@ describe("generateImageWizardShader", () => {
     expect(shader).toContain("emitRGBA(vec4(color, a));");
   });
 
-  it("single-channel transfer function pre-seeds 5 control points with linear alpha", () => {
+  it("single-channel transfer function omits controlPoints/window so the widget auto-ranges", () => {
     const config: WizardConfig = {
       mode: "single",
       treatment: { type: "transfer-function", defaultColor: "#ffaa00" },
@@ -69,17 +69,37 @@ describe("generateImageWizardShader", () => {
       alphaSource: "from-intensity",
     };
     const shader = generateImageWizardShader(config, SINGLE_CHANNEL_CTX);
-    expect(shader).toContain("#uicontrol transferFunction main_tf(");
-    expect(shader).toContain(`controlPoints=[`);
-    // 5 points at fractional positions 0, 0.25, 0.5, 0.75, 1, all #ffaa00,
-    // alpha rises linearly 0, 0.25, 0.5, 0.75, 1.
-    for (const t of [0, 0.25, 0.5, 0.75, 1]) {
-      expect(shader).toContain(`[${t}, "#ffaa00", ${t}]`);
-    }
-    expect(shader).toContain(`defaultColor="#ffaa00"`);
-    expect(shader).toContain("window=[0,1]");
+    expect(shader).toContain(
+      `#uicontrol transferFunction main_tf(defaultColor="#ffaa00")`,
+    );
+    // No explicit control points or window: the TF widget auto-ranges from the
+    // loaded data and seeds default control points using defaultColor.
+    expect(shader).not.toContain("controlPoints=");
+    expect(shader).not.toContain("window=");
+    // No colormap requested → manual node colors, no colormap= parameter.
+    expect(shader).not.toContain("colormap=");
     expect(shader).toContain("vec3 color = main_tf().rgb;");
     expect(shader).toContain("float a = main_tf().a;");
+  });
+
+  it('transfer function with a colormap emits colormap="..." alongside defaultColor', () => {
+    const config: WizardConfig = {
+      mode: "single",
+      treatment: {
+        type: "transfer-function",
+        defaultColor: "#ffaa00",
+        colormap: "viridis",
+      },
+      alpha2D: false,
+      alpha3D: true,
+      alphaSource: "from-intensity",
+    };
+    const shader = generateImageWizardShader(config, SINGLE_CHANNEL_CTX);
+    expect(shader).toContain(
+      `#uicontrol transferFunction main_tf(defaultColor="#ffaa00", colormap="viridis")`,
+    );
+    expect(shader).not.toContain("controlPoints=");
+    expect(shader).not.toContain("window=");
   });
 
   it("transfer function ignores alphaSource (TF carries its own alpha)", () => {

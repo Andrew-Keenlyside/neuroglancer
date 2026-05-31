@@ -51,6 +51,10 @@ import { startRelativeMouseDrag } from "#src/util/mouse_drag.js";
 import { getWheelZoomAmount } from "#src/util/wheel_zoom.js";
 import type { WatchableVisibilityPriority } from "#src/visibility_priority/frontend.js";
 import { GLBuffer, getMemoizedBuffer } from "#src/webgl/buffer.js";
+import {
+  type ColormapName,
+  computeColormapColor,
+} from "#src/webgl/colormaps.js";
 import type { GL } from "#src/webgl/context.js";
 import type { HistogramSpecifications } from "#src/webgl/empirical_cdf.js";
 import {
@@ -68,8 +72,10 @@ import { createGriddedRectangleArray } from "#src/webgl/rectangle_grid_buffer.js
 import type { ShaderCodePart, ShaderProgram } from "#src/webgl/shader.js";
 import { ShaderBuilder } from "#src/webgl/shader.js";
 import { getShaderType } from "#src/webgl/shader_lib.js";
+import type { ColormapParameters } from "#src/webgl/shader_ui_controls.js";
 import { setRawTextureParameters } from "#src/webgl/texture.js";
 import { ColorWidget } from "#src/widget/color.js";
+import { ColormapWidget } from "#src/widget/colormap_legend.js";
 import {
   getUpdatedRangeAndWindowParameters,
   updateInputBoundValue,
@@ -130,6 +136,13 @@ export interface ControlPointTextureOptions {
   dataType: DataType;
   /** Lookup table number of elements*/
   lookupTableSize: number;
+  /**
+   * When set, the lookup table RGB is driven by this colormap (control-point
+   * RGB is ignored; control points still define the alpha curve).
+   */
+  colormap?: ColormapName;
+  /** When true, the colormap is evaluated in reverse (1 - t). */
+  reverseColormap?: boolean;
 }
 
 export interface TransferFunctionParameters {
@@ -137,6 +150,14 @@ export interface TransferFunctionParameters {
   window: DataTypeInterval;
   channel: number[];
   defaultColor: vec3;
+  /**
+   * When set, the transfer function RGB is driven by this named colormap across
+   * the range, while control points only shape the alpha curve. When undefined,
+   * colors come from the control-point nodes (the default, manual behavior).
+   */
+  colormap?: ColormapName;
+  /** When true, the colormap is reversed (first node = colormap max). */
+  reverseColormap?: boolean;
 }
 
 interface CanvasPosition {
@@ -339,12 +360,36 @@ export class LookupTable {
   updateFromControlPoints(
     sortedControlPoints: SortedControlPoints,
     window: DataTypeInterval | undefined = undefined,
+    colormap: ColormapName | undefined = undefined,
+    reverseColormap: boolean = false,
   ) {
     const range = window ? window : sortedControlPoints.range;
     const { controlPoints } = sortedControlPoints;
     const out = this.outputValues;
     const size = this.lookupTableSize;
+    // When a colormap drives the RGB, the colormap is stretched across the span
+    // between the first and last control points (first node = colormap min, last
+    // node = colormap max). These bounds are filled in once the control points
+    // are known; the color channels are then overridden from the colormap while
+    // only the control-point-derived alpha is kept.
+    let colormapFirstIndex = 0;
+    let colormapLastIndex = size - 1;
     function addLookupValue(index: number, color: vec4) {
+      if (colormap !== undefined) {
+        const i = index / NUM_COLOR_CHANNELS;
+        const span = colormapLastIndex - colormapFirstIndex;
+        let t =
+          span <= 0
+            ? 0
+            : Math.min(1, Math.max(0, (i - colormapFirstIndex) / span));
+        if (reverseColormap) t = 1 - t;
+        const [r, g, b] = computeColormapColor(colormap, t);
+        out[index] = Math.round(r * 255);
+        out[index + 1] = Math.round(g * 255);
+        out[index + 2] = Math.round(b * 255);
+        out[index + 3] = color[3];
+        return;
+      }
       out[index] = color[0];
       out[index + 1] = color[1];
       out[index + 2] = color[2];
@@ -362,6 +407,12 @@ export class LookupTable {
       out.fill(0);
       return;
     }
+
+    // Span the colormap between the first and last control points.
+    colormapFirstIndex = toTransferFunctionSpace(controlPoints[0]);
+    colormapLastIndex = toTransferFunctionSpace(
+      controlPoints[controlPoints.length - 1],
+    );
 
     // If first control point not at 0 - fill in transparent values
     // up to the first point
@@ -430,7 +481,12 @@ export class TransferFunction extends RefCounted {
     return this.lookupTable.lookupTableSize;
   }
   updateLookupTable(window: DataTypeInterval | undefined = undefined) {
-    this.lookupTable.updateFromControlPoints(this.sortedControlPoints, window);
+    this.lookupTable.updateFromControlPoints(
+      this.sortedControlPoints,
+      window,
+      this.trackable.value.colormap,
+      this.trackable.value.reverseColormap,
+    );
   }
   addPoint(controlPoint: ControlPoint) {
     this.sortedControlPoints.addPoint(controlPoint);
@@ -637,7 +693,17 @@ export class ControlPointTexture extends BaseLookupTexture {
     const textureUnitEqual =
       existingOptions.textureUnit === newOptions.textureUnit;
     const dataTypeEqual = existingOptions.dataType === newOptions.dataType;
-    return controlPointsEqual && textureUnitEqual && dataTypeEqual;
+    const colormapEqual = existingOptions.colormap === newOptions.colormap;
+    const reverseColormapEqual =
+      (existingOptions.reverseColormap ?? false) ===
+      (newOptions.reverseColormap ?? false);
+    return (
+      controlPointsEqual &&
+      textureUnitEqual &&
+      dataTypeEqual &&
+      colormapEqual &&
+      reverseColormapEqual
+    );
   }
   setOptions(options: ControlPointTextureOptions) {
     this.priorOptions = {
@@ -651,7 +717,12 @@ export class ControlPointTexture extends BaseLookupTexture {
     this.setTextureWidthAndHeightFromSize(lookupTableSize);
     const lookupTable = new LookupTable(lookupTableSize);
     const sortedControlPoints = options.sortedControlPoints;
-    lookupTable.updateFromControlPoints(sortedControlPoints);
+    lookupTable.updateFromControlPoints(
+      sortedControlPoints,
+      undefined,
+      options.colormap,
+      options.reverseColormap,
+    );
     return lookupTable;
   }
   ensureTextureSize(size: number) {
@@ -872,6 +943,18 @@ class TransferFunctionPanel extends IndirectRenderedPanel {
       }
     }
 
+    // In colormap mode, render each marker with the colormap color at its
+    // position so the preview matches the rendered output (control-point RGB is
+    // ignored for color in this mode). The colormap spans the first node
+    // (t=0) to the last node (t=1).
+    const { colormap, reverseColormap } = transferFunction.trackable.value;
+    const firstNodeInput =
+      normalizedControlPoints.length > 0 ? normalizedControlPoints[0].input : 0;
+    const lastNodeInput =
+      normalizedControlPoints.length > 0
+        ? normalizedControlPoints[normalizedControlPoints.length - 1].input
+        : 0;
+    const nodeInputSpan = lastNodeInput - firstNodeInput;
     const lines: vec4[] = [];
     // Update points and draw lines between control points
     for (let i = 0; i < controlPoints.length; ++i) {
@@ -880,9 +963,24 @@ class TransferFunctionPanel extends IndirectRenderedPanel {
       const inputValue = normalizedControlPoints[i].input;
       const outputValue = normalizedControlPoints[i].output;
       const { outputColor } = controlPoints[i];
-      colorArray[colorIndex] = normalizeColor(outputColor[0]);
-      colorArray[colorIndex + 1] = normalizeColor(outputColor[1]);
-      colorArray[colorIndex + 2] = normalizeColor(outputColor[2]);
+      if (colormap !== undefined) {
+        let t =
+          nodeInputSpan <= 0
+            ? 0
+            : Math.min(
+                1,
+                Math.max(0, (inputValue - firstNodeInput) / nodeInputSpan),
+              );
+        if (reverseColormap) t = 1 - t;
+        const [r, g, b] = computeColormapColor(colormap, t);
+        colorArray[colorIndex] = r;
+        colorArray[colorIndex + 1] = g;
+        colorArray[colorIndex + 2] = b;
+      } else {
+        colorArray[colorIndex] = normalizeColor(outputColor[0]);
+        colorArray[colorIndex + 1] = normalizeColor(outputColor[1]);
+        colorArray[colorIndex + 2] = normalizeColor(outputColor[2]);
+      }
       positionArray[positionIndex] = inputValue;
       positionArray[positionIndex + 1] = outputValue;
 
@@ -1318,6 +1416,11 @@ class TransferFunctionController extends RefCounted {
       element,
       "change-point-color",
       (actionEvent) => {
+        // In colormap mode, node colors are driven by the colormap, so manual
+        // per-node recoloring is a no-op.
+        if (this.transferFunction.trackable.value.colormap !== undefined) {
+          return;
+        }
         const mouseEvent = actionEvent.detail;
         const nearestIndex = this.findControlPointIfNearCursor(mouseEvent);
         if (nearestIndex !== -1) {
@@ -1646,6 +1749,10 @@ class TransferFunctionWidget extends Tab {
     this.autoRangeFinder.element.appendChild(this.createClearButton());
     this.autoRangeFinder.element.appendChild(this.createColorPicker(trackable));
 
+    // Colormap mode controls: a checkbox to switch between manual node colors
+    // and colormap-driven colors, plus the reused colormap dropdown.
+    element.appendChild(this.createColormapControls(trackable));
+
     // If no points and no window, set the default control points for the transfer function
     const currentWindow = this.trackable.value.window;
     const defaultWindow = defaultDataTypeRange[this.dataType];
@@ -1723,6 +1830,88 @@ class TransferFunctionWidget extends Tab {
     });
     colorPickerDiv.appendChild(colorPicker.element);
     return colorPickerDiv;
+  }
+
+  private createColormapControls(
+    trackable: WatchableValueInterface<TransferFunctionParameters>,
+  ) {
+    const DEFAULT_COLORMAP: ColormapName = "viridis";
+    const container = document.createElement("div");
+    container.classList.add("neuroglancer-transfer-function-colormap-controls");
+
+    const checkboxLabel = document.createElement("label");
+    checkboxLabel.classList.add(
+      "neuroglancer-transfer-function-colormap-checkbox",
+    );
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.title =
+      "Use a colormap for colors (control points then only set opacity)";
+    checkboxLabel.appendChild(checkbox);
+    checkboxLabel.appendChild(document.createTextNode("Use colormap"));
+
+    // Adapter exposing the transfer function's colormap as a ColormapWidget
+    // trackable. Writes go through the transfer function trackable; when no
+    // colormap is active the dropdown still shows a default so the user can see
+    // what enabling it would select.
+    const colormapAdapter: WatchableValueInterface<ColormapParameters> = {
+      changed: trackable.changed,
+      get value() {
+        return { colormap: trackable.value.colormap ?? DEFAULT_COLORMAP };
+      },
+      set value(newValue: ColormapParameters) {
+        // Only persist a colormap selection while colormap mode is enabled.
+        if (trackable.value.colormap === undefined) return;
+        trackable.value = {
+          ...trackable.value,
+          colormap: newValue.colormap,
+        };
+      },
+    };
+    const colormapWidget = this.registerDisposer(
+      new ColormapWidget(colormapAdapter),
+    );
+
+    checkbox.addEventListener("change", () => {
+      trackable.value = {
+        ...trackable.value,
+        colormap: checkbox.checked
+          ? (trackable.value.colormap ?? DEFAULT_COLORMAP)
+          : undefined,
+      };
+    });
+
+    // Reverse checkbox: flips the colormap direction (1 - t).
+    const reverseLabel = document.createElement("label");
+    reverseLabel.classList.add(
+      "neuroglancer-transfer-function-colormap-checkbox",
+    );
+    const reverseCheckbox = document.createElement("input");
+    reverseCheckbox.type = "checkbox";
+    reverseCheckbox.title = "Reverse the colormap direction";
+    reverseLabel.appendChild(reverseCheckbox);
+    reverseLabel.appendChild(document.createTextNode("Reverse"));
+    reverseCheckbox.addEventListener("change", () => {
+      trackable.value = {
+        ...trackable.value,
+        reverseColormap: reverseCheckbox.checked,
+      };
+    });
+
+    const sync = () => {
+      const enabled = trackable.value.colormap !== undefined;
+      checkbox.checked = enabled;
+      colormapWidget.element.style.display = enabled ? "" : "none";
+      reverseLabel.style.display = enabled ? "" : "none";
+      reverseCheckbox.checked = trackable.value.reverseColormap ?? false;
+    };
+    sync();
+    this.registerDisposer(trackable.changed.add(sync));
+
+    container.appendChild(checkboxLabel);
+    container.appendChild(colormapWidget.element);
+    container.appendChild(reverseLabel);
+    return container;
   }
 
   private createWindowBoundInputs() {
@@ -1882,6 +2071,8 @@ export function enableTransferFunctionShader(
   dataType: DataType,
   sortedControlPoints: SortedControlPoints,
   lookupTableSize: number = defaultTransferFunctionSizes[dataType],
+  colormap: ColormapName | undefined = undefined,
+  reverseColormap: boolean = false,
 ) {
   const { gl } = shader;
   const texture = shader.transferFunctionTextures.get(
@@ -1899,6 +2090,8 @@ export function enableTransferFunctionShader(
     sortedControlPoints,
     dataType,
     lookupTableSize,
+    colormap,
+    reverseColormap,
   );
   if (textureSize === undefined) {
     throw new Error("Failed to create transfer function texture");

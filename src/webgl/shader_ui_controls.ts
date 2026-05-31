@@ -38,6 +38,7 @@ import { vec3, vec4 } from "#src/util/geom.js";
 import {
   parseArray,
   parseFixedLengthArray,
+  verifyBoolean,
   verifyFiniteFloat,
   verifyInt,
   verifyObject,
@@ -633,6 +634,8 @@ function parseTransferFunctionDirective(
   let channel = new Array(channelRank).fill(0);
   let defaultColor = vec3.fromValues(1.0, 1.0, 1.0);
   let window: DataTypeInterval | undefined;
+  let colormap: ColormapName | undefined;
+  let reverseColormap = false;
   let sortedControlPoints = new SortedControlPoints(
     [],
     dataType !== undefined ? dataType : DataType.FLOAT32,
@@ -671,6 +674,27 @@ function parseTransferFunctionDirective(
           }
           break;
         }
+        case "colormap": {
+          const s = verifyString(value);
+          if (!(COLORMAP_NAMES as readonly string[]).includes(s)) {
+            errors.push(
+              `Invalid colormap name ${JSON.stringify(s)}. Valid names: ${COLORMAP_NAMES.join(", ")}`,
+            );
+          } else {
+            colormap = s as ColormapName;
+          }
+          break;
+        }
+        case "reverseColormap": {
+          if (typeof value !== "boolean") {
+            errors.push(
+              `Invalid reverseColormap value: ${JSON.stringify(value)}`,
+            );
+          } else {
+            reverseColormap = value;
+          }
+          break;
+        }
         default:
           errors.push(`Invalid parameter: ${key}`);
           break;
@@ -695,6 +719,8 @@ function parseTransferFunctionDirective(
         channel,
         defaultColor,
         window,
+        colormap,
+        reverseColormap,
       },
     } as ShaderTransferFunctionControl,
     errors: undefined,
@@ -995,6 +1021,9 @@ export interface PropertyInvlerpParameters {
   window: DataTypeInterval | undefined;
   property: string;
   dataType: DataType;
+  // Transient flag: when set, the invlerp widget recomputes the range from the
+  // data histogram on its next render and then clears the flag. Not serialized.
+  autoCompute?: boolean;
 }
 
 function parseImageInvlerpParameters(
@@ -1270,6 +1299,24 @@ export function parseTransferFunctionParameters(
       defaultValue.defaultColor,
     ),
     window,
+    colormap: verifyOptionalObjectProperty(
+      obj,
+      "colormap",
+      (x) => {
+        const s = verifyString(x);
+        if (!(COLORMAP_NAMES as readonly string[]).includes(s)) {
+          throw new Error(`Invalid colormap name: ${JSON.stringify(s)}`);
+        }
+        return s as ColormapName;
+      },
+      defaultValue.colormap,
+    ),
+    reverseColormap: verifyOptionalObjectProperty(
+      obj,
+      "reverseColormap",
+      verifyBoolean,
+      defaultValue.reverseColormap,
+    ),
   };
 }
 
@@ -1318,7 +1365,14 @@ export class TrackableTransferFunctionParameters extends TrackableValue<Transfer
 
   toJSON() {
     const {
-      value: { channel, sortedControlPoints, defaultColor, window },
+      value: {
+        channel,
+        sortedControlPoints,
+        defaultColor,
+        window,
+        colormap,
+        reverseColormap,
+      },
       dataType,
       defaultValue,
     } = this;
@@ -1342,11 +1396,19 @@ export class TrackableTransferFunctionParameters extends TrackableValue<Transfer
     )
       ? undefined
       : this.controlPointsToJson(sortedControlPoints.controlPoints, dataType);
+    const colormapJson =
+      colormap === defaultValue.colormap ? undefined : colormap;
+    const reverseColormapJson =
+      (reverseColormap ?? false) === (defaultValue.reverseColormap ?? false)
+        ? undefined
+        : reverseColormap;
     if (
       channelJson === undefined &&
       colorJson === undefined &&
       controlPointsJson === undefined &&
-      windowJson === undefined
+      windowJson === undefined &&
+      colormapJson === undefined &&
+      reverseColormapJson === undefined
     ) {
       return undefined;
     }
@@ -1355,6 +1417,8 @@ export class TrackableTransferFunctionParameters extends TrackableValue<Transfer
       defaultColor: colorJson,
       controlPoints: controlPointsJson,
       window: windowJson,
+      colormap: colormapJson,
+      reverseColormap: reverseColormapJson,
     };
   }
 }
@@ -1821,6 +1885,9 @@ function setControlInShader(
         uName,
         control.dataType,
         value.sortedControlPoints,
+        undefined,
+        value.colormap,
+        value.reverseColormap,
       );
       break;
     case "colormap":

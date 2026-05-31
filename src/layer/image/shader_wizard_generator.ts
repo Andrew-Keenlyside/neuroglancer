@@ -27,7 +27,12 @@ import type { ColormapName } from "#src/webgl/colormaps.js";
 export type ColorTreatment =
   | { type: "single-color"; color: string }
   | { type: "named-colormap"; name: ColormapName }
-  | { type: "transfer-function"; defaultColor: string };
+  | {
+      type: "transfer-function";
+      defaultColor: string;
+      /** When set, the transfer function RGB is driven by this colormap. */
+      colormap?: ColormapName;
+    };
 
 export type AlphaSource = "from-intensity" | "separate-invlerp";
 
@@ -96,8 +101,6 @@ export function defaultMultiChannelConfig(
   };
 }
 
-const NUM_TF_SEED_POINTS = 5;
-
 function channelClause(channel: readonly number[] | undefined): string {
   if (channel === undefined || channel.length === 0) return "";
   return `channel=[${channel.join(",")}]`;
@@ -106,15 +109,6 @@ function channelClause(channel: readonly number[] | undefined): string {
 function joinParams(...parts: string[]): string {
   const nonEmpty = parts.filter((p) => p.length > 0);
   return nonEmpty.length === 0 ? "" : `(${nonEmpty.join(", ")})`;
-}
-
-function transferFunctionControlPoints(defaultColor: string): string {
-  const points: string[] = [];
-  for (let i = 0; i < NUM_TF_SEED_POINTS; i++) {
-    const t = i / (NUM_TF_SEED_POINTS - 1);
-    points.push(`[${t}, "${defaultColor}", ${t}]`);
-  }
-  return `[${points.join(", ")}]`;
 }
 
 interface Builder {
@@ -167,15 +161,20 @@ function emitTreatment(
     }
     case "transfer-function": {
       const tfName = `${prefix}_tf`;
-      const controlPoints = transferFunctionControlPoints(
-        treatment.defaultColor,
-      );
+      // Intentionally omit `controlPoints` and `window`: leaving both unset lets
+      // the transfer-function widget auto-range from the currently loaded data
+      // and seed default control points (transparent -> defaultColor) at 30%/70%
+      // of that computed window. Emitting an explicit window=[0,1] would defeat
+      // that auto-ranging and bunch the points at the bottom of the data range.
+      const colormapClause =
+        treatment.colormap !== undefined
+          ? `colormap="${treatment.colormap}"`
+          : "";
       builder.directives.push(
         `#uicontrol transferFunction ${tfName}${joinParams(
           chClause,
-          `controlPoints=${controlPoints}`,
           `defaultColor="${treatment.defaultColor}"`,
-          "window=[0,1]",
+          colormapClause,
         )}`,
       );
       return {

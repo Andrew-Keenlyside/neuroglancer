@@ -549,6 +549,7 @@ class RenderingOptionsTab extends Tab {
         layer.fragmentMain,
         layer.codeVisible,
         layer.channelSpace,
+        layer.shaderControlState,
       ),
     );
 
