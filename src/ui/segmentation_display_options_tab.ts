@@ -19,6 +19,8 @@ import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
 import { SKELETON_RENDERING_SHADER_CONTROL_TOOL_ID } from "#src/layer/segmentation/json_keys.js";
 import { LAYER_CONTROLS } from "#src/layer/segmentation/layer_controls.js";
 import { Overlay } from "#src/overlay.js";
+import { WatchableValue } from "#src/trackable_value.js";
+import { CheckboxIcon } from "#src/widget/checkbox_icon.js";
 import { DependentViewWidget } from "#src/widget/dependent_view_widget.js";
 import { addLayerControlToOptionsTab } from "#src/widget/layer_control.js";
 import { LinkedLayerGroupWidget } from "#src/widget/linked_layer.js";
@@ -27,6 +29,7 @@ import {
   ShaderCodeWidget,
 } from "#src/widget/shader_code_widget.js";
 import { ShaderControls } from "#src/widget/shader_controls.js";
+import { SkeletonShaderWizardWidget } from "#src/widget/skeleton_shader_wizard.js";
 import { Tab } from "#src/widget/tab_view.js";
 
 function makeSkeletonShaderCodeWidget(layer: SegmentationUserLayer) {
@@ -90,18 +93,53 @@ export class DisplayOptionsTab extends Tab {
           const codeWidget = refCounted.registerDisposer(
             makeSkeletonShaderCodeWidget(this.layer),
           );
-          parent.appendChild(
-            makeShaderCodeWidgetTopRow(
-              this.layer,
-              codeWidget,
-              ShaderCodeOverlay,
-              {
-                title: "Documentation on image layer rendering",
-                href: "https://github.com/google/neuroglancer/blob/master/src/sliceview/image_layer_rendering.md",
-              },
-              "neuroglancer-segmentation-dropdown-skeleton-shader-header",
+          // Scalar (single-component) vertex attributes are the properties the
+          // wizard's invlerp controls can bind to.
+          const scalarProperties = skeletonLayer.vertexAttributes
+            .slice(1)
+            .filter((x) => x.numComponents === 1)
+            .map((x) => x.name);
+          const wizard = refCounted.registerDisposer(
+            new SkeletonShaderWizardWidget(
+              layer.displayState.skeletonRenderingOptions.shader,
+              layer.codeVisible,
+              new WatchableValue<readonly string[]>(scalarProperties),
+              layer.displayState.skeletonRenderingOptions.shaderControlState,
             ),
           );
+          const topRow = makeShaderCodeWidgetTopRow(
+            this.layer,
+            codeWidget,
+            ShaderCodeOverlay,
+            {
+              title: "Documentation on image layer rendering",
+              href: "https://github.com/google/neuroglancer/blob/master/src/sliceview/image_layer_rendering.md",
+            },
+            "neuroglancer-segmentation-dropdown-skeleton-shader-header",
+          );
+          const wandButton = refCounted.registerDisposer(
+            new CheckboxIcon(wizard.visible, {
+              svg: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5 19L12 12"/><path d="M16 2V14"/><path d="M10 8H22"/></svg>`,
+              text: "Wizard",
+              enableTitle: "Open shader wizard",
+              disableTitle: "Close shader wizard",
+              backgroundScheme: "dark",
+            }),
+          ).element;
+          wandButton.style.gap = "4px";
+          wandButton.style.padding = "1px 8px";
+          wandButton.style.marginRight = "4px";
+          wandButton.style.border = "1px solid #555";
+          refCounted.registerDisposer(
+            wizard.visible.changed.add(() => {
+              if (wizard.visible.value) {
+                layer.codeVisible.value = false;
+              }
+            }),
+          );
+          topRow.insertBefore(wandButton, topRow.children[1] ?? null);
+          parent.appendChild(topRow);
+          parent.appendChild(wizard.element);
           parent.appendChild(codeWidget.element);
           parent.appendChild(
             refCounted.registerDisposer(

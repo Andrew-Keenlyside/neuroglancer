@@ -873,6 +873,11 @@ function uniformName(controlName: string) {
 export function addControlsToBuilder(
   builderState: ShaderControlsBuilderState,
   builder: ShaderBuilder,
+  // When true, `propertyInvlerp` controls are emitted to the fragment stage in
+  // addition to the vertex stage. Used by skeleton shaders, whose user `main()`
+  // runs in the fragment stage (annotation user shaders run in the vertex stage,
+  // so the default keeps them vertex-only).
+  emitPropertyInvlerpToFragment = false,
 ) {
   const { builderValues } = builderState;
   for (const [name, control] of builderState.parseResult.controls) {
@@ -910,6 +915,10 @@ float ${uName}() {
         ];
         builder.addVertexCode(code);
         builder.addVertexCode(`#define ${name} ${uName}\n`);
+        if (emitPropertyInvlerpToFragment) {
+          builder.addFragmentCode(code);
+          builder.addFragmentCode(`#define ${name} ${uName}\n`);
+        }
         break;
       }
       case "checkbox": {

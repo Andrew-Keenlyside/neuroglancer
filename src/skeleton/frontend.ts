@@ -64,17 +64,22 @@ import {
   parameterizedEmitterDependentShaderGetter,
   shaderCodeWithLineDirective,
 } from "#src/webgl/dynamic_shader.js";
+import type { HistogramSpecifications } from "#src/webgl/empirical_cdf.js";
+import {
+  defineInvlerpShaderFunction,
+  enableLerpShaderFunction,
+} from "#src/webgl/lerp.js";
 import {
   defineLineShader,
   drawLines,
   initializeLineShader,
 } from "#src/webgl/lines.js";
+import { ShaderBuilder } from "#src/webgl/shader.js";
+import type { ShaderProgram, ShaderSamplerType } from "#src/webgl/shader.js";
 import type {
-  ShaderBuilder,
-  ShaderProgram,
-  ShaderSamplerType,
-} from "#src/webgl/shader.js";
-import type { ShaderControlsBuilderState } from "#src/webgl/shader_ui_controls.js";
+  ShaderControlsBuilderState,
+  ShaderDataContext,
+} from "#src/webgl/shader_ui_controls.js";
 import {
   addControlsToBuilder,
   getFallbackBuilderState,
@@ -166,13 +171,15 @@ class RenderHelper extends RefCounted {
           defineLineShader(builder);
           builder.addAttribute("highp uvec2", "aVertexIndex");
           builder.addUniform("highp float", "uLineWidth");
-          let vertexMain = `
-highp vec3 vertexA = readAttribute0(aVertexIndex.x);
-highp vec3 vertexB = readAttribute0(aVertexIndex.y);
-emitLine(uProjection, vertexA, vertexB, uLineWidth);
-highp uint lineEndpointIndex = getLineEndpointIndex();
-highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexIndex.y * lineEndpointIndex;
-`;
+          const code = shaderBuilderState.parseResult.code;
+          // Line width / node diameter can be set per-vertex from the shader via
+          // setLineWidth(). Because that value is consumed in the vertex stage
+          // (emitLine), the user main() is run in the vertex stage too, but only
+          // when the shader actually calls setLineWidth() — otherwise the shader
+          // stays fragment-only and width is the global uLineWidth (unchanged).
+          const usesSetLineWidth = code.includes("setLineWidth");
+          const { vertexAttributes } = this;
+          const numAttributes = vertexAttributes.length;
 
           builder.addFragmentCode(`
 vec4 segmentColor() {
@@ -184,23 +191,60 @@ void emitRGB(vec3 color) {
 void emitDefault() {
   emit(vec4(uColor.rgb, uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), uPickID);
 }
+void setLineWidth(float widthInPixels) {}
 `);
-          const { vertexAttributes } = this;
-          const numAttributes = vertexAttributes.length;
           for (let i = 1; i < numAttributes; ++i) {
             const info = vertexAttributes[i];
             builder.addVarying(`highp ${info.glslDataType}`, `vCustom${i}`);
+            const defines = `#define ${info.name} vCustom${i}\n#define prop_${info.name}() vCustom${i}\n`;
+            builder.addFragmentCode(defines);
+            builder.addVertexCode(defines);
+          }
+
+          let vertexMain = `
+highp vec3 vertexA = readAttribute0(aVertexIndex.x);
+highp vec3 vertexB = readAttribute0(aVertexIndex.y);
+`;
+          if (usesSetLineWidth) {
+            // Width pass: sample attributes at the segment start vertex so the
+            // width is constant across the expanded line quad, then run the user
+            // shader, which may call setLineWidth() to set ng_lineWidth.
+            for (let i = 1; i < numAttributes; ++i) {
+              vertexMain += `vCustom${i} = readAttribute${i}(aVertexIndex.x);\n`;
+            }
+            vertexMain += `ng_lineWidth = uLineWidth;
+userMain();
+emitLine(uProjection, vertexA, vertexB, ng_lineWidth);
+`;
+          } else {
+            vertexMain += `emitLine(uProjection, vertexA, vertexB, uLineWidth);\n`;
+          }
+          vertexMain += `highp uint lineEndpointIndex = getLineEndpointIndex();
+highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexIndex.y * lineEndpointIndex;
+`;
+          // Per-endpoint values for the color varyings consumed by the fragment.
+          for (let i = 1; i < numAttributes; ++i) {
             vertexMain += `vCustom${i} = readAttribute${i}(vertexIndex);\n`;
-            builder.addFragmentCode(`#define ${info.name} vCustom${i}\n`);
-            builder.addFragmentCode(
-              `#define prop_${info.name}() vCustom${i}\n`,
-            );
+          }
+          if (usesSetLineWidth) {
+            builder.addVertexCode(`
+float ng_lineWidth;
+void setLineWidth(float widthInPixels) { ng_lineWidth = widthInPixels; }
+void emitRGB(vec3 color) {}
+void emitDefault() {}
+vec4 segmentColor() { return uColor; }
+`);
           }
           builder.setVertexMain(vertexMain);
-          addControlsToBuilder(shaderBuilderState, builder);
-          builder.setFragmentMainFunction(
-            shaderCodeWithLineDirective(shaderBuilderState.parseResult.code),
-          );
+          addControlsToBuilder(shaderBuilderState, builder, true);
+          if (usesSetLineWidth) {
+            builder.addVertexCode(
+              "\n#define main userMain\n" +
+                shaderCodeWithLineDirective(code) +
+                "\n#undef main\n",
+            );
+          }
+          builder.setFragmentMainFunction(shaderCodeWithLineDirective(code));
         },
       },
     );
@@ -232,11 +276,13 @@ void emitDefault() {
             /*crossSectionFade=*/ this.targetIsSliceView,
           );
           builder.addUniform("highp float", "uNodeDiameter");
-          let vertexMain = `
-highp uint vertexIndex = uint(gl_InstanceID);
-highp vec3 vertexPosition = readAttribute0(vertexIndex);
-emitCircle(uProjection * vec4(vertexPosition, 1.0), uNodeDiameter, 0.0);
-`;
+          const code = shaderBuilderState.parseResult.code;
+          // See the edge shader: when the shader calls setLineWidth() the user
+          // main() also runs in the vertex stage, and the node diameter tracks
+          // the set width; otherwise the global uNodeDiameter is used.
+          const usesSetLineWidth = code.includes("setLineWidth");
+          const { vertexAttributes } = this;
+          const numAttributes = vertexAttributes.length;
 
           builder.addFragmentCode(`
 vec4 segmentColor() {
@@ -252,23 +298,49 @@ void emitRGB(vec3 color) {
 void emitDefault() {
   emitRGBA(uColor);
 }
+void setLineWidth(float widthInPixels) {}
 `);
-          const { vertexAttributes } = this;
-          const numAttributes = vertexAttributes.length;
           for (let i = 1; i < numAttributes; ++i) {
             const info = vertexAttributes[i];
             builder.addVarying(`highp ${info.glslDataType}`, `vCustom${i}`);
+            const defines = `#define ${info.name} vCustom${i}\n#define prop_${info.name}() vCustom${i}\n`;
+            builder.addFragmentCode(defines);
+            builder.addVertexCode(defines);
+          }
+
+          let vertexMain = `
+highp uint vertexIndex = uint(gl_InstanceID);
+highp vec3 vertexPosition = readAttribute0(vertexIndex);
+`;
+          for (let i = 1; i < numAttributes; ++i) {
             vertexMain += `vCustom${i} = readAttribute${i}(vertexIndex);\n`;
-            builder.addFragmentCode(`#define ${info.name} vCustom${i}\n`);
-            builder.addFragmentCode(
-              `#define prop_${info.name}() vCustom${i}\n`,
-            );
+          }
+          if (usesSetLineWidth) {
+            vertexMain += `ng_lineWidth = uNodeDiameter;
+userMain();
+emitCircle(uProjection * vec4(vertexPosition, 1.0), ng_lineWidth, 0.0);
+`;
+            builder.addVertexCode(`
+float ng_lineWidth;
+void setLineWidth(float widthInPixels) { ng_lineWidth = widthInPixels; }
+void emitRGBA(vec4 color) {}
+void emitRGB(vec3 color) {}
+void emitDefault() {}
+vec4 segmentColor() { return uColor; }
+`);
+          } else {
+            vertexMain += `emitCircle(uProjection * vec4(vertexPosition, 1.0), uNodeDiameter, 0.0);\n`;
           }
           builder.setVertexMain(vertexMain);
-          addControlsToBuilder(shaderBuilderState, builder);
-          builder.setFragmentMainFunction(
-            shaderCodeWithLineDirective(shaderBuilderState.parseResult.code),
-          );
+          addControlsToBuilder(shaderBuilderState, builder, true);
+          if (usesSetLineWidth) {
+            builder.addVertexCode(
+              "\n#define main userMain\n" +
+                shaderCodeWithLineDirective(code) +
+                "\n#undef main\n",
+            );
+          }
+          builder.setFragmentMainFunction(shaderCodeWithLineDirective(code));
         },
       },
     );
@@ -300,6 +372,125 @@ void emitDefault() {
         ),
       );
     });
+  }
+
+  private histogramShaders = new Map<number, ShaderProgram>();
+
+  /**
+   * Returns a shader that scatters one point per skeleton vertex into a 256-bin
+   * histogram framebuffer, reading vertex attribute `attributeIndex` and mapping
+   * it through `invlerpForHistogram` (bounds supplied at draw time). Mirrors the
+   * annotation property-histogram shader.
+   */
+  private getHistogramShader(attributeIndex: number): ShaderProgram {
+    const { histogramShaders } = this;
+    let shader = histogramShaders.get(attributeIndex);
+    if (shader === undefined) {
+      const { gl } = this;
+      shader = gl.memoize.get(
+        JSON.stringify({
+          t: "skeleton/SkeletonShaderManager/histogram",
+          attributeIndex,
+          vertexAttributes: this.vertexAttributes.map((a) => ({
+            name: a.name,
+            dataType: a.dataType,
+            numComponents: a.numComponents,
+          })),
+        }),
+        () => {
+          const builder = new ShaderBuilder(gl);
+          this.defineAttributeAccess(builder);
+          builder.addOutputBuffer("vec4", "out_histogram", 0);
+          builder.addVertexCode(
+            defineInvlerpShaderFunction(
+              builder,
+              "invlerpForHistogram",
+              DataType.FLOAT32,
+              /*clamp=*/ false,
+            ),
+          );
+          builder.setVertexMain(`
+highp uint vertexIndex = uint(gl_VertexID);
+float x = invlerpForHistogram(readAttribute${attributeIndex}(vertexIndex));
+if (x < 0.0) x = 0.0;
+else if (x > 1.0) x = 1.0;
+else x = (1.0 + x * 253.0) / 255.0;
+gl_Position = vec4(2.0 * (x * 255.0 + 0.5) / 256.0 - 1.0, 0.0, 0.0, 1.0);
+gl_PointSize = 1.0;
+`);
+          builder.setFragmentMain("out_histogram = vec4(1.0, 1.0, 1.0, 1.0);");
+          return builder.build();
+        },
+      );
+      histogramShaders.set(attributeIndex, shader);
+    }
+    return shader;
+  }
+
+  /**
+   * Accumulates per-vertex-property histograms for the given chunk into the
+   * framebuffers owned by `histogramSpecifications`, one per referenced vertex
+   * property. Uses additive blending and clears once per frame so contributions
+   * from all visible skeleton chunks accumulate.
+   */
+  computeHistograms(
+    skeletonChunk: SkeletonChunk,
+    histogramSpecifications: HistogramSpecifications,
+    frameNumber: number,
+  ) {
+    const { gl, vertexAttributes } = this;
+    const properties = histogramSpecifications.properties.value;
+    const numHistograms = properties.length;
+    if (numHistograms === 0 || skeletonChunk.numVertices === 0) return;
+    const bounds = histogramSpecifications.bounds.value;
+    const framebuffers = histogramSpecifications.getFramebuffers(gl);
+    const oldFrameNumber = histogramSpecifications.frameNumber;
+    histogramSpecifications.frameNumber = frameNumber;
+    const { vertexAttributeTextures } = skeletonChunk;
+    gl.enable(WebGL2RenderingContext.BLEND);
+    gl.disable(WebGL2RenderingContext.SCISSOR_TEST);
+    gl.disable(WebGL2RenderingContext.DEPTH_TEST);
+    gl.blendFunc(WebGL2RenderingContext.ONE, WebGL2RenderingContext.ONE);
+    for (
+      let histogramIndex = 0;
+      histogramIndex < numHistograms;
+      ++histogramIndex
+    ) {
+      const attributeIndex = vertexAttributes.findIndex(
+        (a) => a.name === properties[histogramIndex],
+      );
+      if (attributeIndex <= 0) continue;
+      const shader = this.getHistogramShader(attributeIndex);
+      shader.bind();
+      // Bind the vertex attribute textures the accessor functions sample from.
+      for (let i = 0; i < vertexAttributes.length; ++i) {
+        gl.activeTexture(
+          WebGL2RenderingContext.TEXTURE0 +
+            shader.textureUnit(vertexAttributeSamplerSymbols[i]),
+        );
+        gl.bindTexture(
+          WebGL2RenderingContext.TEXTURE_2D,
+          vertexAttributeTextures[i],
+        );
+      }
+      enableLerpShaderFunction(
+        shader,
+        "invlerpForHistogram",
+        DataType.FLOAT32,
+        bounds[histogramIndex],
+      );
+      framebuffers[histogramIndex].bind(256, 1);
+      if (frameNumber !== oldFrameNumber) {
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(WebGL2RenderingContext.COLOR_BUFFER_BIT);
+      }
+      gl.drawArrays(
+        WebGL2RenderingContext.POINTS,
+        0,
+        skeletonChunk.numVertices,
+      );
+    }
+    gl.disable(WebGL2RenderingContext.BLEND);
   }
 
   getCrossSectionFadeFactor() {
@@ -425,7 +616,11 @@ export class SkeletonRenderingOptions implements Trackable {
   }
 
   shader = makeTrackableFragmentMain(DEFAULT_FRAGMENT_MAIN);
-  shaderControlState = new ShaderControlState(this.shader);
+  // Exposes the skeleton's per-vertex attributes to the shader controls as
+  // `properties`, so `#uicontrol invlerp name(property="…")` can bind to them.
+  // Populated once the skeleton source's vertex attributes are known.
+  dataContext = new WatchableValue<ShaderDataContext>({});
+  shaderControlState = new ShaderControlState(this.shader, this.dataContext);
   params2d: ViewSpecificSkeletonRenderingOptions = {
     mode: new TrackableSkeletonRenderMode(SkeletonRenderMode.LINES_AND_POINTS),
     lineWidth: new TrackableSkeletonLineWidth(2),
@@ -523,6 +718,17 @@ export class SkeletonLayer extends RefCounted {
           info.numComponents > 1 ? `vec${info.numComponents}` : "float",
       });
     }
+
+    // Expose scalar vertex attributes as shader-control properties so that
+    // `#uicontrol invlerp name(property="…")` (used by the skeleton shader
+    // wizard) can bind to them.
+    const properties = new Map<string, DataType>();
+    for (const attr of vertexAttributes) {
+      if (attr.name !== "" && attr.numComponents === 1) {
+        properties.set(attr.name, attr.dataType);
+      }
+    }
+    displayState.skeletonRenderingOptions.dataContext.value = { properties };
   }
 
   get gl() {
@@ -635,6 +841,32 @@ export class SkeletonLayer extends RefCounted {
       },
     );
     renderHelper.endLayer(gl, edgeShader);
+
+    // After drawing, accumulate per-vertex-property histograms for any invlerp
+    // controls that reference vertex attributes, so their widgets show a CDF and
+    // auto-range works. Done in a separate pass (it rebinds the framebuffer) and
+    // gated so it costs nothing when no histograms are needed.
+    const { histogramSpecifications } = shaderControlState;
+    if (histogramSpecifications.visibleHistograms > 0) {
+      forEachVisibleSegment(
+        displayState.segmentationGroupState.value,
+        (objectId) => {
+          const skeleton = skeletons.get(getObjectKey(objectId));
+          if (
+            skeleton === undefined ||
+            skeleton.state !== ChunkState.GPU_MEMORY
+          ) {
+            return;
+          }
+          renderHelper.computeHistograms(
+            skeleton,
+            histogramSpecifications,
+            renderContext.frameNumber,
+          );
+        },
+      );
+      renderContext.bindFramebuffer();
+    }
   }
 
   isReady() {
@@ -685,6 +917,13 @@ export class PerspectiveViewSkeletonLayer extends PerspectiveViewRenderLayer {
       renderOptions.lineWidth.changed.add(this.redrawNeeded.dispatch),
     );
     this.registerDisposer(base.visibility.add(this.visibility));
+    // Mark this layer as a producer of the property histograms so the invlerp
+    // widgets draw the CDF curve (the per-vertex histogram is computed in draw).
+    this.registerDisposer(
+      base.displayState.skeletonRenderingOptions.shaderControlState.histogramSpecifications.producerVisibility.add(
+        this.visibility,
+      ),
+    );
   }
   get gl() {
     return this.base.gl;
@@ -737,6 +976,13 @@ export class SliceViewPanelSkeletonLayer extends SliceViewPanelRenderLayer {
     );
     this.registerDisposer(base.redrawNeeded.add(this.redrawNeeded.dispatch));
     this.registerDisposer(base.visibility.add(this.visibility));
+    // Mark this layer as a producer of the property histograms so the invlerp
+    // widgets draw the CDF curve (the per-vertex histogram is computed in draw).
+    this.registerDisposer(
+      base.displayState.skeletonRenderingOptions.shaderControlState.histogramSpecifications.producerVisibility.add(
+        this.visibility,
+      ),
+    );
   }
   get gl() {
     return this.base.gl;
