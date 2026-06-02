@@ -55,9 +55,9 @@ import {
   type ColormapBinName,
   type ColormapName,
   colormapDataLoaded,
+  getAllColormapsAsync,
   getColormapBytes,
-  getColormapDataPromise,
-  getGrayscaleFallbackBytes,
+  getColormapBytesAsync,
 } from "#src/webgl/colormaps.js";
 import type { GL } from "#src/webgl/context.js";
 import type { HistogramSpecifications } from "#src/webgl/empirical_cdf.js";
@@ -127,8 +127,12 @@ function sampleColormap(
   name: ColormapBinName,
   t: number,
 ): [number, number, number] {
-  const bytes = getColormapBytes(name) ?? getGrayscaleFallbackBytes();
-  const x = Math.min(1, Math.max(0, t)) * 255;
+  const tc = Math.min(1, Math.max(0, t));
+  const bytes = getColormapBytes(name);
+  // Fall back to a grayscale ramp until the colormap byte data has loaded; the
+  // caller refreshes once colormapDataLoaded fires.
+  if (bytes === undefined) return [tc, tc, tc];
+  const x = tc * 255;
   const lo = Math.floor(x);
   const hi = Math.min(255, lo + 1);
   const f = x - lo;
@@ -1836,7 +1840,7 @@ class TransferFunctionWidget extends Tab {
     // Colormap byte data loads asynchronously. Start the fetch and, once it
     // arrives, rebuild the panel preview and trigger a layer redraw (which
     // rebuilds the GPU lookup-table texture with the real colormap colors).
-    void getColormapDataPromise();
+    void getAllColormapsAsync();
     this.registerDisposer(
       colormapDataLoaded.add(() => {
         this.updateControlPointsAndDraw();
@@ -2138,7 +2142,7 @@ export function enableTransferFunctionShader(
   // table can be rebuilt with real colors once it arrives, even when no
   // colormap widget/legend is open to trigger the load.
   if (colormap !== undefined) {
-    void getColormapDataPromise();
+    void getColormapBytesAsync(colormap);
   }
   const texture = shader.transferFunctionTextures.get(
     `TransferFunction.${name}`,
