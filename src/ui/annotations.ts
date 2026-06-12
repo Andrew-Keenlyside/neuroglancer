@@ -137,6 +137,7 @@ import { Tab } from "#src/widget/tab_view.js";
 import type { VirtualListSource } from "#src/widget/virtual_list.js";
 import { VirtualList } from "#src/widget/virtual_list.js";
 import { TrackableRoiBoxState } from "#src/roi_box.js";
+import { RoiBoxWidget } from "#src/ui/roi_box_widget.js";
 
 export class MergedAnnotationStates
   extends RefCounted
@@ -1083,6 +1084,11 @@ export class AnnotationTab extends Tab {
 
     const { element } = this;
     element.classList.add("neuroglancer-annotations-tab");
+
+    const roiWidget = this.registerDisposer(
+      new RoiBoxWidget(layer.roiBoxState),
+    );
+    element.appendChild(roiWidget.element);
     element.appendChild(this.layerView.element);
   }
 }

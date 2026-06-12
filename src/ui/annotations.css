@@ -350,3 +350,78 @@ input.neuroglancer-segment-list-entry-id {
 .neuroglancer-related-segment-list-header-checkbox {
   min-width: 17px;
 }
+
+.neuroglancer-roi-box-widget {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 6px;
+  border-bottom: 1px solid #444;
+  font-size: small;
+  color: #ccc;
+}
+
+.neuroglancer-roi-box-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.neuroglancer-roi-box-header {
+  font-weight: bold;
+  gap: 8px;
+}
+
+.neuroglancer-roi-box-enable-label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+}
+
+.neuroglancer-roi-box-edit-label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  margin-left: auto;
+}
+
+.neuroglancer-roi-box-row-label {
+  min-width: 40px;
+  color: #aaa;
+}
+
+.neuroglancer-roi-box-uniform-label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  margin-left: 2px;
+  color: #aaa;
+}
+
+.neuroglancer-roi-box-size-input,
+.neuroglancer-roi-box-offset-input {
+  width: 62px;
+  background: #222;
+  color: #eee;
+  border: 1px solid #555;
+  border-radius: 2px;
+  padding: 1px 3px;
+  font-size: small;
+  text-align: right;
+}
+
+.neuroglancer-roi-box-size-input:focus,
+.neuroglancer-roi-box-offset-input:focus {
+  outline: none;
+  border-color: #06e;
+}
+
+.neuroglancer-roi-box-size-input:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
