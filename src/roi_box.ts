@@ -44,9 +44,9 @@ import type { Trackable } from "#src/util/trackable.js";
  */
 export interface RoiBoxParameters {
   enabled: boolean;
-  /** Full size of the box along each global display axis, in physical units. */
+  /** Full size of the box along each global display axis, in SI meters. */
   physicalSize: Float32Array;
-  /** Offset of the box center from the anchor (cursor or fixedAnchor), physical units. */
+  /** Offset of the box center from the anchor (cursor or fixedAnchor), in SI meters. */
   offset: Float32Array;
   /** When true, the box center tracks the cursor; otherwise it sits at `fixedAnchor`. */
   followCursor: boolean;
@@ -58,7 +58,7 @@ export interface RoiBoxParameters {
   uniformSize: boolean;
 }
 
-const DEFAULT_PHYSICAL_SIZE = 1000; // physical units along each axis by default
+const DEFAULT_PHYSICAL_SIZE = 1e-6; // 1 μm in SI meters
 
 export function makeDefaultRoiBoxParameters(): RoiBoxParameters {
   return {
@@ -102,19 +102,18 @@ export interface RoiGlobalBox {
  * @param center Box anchor in global voxel coordinates (cursor position when
  *     `followCursor`, otherwise ignored in favor of `params.fixedAnchor`). Length
  *     equals the number of display dimensions (<= 3).
- * @param canonicalVoxelPhysicalSize Physical size of one canonical voxel (from
- *     `DisplayDimensionRenderInfo`), used to convert physical units to voxels.
+ * @param displayScales Physical scale (SI meters per voxel) for each display
+ *     axis. Typically `coordinateSpace.scales[displayDimIndices]`. Used to
+ *     convert SI-meter physical sizes to per-axis voxel extents, correctly
+ *     handling anisotropic data.
  * @param zoomFactor Current zoom (canonical voxels per screen pixel). When
- *     `zoomRelative` is set the half-extent is scaled by this so the box stays a
- *     constant size on screen, mirroring the depth-range "zoom-relative" option.
- *
- * NOTE: the exact zoom scaling convention is validated against the depth-range
- * behavior during end-to-end testing.
+ *     `zoomRelative` is set the half-extents are scaled by this so the box
+ *     stays a constant size on screen, mirroring the depth-range convention.
  */
 export function computeRoiGlobalBox(
   params: RoiBoxParameters,
   center: Float32Array,
-  canonicalVoxelPhysicalSize: number,
+  displayScales: ArrayLike<number>,
   zoomFactor: number,
 ): RoiGlobalBox {
   const rank = center.length;
@@ -122,9 +121,10 @@ export function computeRoiGlobalBox(
   const upper = new Float32Array(rank);
   const anchor = params.followCursor ? center : params.fixedAnchor;
   for (let i = 0; i < rank; ++i) {
-    const offsetVoxels = params.offset[i] / canonicalVoxelPhysicalSize;
+    const scale = (displayScales[i] as number | undefined) || 1;
+    const offsetVoxels = (params.offset[i] ?? 0) / scale;
     let halfExtentVoxels =
-      params.physicalSize[i] / 2 / canonicalVoxelPhysicalSize;
+      (params.physicalSize[i] ?? DEFAULT_PHYSICAL_SIZE) / 2 / scale;
     if (params.zoomRelative) {
       halfExtentVoxels *= zoomFactor;
     }

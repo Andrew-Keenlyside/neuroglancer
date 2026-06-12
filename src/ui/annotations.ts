@@ -52,11 +52,19 @@ import {
   SpatiallyIndexedPerspectiveViewAnnotationLayer,
   SpatiallyIndexedSliceViewAnnotationLayer,
 } from "#src/annotation/renderlayer.js";
-import type { CoordinateSpace } from "#src/coordinate_transform.js";
+import {
+  emptyValidCoordinateSpace,
+  makeIdentityTransform,
+  type CoordinateSpace,
+} from "#src/coordinate_transform.js";
 import type { MouseSelectionState, UserLayer } from "#src/layer/index.js";
+import { LayerDataSource } from "#src/layer/layer_data_source.js";
 import type { LoadedDataSubsource } from "#src/layer/layer_data_source.js";
 import type { ChunkTransformParameters } from "#src/render_coordinate_transform.js";
-import { getChunkPositionFromCombinedGlobalLocalPositions } from "#src/render_coordinate_transform.js";
+import {
+  getChunkPositionFromCombinedGlobalLocalPositions,
+  getWatchableRenderLayerTransform,
+} from "#src/render_coordinate_transform.js";
 import {
   RenderScaleHistogram,
   trackableRenderScaleTarget,
@@ -76,6 +84,8 @@ import type { WatchableValueInterface } from "#src/trackable_value.js";
 import {
   AggregateWatchableValue,
   ConditionalWatchableValue,
+  constantWatchableValue,
+  makeCachedDerivedWatchableValue,
   makeCachedLazyDerivedWatchableValue,
   registerNested,
   WatchableValue,
@@ -126,6 +136,7 @@ import { makeMoveToButton } from "#src/widget/move_to_button.js";
 import { Tab } from "#src/widget/tab_view.js";
 import type { VirtualListSource } from "#src/widget/virtual_list.js";
 import { VirtualList } from "#src/widget/virtual_list.js";
+import { TrackableRoiBoxState } from "#src/roi_box.js";
 
 export class MergedAnnotationStates
   extends RefCounted
@@ -1925,6 +1936,9 @@ function makeRelatedSegmentList(
 }
 
 const ANNOTATION_COLOR_JSON_KEY = "annotationColor";
+const ROI_BOX_JSON_KEY = "roiBox";
+const ROI_SENTINEL_ID = "roi-box-0";
+
 export function UserLayerWithAnnotationsMixin<
   TBase extends { new (...args: any[]): UserLayer },
 >(Base: TBase) {
@@ -1937,6 +1951,15 @@ export function UserLayerWithAnnotationsMixin<
     annotationProjectionRenderScaleTarget = trackableRenderScaleTarget(8);
     allowDependentAnnotationViewUpdate = new TrackableBoolean(true);
     static supportColorPickerInAnnotationTab = true;
+
+    roiBoxState = this.registerDisposer(new TrackableRoiBoxState());
+    // Separate display state so the ROI box renders in a distinct color and
+    // is not confused with user-created annotations in the selection UI.
+    roiAnnotationDisplayState = (() => {
+      const s = new AnnotationDisplayState();
+      s.color.value = vec3.fromValues(0, 0.9, 1); // cyan
+      return s;
+    })();
 
     constructor(...args: any[]) {
       super(...args);
@@ -1968,6 +1991,156 @@ export function UserLayerWithAnnotationsMixin<
       };
       this.readyStateChanged.add(updateReadyBinding);
       updateReadyBinding();
+
+      // Wire ROI box state changes into the layer's specification-changed signal.
+      this.registerDisposer(
+        this.roiBoxState.changed.add(this.specificationChanged.dispatch),
+      );
+
+      // When roiBoxState.enabled becomes true, create a synthetic annotation
+      // layer (not in annotationStates) that renders the ROI box in 2D/3D and
+      // keeps a sentinel AxisAlignedBoundingBox annotation up to date as the
+      // cursor moves.
+      this.registerDisposer(
+        registerNested((context, enabled) => {
+          if (!enabled) return;
+          const globalSpace = this.manager.root.coordinateSpace.value;
+          if (!globalSpace.valid) return;
+          const rank = globalSpace.rank;
+
+          // Annotation source holding the one sentinel bounding-box annotation.
+          const source = context.registerDisposer(new AnnotationSource(rank));
+          source.add({
+            type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
+            id: ROI_SENTINEL_ID,
+            description: undefined,
+            relatedSegments: undefined,
+            properties: [],
+            pointA: new Float32Array(rank),
+            pointB: new Float32Array(rank),
+          } as AxisAlignedBoundingBox);
+          const ref = context.registerDisposer(
+            source.getReference(ROI_SENTINEL_ID),
+          );
+
+          // Identity transform: annotation coordinates == global voxel coords.
+          const identityTransform = context.registerDisposer(
+            makeCachedDerivedWatchableValue(
+              (space) => makeIdentityTransform(space),
+              [this.manager.root.coordinateSpace],
+            ),
+          );
+          const layerTransform = context.registerDisposer(
+            getWatchableRenderLayerTransform(
+              this.manager.root.coordinateSpace,
+              constantWatchableValue(emptyValidCoordinateSpace),
+              identityTransform,
+              undefined,
+            ),
+          );
+
+          // Sentinel data source (not loaded; satisfies AnnotationLayerState API).
+          const sentinelDs = context.registerDisposer(
+            new LayerDataSource(this, undefined),
+          );
+
+          const layerState = context.registerDisposer(
+            new AnnotationLayerState({
+              transform: layerTransform,
+              localPosition: constantWatchableValue(new Float32Array(0)),
+              source: source.addRef(),
+              displayState: this.roiAnnotationDisplayState,
+              dataSource: sentinelDs,
+              subsourceId: ROI_SENTINEL_ID,
+              subsourceIndex: 0,
+              role: RenderLayerRole.ANNOTATION,
+            }),
+          );
+
+          // Render layers (not added to annotationStates — not user-selectable).
+          const annotationLayer = context.registerDisposer(
+            new AnnotationLayer(this.manager.chunkManager, layerState.addRef()),
+          );
+          context.registerDisposer(
+            this.addRenderLayer(
+              new SliceViewAnnotationLayer(
+                annotationLayer,
+                this.annotationCrossSectionRenderScaleHistogram,
+              ),
+            ),
+          );
+          context.registerDisposer(
+            this.addRenderLayer(
+              new PerspectiveViewAnnotationLayer(
+                annotationLayer.addRef(),
+                this.annotationProjectionRenderScaleHistogram,
+              ),
+            ),
+          );
+
+          // Geometry controller: recompute pointA/pointB whenever cursor or
+          // box parameters change, then update the sentinel annotation.
+          const updateGeometry = context.registerCancellable(
+            animationFrameDebounce(() => {
+              const ct = layerState.chunkTransform.value;
+              if (ct.error !== undefined) return;
+              const coordSpace = this.manager.root.coordinateSpace.value;
+              if (!coordSpace.valid) return;
+              const r = ct.modelTransform.unpaddedRank;
+
+              const center = new Float32Array(r);
+              if (this.roiBoxState.followCursor.value) {
+                const ms = this.manager.layerSelectedValues.mouseState;
+                const pos = getMousePositionInAnnotationCoordinates(
+                  ms,
+                  layerState,
+                );
+                if (pos === undefined) return;
+                for (let i = 0; i < r; i++) center[i] = pos[i];
+              } else {
+                const anchor = this.roiBoxState.fixedAnchor.value;
+                for (let i = 0; i < r; i++) center[i] = anchor[i] ?? 0;
+              }
+
+              const sizeVec = this.roiBoxState.physicalSize.value;
+              const offsetVec = this.roiBoxState.offset.value;
+              const pointA = new Float32Array(r);
+              const pointB = new Float32Array(r);
+              for (let i = 0; i < r; i++) {
+                const scale = coordSpace.scales[i] || 1;
+                const half = (sizeVec[i] ?? 1e-6) / (2 * scale);
+                const off = (offsetVec[i] ?? 0) / scale;
+                const c = center[i] + off;
+                pointA[i] = c - half;
+                pointB[i] = c + half;
+              }
+
+              source.update(ref, {
+                type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
+                id: ROI_SENTINEL_ID,
+                description: undefined,
+                relatedSegments: undefined,
+                properties: [],
+                pointA,
+                pointB,
+              } as AxisAlignedBoundingBox);
+            }),
+          );
+
+          context.registerDisposer(
+            this.manager.layerSelectedValues.mouseState.changed.add(
+              updateGeometry,
+            ),
+          );
+          context.registerDisposer(
+            this.roiBoxState.changed.add(updateGeometry),
+          );
+          context.registerDisposer(
+            this.manager.root.coordinateSpace.changed.add(updateGeometry),
+          );
+          updateGeometry();
+        }, this.roiBoxState.enabled),
+      );
 
       const { mouseState } = this.manager.layerSelectedValues;
       this.registerDisposer(
@@ -2009,6 +2182,10 @@ export function UserLayerWithAnnotationsMixin<
       this.annotationDisplayState.color.restoreState(
         specification[ANNOTATION_COLOR_JSON_KEY],
       );
+      const roiBoxJson = specification[ROI_BOX_JSON_KEY];
+      if (roiBoxJson !== undefined) {
+        this.roiBoxState.restoreState(roiBoxJson);
+      }
     }
 
     captureSelectionState(
@@ -2699,6 +2876,10 @@ export function UserLayerWithAnnotationsMixin<
     toJSON() {
       const x = super.toJSON();
       x[ANNOTATION_COLOR_JSON_KEY] = this.annotationDisplayState.color.toJSON();
+      const roiBoxJson = this.roiBoxState.toJSON();
+      if (roiBoxJson !== undefined) {
+        x[ROI_BOX_JSON_KEY] = roiBoxJson;
+      }
       return x;
     }
   }
