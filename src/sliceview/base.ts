@@ -803,6 +803,7 @@ export const SLICEVIEW_ADD_VISIBLE_LAYER_RPC_ID = "SliceView.addVisibleLayer";
 export const SLICEVIEW_REMOVE_VISIBLE_LAYER_RPC_ID =
   "SliceView.removeVisibleLayer";
 export const SLICEVIEW_REQUEST_CHUNK_RPC_ID = "ChunkManager.requestChunk";
+export const SLICEVIEW_UPDATE_LAYER_ROI_RPC_ID = "SliceView.updateLayerRoi";
 
 const tempVisibleVolumetricChunkLower = new Float32Array(3);
 const tempVisibleVolumetricChunkUpper = new Float32Array(3);

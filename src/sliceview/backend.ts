@@ -45,8 +45,14 @@ import {
   SLICEVIEW_RENDERLAYER_RPC_ID,
   SLICEVIEW_REQUEST_CHUNK_RPC_ID,
   SLICEVIEW_RPC_ID,
+  SLICEVIEW_UPDATE_LAYER_ROI_RPC_ID,
   SliceViewBase,
 } from "#src/sliceview/base.js";
+import {
+  computeRoiGlobalBox,
+  type RoiBoxParameters,
+  roiGlobalBoxToLocalBounds,
+} from "#src/roi_box.js";
 import { ChunkLayout } from "#src/sliceview/chunk_layout.js";
 import type { WatchableValueInterface } from "#src/trackable_value.js";
 import { raceWithAbort } from "#src/util/abort.js";
@@ -172,6 +178,32 @@ export class SliceViewBackend extends SliceViewIntermediateBase {
         const priorityIndex = i;
         const sourceBasePriority =
           basePriority + SCALE_PRIORITY_MULTIPLIER * priorityIndex;
+
+        // Compute ROI chunk-grid bounds for this source (snapped outward to chunk boundaries).
+        let roiChunkLower: vec3 | null = null;
+        let roiChunkUpper: vec3 | null = null;
+        const roi = layer.roiBoxParameters;
+        if (roi?.enabled) {
+          const center = roi.followNavCenter
+            ? projectionParameters.centerDataPosition
+            : roi.center;
+          const { displayDimensionRenderInfo } = projectionParameters;
+          const globalBox = computeRoiGlobalBox(
+            center,
+            roi.physicalSize,
+            displayDimensionRenderInfo.displayDimensionScales,
+            projectionParameters.pixelSize,
+            roi.zoomRelative,
+          );
+          const bounds = roiGlobalBoxToLocalBounds(
+            globalBox,
+            chunkLayout.invTransform,
+            chunkLayout.size,
+          );
+          roiChunkLower = bounds.lower;
+          roiChunkUpper = bounds.upper;
+        }
+
         curVisibleChunks.length = 0;
         const curMarkGeneration = getNextMarkGeneration();
         forEachPlaneIntersectingVolumetricChunk(
@@ -180,6 +212,16 @@ export class SliceViewBackend extends SliceViewIntermediateBase {
           tsource,
           getNormalizedChunkLayout(projectionParameters, tsource.chunkLayout),
           (positionInChunks) => {
+            if (roiChunkLower !== null) {
+              for (let d = 0; d < finiteRank; ++d) {
+                if (
+                  positionInChunks[d] < roiChunkLower[d] ||
+                  positionInChunks[d] >= roiChunkUpper![d]
+                ) {
+                  return;
+                }
+              }
+            }
             vec3.multiply(tempChunkPosition, positionInChunks, chunkSize);
             const priority = -vec3.distance(localCenter, tempChunkPosition);
             const { curPositionInChunks } = tsource;
@@ -330,6 +372,7 @@ export function deserializeTransformedSources<
 registerRPC(SLICEVIEW_ADD_VISIBLE_LAYER_RPC_ID, function (x) {
   const obj = <SliceViewBackend>this.get(x.id);
   const layer = <SliceViewRenderLayerBackend>this.get(x.layerId);
+  layer.roiBoxParameters = x.roiBox ?? null;
   const sources = deserializeTransformedSources<
     SliceViewChunkSourceBackend,
     SliceViewRenderLayerBackend
@@ -340,6 +383,12 @@ registerRPC(SLICEVIEW_REMOVE_VISIBLE_LAYER_RPC_ID, function (x) {
   const obj = <SliceViewBackend>this.get(x.id);
   const layer = <SliceViewRenderLayerBackend>this.get(x.layerId);
   obj.removeVisibleLayer(layer);
+});
+registerRPC(SLICEVIEW_UPDATE_LAYER_ROI_RPC_ID, function (x) {
+  const view = <SliceViewBackend>this.get(x.id);
+  const layer = <SliceViewRenderLayerBackend>this.get(x.layerId);
+  layer.roiBoxParameters = x.roiBox ?? null;
+  view.chunkManager.scheduleUpdateChunkPriorities();
 });
 
 export class SliceViewChunk extends Chunk {
@@ -414,6 +463,7 @@ export class SliceViewRenderLayerBackend
   declare rpcId: number;
   renderScaleTarget: SharedWatchableValue<number>;
   localPosition: WatchableValueInterface<Float32Array>;
+  roiBoxParameters: RoiBoxParameters | null = null;
 
   numVisibleChunksNeeded: number;
   numVisibleChunksAvailable: number;

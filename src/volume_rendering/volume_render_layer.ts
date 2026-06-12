@@ -68,6 +68,7 @@ import {
   forEachVisibleVolumeRenderingChunk,
   getVolumeRenderingNearFarBounds,
   VOLUME_RENDERING_RENDER_LAYER_RPC_ID,
+  VOLUME_RENDERING_RENDER_LAYER_UPDATE_ROI_RPC_ID,
   VOLUME_RENDERING_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
 } from "#src/volume_rendering/base.js";
 import type { TrackableVolumeRenderingModeValue } from "#src/volume_rendering/trackable_volume_rendering_mode.js";
@@ -805,6 +806,7 @@ gl_Position = uModelViewProjectionMatrix * vec4(position, 1.0);
                 view: attachment.view.rpcId,
                 sources: serializeAllTransformedSources(transformedSources),
                 displayDimensionRenderInfo,
+                roiBox: this.roiBoxState?.toParameters() ?? null,
               },
             );
             this.redrawNeeded.dispatch();
@@ -815,6 +817,20 @@ gl_Position = uModelViewProjectionMatrix * vec4(position, 1.0);
         ),
       ),
     };
+    // Wire ROI box changes → backend chunk priority update.
+    if (this.roiBoxState != null) {
+      const roiBoxState = this.roiBoxState;
+      const rpc = this.backend.rpc!;
+      const layerRpcId = this.backend.rpcId;
+      attachment.registerDisposer(
+        roiBoxState.changed.add(() => {
+          rpc.invoke(VOLUME_RENDERING_RENDER_LAYER_UPDATE_ROI_RPC_ID, {
+            layer: layerRpcId,
+            roiBox: roiBoxState.toParameters(),
+          });
+        }),
+      );
+    }
   }
 
   get chunkManager() {

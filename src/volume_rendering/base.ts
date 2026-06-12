@@ -33,6 +33,8 @@ export const VOLUME_RENDERING_RENDER_LAYER_RPC_ID =
   "volume_rendering/VolumeRenderingRenderLayer";
 export const VOLUME_RENDERING_RENDER_LAYER_UPDATE_SOURCES_RPC_ID =
   "volume_rendering/VolumeRenderingRenderLayer/update";
+export const VOLUME_RENDERING_RENDER_LAYER_UPDATE_ROI_RPC_ID =
+  "volume_rendering/VolumeRenderingRenderLayer/updateRoi";
 
 const DEBUG_CHUNK_LEVEL = false;
 

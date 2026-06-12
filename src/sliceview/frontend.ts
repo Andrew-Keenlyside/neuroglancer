@@ -57,6 +57,7 @@ import {
   SLICEVIEW_REMOVE_VISIBLE_LAYER_RPC_ID,
   SLICEVIEW_REQUEST_CHUNK_RPC_ID,
   SLICEVIEW_RPC_ID,
+  SLICEVIEW_UPDATE_LAYER_ROI_RPC_ID,
   SliceViewBase,
   SliceViewProjectionParameters,
 } from "#src/sliceview/base.js";
@@ -405,6 +406,22 @@ export class SliceView extends Base {
         this.visibility,
       ),
     );
+    // Wire ROI box changes → backend chunk priority update (if this layer has an ROI box).
+    const roiBoxState = (renderLayer as any).roiBoxState;
+    if (roiBoxState != null) {
+      const rpc = this.rpc!;
+      const viewRpcId = this.rpcId;
+      const layerRpcId = renderLayer.rpcId;
+      disposers.push(
+        roiBoxState.changed.add(() => {
+          rpc.invoke(SLICEVIEW_UPDATE_LAYER_ROI_RPC_ID, {
+            id: viewRpcId,
+            layerId: layerRpcId,
+            roiBox: roiBoxState.toParameters(),
+          });
+        }),
+      );
+    }
   }
 
   private updateVisibleLayersNow() {
@@ -463,6 +480,7 @@ export class SliceView extends Base {
           layerId: renderLayer.rpcId,
           sources: serializeAllTransformedSources(layerInfo.allSources),
           displayDimensionRenderInfo: displayDimensionRenderInfo,
+          roiBox: (renderLayer as any).roiBoxState?.toParameters() ?? null,
         });
         changed = true;
       }

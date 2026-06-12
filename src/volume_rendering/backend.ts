@@ -27,6 +27,11 @@ import type {
 import { RenderLayerBackend } from "#src/render_layer_backend.js";
 import type { SharedWatchableValue } from "#src/shared_watchable_value.js";
 import {
+  computeRoiGlobalBox,
+  type RoiBoxParameters,
+  roiGlobalBoxToLocalBounds,
+} from "#src/roi_box.js";
+import {
   BASE_PRIORITY,
   deserializeTransformedSources,
   SCALE_PRIORITY_MULTIPLIER,
@@ -41,6 +46,7 @@ import {
 import {
   forEachVisibleVolumeRenderingChunk,
   VOLUME_RENDERING_RENDER_LAYER_RPC_ID,
+  VOLUME_RENDERING_RENDER_LAYER_UPDATE_ROI_RPC_ID,
   VOLUME_RENDERING_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
 } from "#src/volume_rendering/base.js";
 import type { RPC } from "#src/worker_rpc.js";
@@ -58,6 +64,8 @@ const tempChunkPosition = vec3.create();
 const tempCenter = vec3.create();
 const tempChunkSize = vec3.create();
 const tempCenterDataPosition = vec3.create();
+const tempRoiChunkLower = vec3.create();
+const tempRoiChunkUpper = vec3.create();
 
 @registerSharedObject(VOLUME_RENDERING_RENDER_LAYER_RPC_ID)
 class VolumeRenderingRenderLayerBackend extends withChunkManager(
@@ -66,6 +74,7 @@ class VolumeRenderingRenderLayerBackend extends withChunkManager(
   localPosition: SharedWatchableValue<Float32Array>;
   // The render scale target for volume rendering is the number of depth samples
   renderScaleTarget: SharedWatchableValue<number>;
+  roiBoxParameters: RoiBoxParameters | null = null;
 
   constructor(rpc: RPC, options: any) {
     super(rpc, options);
@@ -147,6 +156,8 @@ class VolumeRenderingRenderLayerBackend extends withChunkManager(
           globalDim === -1 ? 0 : globalPosition[globalDim];
       }
       let sourceBasePriority: number;
+      let hasRoi = false;
+      let volFiniteRank = 3;
       const { chunkManager } = this;
       chunkManager.registerLayer(this);
       forEachVisibleVolumeRenderingChunk(
@@ -166,8 +177,43 @@ class VolumeRenderingRenderLayerBackend extends withChunkManager(
           const priorityIndex = transformedSources[0].length - 1 - scaleIndex;
           sourceBasePriority =
             basePriority + SCALE_PRIORITY_MULTIPLIER * priorityIndex;
+          // Compute ROI chunk-grid bounds for this source.
+          volFiniteRank = finiteRank;
+          hasRoi = false;
+          const roi = this.roiBoxParameters;
+          if (roi?.enabled) {
+            const center = roi.followNavCenter
+              ? centerDataPosition
+              : roi.center;
+            const { displayDimensionRenderInfo } = projectionParameters;
+            const globalBox = computeRoiGlobalBox(
+              center,
+              roi.physicalSize,
+              displayDimensionRenderInfo.displayDimensionScales,
+              1,
+              roi.zoomRelative,
+            );
+            const bounds = roiGlobalBoxToLocalBounds(
+              globalBox,
+              chunkLayout.invTransform,
+              chunkLayout.size,
+            );
+            vec3.copy(tempRoiChunkLower, bounds.lower);
+            vec3.copy(tempRoiChunkUpper, bounds.upper);
+            hasRoi = true;
+          }
         },
         (tsource, _, positionInChunks) => {
+          if (hasRoi) {
+            for (let d = 0; d < volFiniteRank; ++d) {
+              if (
+                positionInChunks[d] < tempRoiChunkLower[d] ||
+                positionInChunks[d] >= tempRoiChunkUpper[d]
+              ) {
+                return;
+              }
+            }
+          }
           vec3.multiply(tempChunkPosition, positionInChunks, chunkSize);
           const priority = -vec3.distance(localCenter, tempChunkPosition);
           const chunk = tsource.source.getChunk(tsource.curPositionInChunks);
@@ -190,6 +236,7 @@ VolumeRenderingRenderLayerBackend;
 registerRPC(VOLUME_RENDERING_RENDER_LAYER_UPDATE_SOURCES_RPC_ID, function (x) {
   const view = this.get(x.view) as RenderedViewBackend;
   const layer = this.get(x.layer) as VolumeRenderingRenderLayerBackend;
+  layer.roiBoxParameters = x.roiBox ?? null;
   const attachment = layer.attachments.get(
     view,
   )! as RenderLayerBackendAttachment<
@@ -201,5 +248,10 @@ registerRPC(VOLUME_RENDERING_RENDER_LAYER_UPDATE_SOURCES_RPC_ID, function (x) {
     VolumeRenderingRenderLayerBackend
   >(this, x.sources, layer);
   attachment.state!.displayDimensionRenderInfo = x.displayDimensionRenderInfo;
+  layer.chunkManager.scheduleUpdateChunkPriorities();
+});
+registerRPC(VOLUME_RENDERING_RENDER_LAYER_UPDATE_ROI_RPC_ID, function (x) {
+  const layer = this.get(x.layer) as VolumeRenderingRenderLayerBackend;
+  layer.roiBoxParameters = x.roiBox ?? null;
   layer.chunkManager.scheduleUpdateChunkPriorities();
 });
