@@ -53,7 +53,7 @@ function formatSiMeters(meters: number): string {
 /**
  * Per-layer ROI box control section rendered inside the Annotations tab.
  * Exposes: enable toggle, edit-mode toggle, per-axis size inputs with uniform
- * lock, per-axis offset inputs, follow-cursor toggle, zoom-relative toggle.
+ * lock, follow-view toggle, zoom-relative toggle.
  */
 export class RoiBoxWidget extends RefCounted {
   element: HTMLDivElement;
@@ -80,7 +80,7 @@ export class RoiBoxWidget extends RefCounted {
     const enableLabel = document.createElement("label");
     enableLabel.classList.add("neuroglancer-roi-box-enable-label");
     enableLabel.appendChild(enableCb.element);
-    enableLabel.appendChild(document.createTextNode(" ROI Box"));
+    enableLabel.appendChild(document.createTextNode(" ROI Box"));
     headerRow.appendChild(enableLabel);
 
     const editCb = this.registerDisposer(
@@ -92,7 +92,7 @@ export class RoiBoxWidget extends RefCounted {
     const editLabel = document.createElement("label");
     editLabel.classList.add("neuroglancer-roi-box-edit-label");
     editLabel.appendChild(editCb.element);
-    editLabel.appendChild(document.createTextNode(" Edit"));
+    editLabel.appendChild(document.createTextNode(" Edit"));
     headerRow.appendChild(editLabel);
 
     element.appendChild(headerRow);
@@ -121,7 +121,7 @@ export class RoiBoxWidget extends RefCounted {
     uniformLabel.classList.add("neuroglancer-roi-box-uniform-label");
     uniformLabel.title = "Lock x/y/z size to the same value (uniform scaling)";
     uniformLabel.appendChild(uniformCb.element);
-    uniformLabel.appendChild(document.createTextNode(" uniform"));
+    uniformLabel.appendChild(document.createTextNode(" uniform"));
     sizeRow.appendChild(uniformLabel);
 
     element.appendChild(sizeRow);
@@ -152,7 +152,7 @@ export class RoiBoxWidget extends RefCounted {
     );
     const followLabel = document.createElement("label");
     followLabel.appendChild(followCb.element);
-    followLabel.appendChild(document.createTextNode(" Follow cursor"));
+    followLabel.appendChild(document.createTextNode(" Follow view"));
     optionsRow.appendChild(followLabel);
 
     const zoomCb = this.registerDisposer(
@@ -165,7 +165,7 @@ export class RoiBoxWidget extends RefCounted {
     );
     const zoomLabel = document.createElement("label");
     zoomLabel.appendChild(zoomCb.element);
-    zoomLabel.appendChild(document.createTextNode(" Zoom-relative"));
+    zoomLabel.appendChild(document.createTextNode(" Zoom-relative"));
     optionsRow.appendChild(zoomLabel);
 
     element.appendChild(optionsRow);
