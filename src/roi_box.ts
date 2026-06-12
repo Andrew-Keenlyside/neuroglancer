@@ -38,20 +38,24 @@ import { NullarySignal } from "#src/util/signal.js";
 import type { Trackable } from "#src/util/trackable.js";
 
 /**
- * Plain, serializable snapshot of a ROI box configuration. Physical sizes/offsets
- * are in physical units (e.g. nm); `fixedAnchor` is in global ("display") voxel
+ * Plain, serializable snapshot of a ROI box configuration. Physical sizes are in
+ * SI meters; `center` is the absolute box center in global ("display") voxel
  * coordinates. This is what gets sent to the backend chunk-priority logic.
+ *
+ * The box has a single authoritative location: `center`. When `followNavCenter`
+ * is true, the frontend keeps `center` synced to the navigation position; when it
+ * is turned off, `center` simply stops updating, so the box stays exactly where it
+ * was. There is no separate "offset" or "anchor" — the center is the source of
+ * truth in both modes.
  */
 export interface RoiBoxParameters {
   enabled: boolean;
   /** Full size of the box along each global display axis, in SI meters. */
   physicalSize: Float32Array;
-  /** Offset of the box center from the anchor (cursor or fixedAnchor), in SI meters. */
-  offset: Float32Array;
-  /** When true, the box center tracks the cursor; otherwise it sits at `fixedAnchor`. */
-  followCursor: boolean;
-  /** Box center (global voxel coords) used when `followCursor` is false. */
-  fixedAnchor: Float32Array;
+  /** Absolute box center, in global ("display") voxel coordinates. */
+  center: Float32Array;
+  /** When true, the box center tracks the navigation position. */
+  followNavCenter: boolean;
   /** When true, the box stays a constant size on screen (scales with zoom). */
   zoomRelative: boolean;
   /** When true, the three size components are kept equal. */
@@ -68,9 +72,8 @@ export function makeDefaultRoiBoxParameters(): RoiBoxParameters {
       DEFAULT_PHYSICAL_SIZE,
       DEFAULT_PHYSICAL_SIZE,
     ),
-    offset: Float32Array.of(0, 0, 0),
-    followCursor: true,
-    fixedAnchor: Float32Array.of(0, 0, 0),
+    center: Float32Array.of(0, 0, 0),
+    followNavCenter: true,
     zoomRelative: false,
     uniformSize: true,
   };
@@ -80,9 +83,8 @@ export function copyRoiBoxParameters(p: RoiBoxParameters): RoiBoxParameters {
   return {
     enabled: p.enabled,
     physicalSize: Float32Array.from(p.physicalSize),
-    offset: Float32Array.from(p.offset),
-    followCursor: p.followCursor,
-    fixedAnchor: Float32Array.from(p.fixedAnchor),
+    center: Float32Array.from(p.center),
+    followNavCenter: p.followNavCenter,
     zoomRelative: p.zoomRelative,
     uniformSize: p.uniformSize,
   };
@@ -96,39 +98,41 @@ export interface RoiGlobalBox {
 }
 
 /**
- * Compute the effective ROI box in global display-voxel coordinates.
+ * Compute the effective ROI box in global display-voxel coordinates from an
+ * absolute center.
  *
- * @param params Box configuration.
- * @param center Box anchor in global voxel coordinates (cursor position when
- *     `followCursor`, otherwise ignored in favor of `params.fixedAnchor`). Length
- *     equals the number of display dimensions (<= 3).
+ * @param center Absolute box center in global voxel coordinates. Length equals
+ *     the number of display dimensions (<= 3). When following the navigation
+ *     position, the caller passes the live nav position; otherwise it passes the
+ *     stored `params.center`.
+ * @param physicalSize Full box size per display axis, in SI meters.
  * @param displayScales Physical scale (SI meters per voxel) for each display
  *     axis. Typically `coordinateSpace.scales[displayDimIndices]`. Used to
  *     convert SI-meter physical sizes to per-axis voxel extents, correctly
  *     handling anisotropic data.
  * @param zoomFactor Current zoom (canonical voxels per screen pixel). When
- *     `zoomRelative` is set the half-extents are scaled by this so the box
- *     stays a constant size on screen, mirroring the depth-range convention.
+ *     `zoomRelative` is set the half-extents are scaled by this so the box stays
+ *     a constant size on screen, mirroring the depth-range convention.
+ * @param zoomRelative When true, scale half-extents by `zoomFactor`.
  */
 export function computeRoiGlobalBox(
-  params: RoiBoxParameters,
-  center: Float32Array,
+  center: ArrayLike<number>,
+  physicalSize: ArrayLike<number>,
   displayScales: ArrayLike<number>,
   zoomFactor: number,
+  zoomRelative: boolean,
 ): RoiGlobalBox {
   const rank = center.length;
   const lower = new Float32Array(rank);
   const upper = new Float32Array(rank);
-  const anchor = params.followCursor ? center : params.fixedAnchor;
   for (let i = 0; i < rank; ++i) {
     const scale = (displayScales[i] as number | undefined) || 1;
-    const offsetVoxels = (params.offset[i] ?? 0) / scale;
     let halfExtentVoxels =
-      (params.physicalSize[i] ?? DEFAULT_PHYSICAL_SIZE) / 2 / scale;
-    if (params.zoomRelative) {
+      (physicalSize[i] ?? DEFAULT_PHYSICAL_SIZE) / 2 / scale;
+    if (zoomRelative) {
       halfExtentVoxels *= zoomFactor;
     }
-    const c = (anchor[i] ?? 0) + offsetVoxels;
+    const c = center[i] ?? 0;
     lower[i] = c - halfExtentVoxels;
     upper[i] = c + halfExtentVoxels;
   }
@@ -202,9 +206,9 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
       DEFAULT_PHYSICAL_SIZE,
     ),
   );
-  offset = new TrackableVec3(vec3.create(), vec3.create());
-  followCursor = new TrackableBoolean(true);
-  fixedAnchor = new TrackableVec3(vec3.create(), vec3.create());
+  /** Absolute box center in global ("display") voxel coordinates. */
+  center = new TrackableVec3(vec3.create(), vec3.create());
+  followNavCenter = new TrackableBoolean(true);
   zoomRelative = new TrackableBoolean(false);
   uniformSize = new TrackableBoolean(true);
 
@@ -214,9 +218,8 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
       this.enabled,
       this.editActive,
       this.physicalSize,
-      this.offset,
-      this.followCursor,
-      this.fixedAnchor,
+      this.center,
+      this.followNavCenter,
       this.zoomRelative,
       this.uniformSize,
     ]) {
@@ -249,9 +252,8 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
     return {
       enabled: this.enabled.value,
       physicalSize: Float32Array.from(this.physicalSize.value),
-      offset: Float32Array.from(this.offset.value),
-      followCursor: this.followCursor.value,
-      fixedAnchor: Float32Array.from(this.fixedAnchor.value),
+      center: Float32Array.from(this.center.value),
+      followNavCenter: this.followNavCenter.value,
       zoomRelative: this.zoomRelative.value,
       uniformSize: this.uniformSize.value,
     };
@@ -263,12 +265,13 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
     if (this.editActive.value) result.edit = true;
     const size = this.physicalSize.toJSON();
     if (size !== undefined) result.size = size;
-    const offset = this.offset.toJSON();
-    if (offset !== undefined) result.offset = offset;
-    if (!this.followCursor.value) {
-      result.followCursor = false;
-      const anchor = this.fixedAnchor.toJSON();
-      if (anchor !== undefined) result.anchor = anchor;
+    // The box center is only meaningful as a persisted location when the box is
+    // NOT following the navigation position; while following, it is re-derived
+    // from the nav position on load, so omit it to avoid churn.
+    if (!this.followNavCenter.value) {
+      result.followNav = false;
+      const center = this.center.toJSON();
+      if (center !== undefined) result.center = center;
     }
     if (this.zoomRelative.value) result.zoomRelative = true;
     if (!this.uniformSize.value) result.uniform = false;
@@ -288,14 +291,11 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
     verifyOptionalObjectProperty(obj, "size", (x) => {
       this.physicalSize.restoreState(x);
     });
-    verifyOptionalObjectProperty(obj, "offset", (x) => {
-      this.offset.restoreState(x);
+    verifyOptionalObjectProperty(obj, "followNav", (x) => {
+      this.followNavCenter.restoreState(x);
     });
-    verifyOptionalObjectProperty(obj, "followCursor", (x) => {
-      this.followCursor.restoreState(x);
-    });
-    verifyOptionalObjectProperty(obj, "anchor", (x) => {
-      this.fixedAnchor.restoreState(x);
+    verifyOptionalObjectProperty(obj, "center", (x) => {
+      this.center.restoreState(x);
     });
     verifyOptionalObjectProperty(obj, "zoomRelative", (x) => {
       this.zoomRelative.restoreState(x);
@@ -311,9 +311,8 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
     this.enabled.reset();
     this.editActive.reset();
     this.physicalSize.reset();
-    this.offset.reset();
-    this.followCursor.reset();
-    this.fixedAnchor.reset();
+    this.center.reset();
+    this.followNavCenter.reset();
     this.zoomRelative.reset();
     this.uniformSize.reset();
   }

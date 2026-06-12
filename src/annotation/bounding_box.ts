@@ -429,6 +429,58 @@ emitAnnotation(color);
     });
   }
 
+  private faceShaderGetter = this.getDependentShader(
+    "annotation/boundingBox/projection/face",
+    (builder: ShaderBuilder) => {
+      const { rank } = this;
+      this.defineShader(builder);
+      builder.addVarying("highp float", "vClipCoefficient");
+      addFaceSetters(builder);
+      builder.setVertexMain(`
+float modelPositionA[${rank}] = getBounds0();
+float modelPositionB[${rank}] = getBounds1();
+
+int faceIdx = gl_VertexID / 6;
+int vInFace = gl_VertexID % 6;
+int axis = faceIdx / 2;
+int side = faceIdx % 2;
+
+// Two axes perpendicular to this face's axis (consistent for all face indices)
+int uAxis = (axis + 1) % 3;
+int vAxis = (axis + 2) % 3;
+
+// Map the 6 triangle vertices to quad corners 0-3 (two triangles: 0,1,2 and 0,2,3)
+// Corner k: u=(k==1||k==2)?1:0, v=(k>=2)?1:0
+int triOrder[6] = int[6](0, 1, 2, 0, 2, 3);
+int cornerK = triOrder[vInFace];
+int cu = int(cornerK == 1 || cornerK == 2);
+int cv = int(cornerK >= 2);
+
+// Corner offset in normalized box [0,1]^3 space
+vec3 cornerOffset = vec3(0.0);
+cornerOffset[axis] = float(side);
+cornerOffset[uAxis] = float(cu);
+cornerOffset[vAxis] = float(cv);
+
+vClipCoefficient = getMaxSubspaceClipCoefficient(modelPositionA, modelPositionB);
+if (vClipCoefficient == 0.0) {
+  gl_Position = vec4(2.0, 0.0, 0.0, 1.0);
+  return;
+}
+vec3 subspacePositionA = projectModelVectorToSubspace(modelPositionA) + uModelSpaceBoundOffsets[0];
+vec3 subspacePositionB = projectModelVectorToSubspace(modelPositionB) + uModelSpaceBoundOffsets[1];
+vec3 vertexPosition = mix(subspacePositionA, subspacePositionB, cornerOffset);
+gl_Position = uModelViewProjection * vec4(vertexPosition, 1.0);
+${this.invokeUserMain}
+uint facePickOffset = ${FACES_PICK_OFFSET}u + uint(faceIdx);
+${this.setPartIndex(builder, "facePickOffset")};
+`);
+      builder.setFragmentMain(`
+emitAnnotation(vec4(vColor.rgb, vColor.a * vClipCoefficient));
+`);
+    },
+  );
+
   drawCorners(context: AnnotationRenderContext) {
     const { gl } = this;
     this.enable(this.cornerShaderGetter, context, (shader) => {
@@ -449,9 +501,29 @@ emitAnnotation(color);
     });
   }
 
+  drawFaces(context: AnnotationRenderContext) {
+    // 6 faces × 2 triangles × 3 vertices = 36 vertices, all geometry derived from gl_VertexID.
+    this.enable(this.faceShaderGetter, context, () => {
+      drawArraysInstanced(
+        this.gl,
+        WebGL2RenderingContext.TRIANGLES,
+        0,
+        36,
+        context.count,
+      );
+    });
+  }
+
   draw(context: AnnotationRenderContext) {
     this.drawEdges(context);
     this.drawCorners(context);
+    if (
+      this.shaderControlState.parseResult.value.code.match(
+        /\bsetBoundingBoxFillColor\b/,
+      )
+    ) {
+      this.drawFaces(context);
+    }
   }
 }
 
@@ -632,36 +704,47 @@ registerAnnotationTypeRenderHandler<AxisAlignedBoundingBox>(
       const corners = new Float32Array(data, offset, rank * 2);
       if (partIndex >= CORNERS_PICK_OFFSET && partIndex < EDGES_PICK_OFFSET) {
         snapPositionToCorner(position, corners);
-      } else if (
-        partIndex >= EDGES_PICK_OFFSET &&
-        partIndex < FACES_PICK_OFFSET
-      ) {
-        // snapPositionToEdge(position, objectToData, corners, partIndex - EDGES_PICK_OFFSET);
-      } else {
-        // vec3.transformMat4(position, annotation.point, objectToData);
+      } else if (partIndex >= FACES_PICK_OFFSET) {
+        // Snap to the face plane: fix the axis coordinate to the face value.
+        const faceIdx = partIndex - FACES_PICK_OFFSET;
+        const axis = faceIdx >> 1;
+        const isUpper = (faceIdx & 1) === 1;
+        const v0 = corners[axis];
+        const v1 = corners[axis + rank];
+        position[axis] = isUpper ? Math.max(v0, v1) : Math.min(v0, v1);
       }
     },
     getRepresentativePoint(out: Float32Array, ann, partIndex) {
-      // if the full object is selected pick the first corner as representative
       if (partIndex === FULL_OBJECT_PICK_OFFSET) {
+        // Whole-object pick: representative point is pointA (for translation).
         out.set(ann.pointA);
       } else if (
         partIndex >= CORNERS_PICK_OFFSET &&
         partIndex < EDGES_PICK_OFFSET
       ) {
-        // picked a corner
-        // FIXME: figure out how to return corner point
+        // Corner pick: use pointA as a placeholder (corner-specific move not yet implemented).
         out.set(ann.pointA);
       } else if (
         partIndex >= EDGES_PICK_OFFSET &&
         partIndex < FACES_PICK_OFFSET
       ) {
-        // FIXME: can't figure out how to resize based upon edge grabbed
+        // Edge pick: use pointA as a placeholder.
         out.set(ann.pointA);
-        // snapPositionToCorner(repPoint, objectToData, corners, 5);
       } else {
-        // for now faces will move the whole object so pick the first corner
-        out.set(ann.pointA);
+        // Face pick: representative point is the center of that face.
+        const faceIdx = partIndex - FACES_PICK_OFFSET;
+        const axis = faceIdx >> 1;
+        const isUpper = (faceIdx & 1) === 1;
+        const rank = ann.pointA.length;
+        for (let i = 0; i < rank; ++i) {
+          if (i === axis) {
+            out[i] = isUpper
+              ? Math.max(ann.pointA[i], ann.pointB[i])
+              : Math.min(ann.pointA[i], ann.pointB[i]);
+          } else {
+            out[i] = (ann.pointA[i] + ann.pointB[i]) / 2;
+          }
+        }
       }
     },
 
@@ -670,35 +753,45 @@ registerAnnotationTypeRenderHandler<AxisAlignedBoundingBox>(
       position: Float32Array,
       partIndex: number,
     ) {
-      partIndex;
       const rank = position.length;
       const { pointA, pointB } = oldAnnotation;
-      const newPointA = new Float32Array(rank);
-      const newPointB = new Float32Array(rank);
-      for (let i = 0; i < rank; ++i) {
-        const x = (newPointA[i] = position[i]);
-        newPointB[i] = pointB[i] + (x - pointA[i]);
+      if (partIndex < FACES_PICK_OFFSET) {
+        // Whole-object, corner, or edge pick: translate the entire box.
+        const newPointA = new Float32Array(rank);
+        const newPointB = new Float32Array(rank);
+        for (let i = 0; i < rank; ++i) {
+          const x = (newPointA[i] = position[i]);
+          newPointB[i] = pointB[i] + (x - pointA[i]);
+        }
+        return { ...oldAnnotation, pointA: newPointA, pointB: newPointB };
+      }
+      // Face pick: one-sided resize — only move the picked face's coordinate.
+      const faceIdx = partIndex - FACES_PICK_OFFSET;
+      const axis = faceIdx >> 1;
+      const isUpper = (faceIdx & 1) === 1;
+      const newPointA = Float32Array.from(pointA);
+      const newPointB = Float32Array.from(pointB);
+      const newCoord = position[axis];
+      if (isUpper) {
+        // Move the upper (max) face — clamp so it cannot cross the lower face.
+        const lower = Math.min(pointA[axis], pointB[axis]);
+        const clamped = Math.max(newCoord, lower);
+        if (pointA[axis] >= pointB[axis]) {
+          newPointA[axis] = clamped;
+        } else {
+          newPointB[axis] = clamped;
+        }
+      } else {
+        // Move the lower (min) face — clamp so it cannot cross the upper face.
+        const upper = Math.max(pointA[axis], pointB[axis]);
+        const clamped = Math.min(newCoord, upper);
+        if (pointA[axis] <= pointB[axis]) {
+          newPointA[axis] = clamped;
+        } else {
+          newPointB[axis] = clamped;
+        }
       }
       return { ...oldAnnotation, pointA: newPointA, pointB: newPointB };
-      // let newPt = vec3.transformMat4(vec3.create(), position, dataToObject);
-      // let baseBox = {...oldAnnotation};
-      // // if the full object is selected pick the first corner as representative
-      // let delta = vec3.sub(vec3.create(), oldAnnotation.pointB, oldAnnotation.pointA);
-      // if (partIndex === FULL_OBJECT_PICK_OFFSET) {
-      //   baseBox.pointA = newPt;
-      //   baseBox.pointB = vec3.add(vec3.create(), newPt, delta);
-      // } else if (partIndex >= CORNERS_PICK_OFFSET && partIndex < EDGES_PICK_OFFSET) {
-      //   // picked a corner
-      //   baseBox.pointA = newPt;
-      //   baseBox.pointB = vec3.add(vec3.create(), newPt, delta);
-      // } else if (partIndex >= EDGES_PICK_OFFSET && partIndex < FACES_PICK_OFFSET) {
-      //   baseBox.pointA = newPt;
-      //   baseBox.pointB = vec3.add(vec3.create(), newPt, delta);
-      // } else {  // for now faces will move the whole object so pick the first corner
-      //   baseBox.pointA = newPt;
-      //   baseBox.pointB = vec3.add(vec3.create(), newPt, delta);
-      // }
-      // return baseBox;
     },
   },
 );

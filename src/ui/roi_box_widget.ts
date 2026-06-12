@@ -22,7 +22,6 @@ import type { TrackableRoiBoxState } from "#src/roi_box.js";
 import { TrackableBooleanCheckbox } from "#src/trackable_boolean.js";
 import { animationFrameDebounce } from "#src/util/animation_frame_debounce.js";
 import { RefCounted } from "#src/util/disposable.js";
-import { vec3 } from "#src/util/geom.js";
 import { formatScaleWithUnitAsString, parseScale } from "#src/util/si_units.js";
 
 const AXIS_NAMES = ["x", "y", "z"] as const;
@@ -140,25 +139,15 @@ export class RoiBoxWidget extends RefCounted {
     this.registerDisposer(state.uniformSize.changed.add(updateUniformUI));
     updateUniformUI();
 
-    // ── Offset: [x____] [y____] [z____] ────────────────────────────────
-    const offsetRow = this.makeRow();
-    const offsetHeading = document.createElement("span");
-    offsetHeading.classList.add("neuroglancer-roi-box-row-label");
-    offsetHeading.textContent = "Offset:";
-    offsetRow.appendChild(offsetHeading);
-
-    for (let i = 0; i < 3; i++) {
-      offsetRow.appendChild(this.makeOffsetInput(i));
-    }
-    element.appendChild(offsetRow);
-
-    // ── Options: [□] Follow cursor  [□] Zoom-relative ───────────────────
+    // ── Options: [□] Follow view   [□] Zoom-relative ───────────────────
     const optionsRow = this.makeRow();
 
     const followCb = this.registerDisposer(
-      new TrackableBooleanCheckbox(state.followCursor, {
-        enabledTitle: "Box center follows cursor — click to fix in space",
-        disabledTitle: "Box center fixed in space — click to follow cursor",
+      new TrackableBooleanCheckbox(state.followNavCenter, {
+        enabledTitle:
+          "Box center follows navigation position — click to freeze in place",
+        disabledTitle:
+          "Box center frozen in place — click to follow navigation",
       }),
     );
     const followLabel = document.createElement("label");
@@ -216,52 +205,6 @@ export class RoiBoxWidget extends RefCounted {
         return;
       }
       state.setSizeComponent(axis, meters);
-    };
-    input.addEventListener("change", commit);
-    input.addEventListener("keydown", (e: KeyboardEvent) => {
-      if (e.key === "Enter") {
-        commit();
-        input.blur();
-      } else if (e.key === "Escape") {
-        updateView();
-        input.blur();
-      }
-    });
-    input.addEventListener("blur", commit);
-
-    return input;
-  }
-
-  private makeOffsetInput(axis: number): HTMLInputElement {
-    const { state } = this;
-    const input = document.createElement("input");
-    input.type = "text";
-    input.classList.add("neuroglancer-roi-box-offset-input");
-    input.spellcheck = false;
-    input.autocomplete = "off";
-    input.title = AXIS_NAMES[axis] + " offset (can be negative)";
-
-    const updateView = this.registerCancellable(
-      animationFrameDebounce(() => {
-        if (document.activeElement === input) return;
-        const v = state.offset.value[axis] ?? 0;
-        input.value = formatSiMeters(v);
-      }),
-    );
-
-    this.registerDisposer(state.offset.changed.add(updateView));
-    updateView();
-
-    const commit = () => {
-      const meters = parseSiMeters(input.value);
-      if (meters === null || meters === undefined) {
-        updateView();
-        return;
-      }
-      const cur = state.offset.value;
-      const next = vec3.clone(cur);
-      next[axis] = meters;
-      state.offset.value = next;
     };
     input.addEventListener("change", commit);
     input.addEventListener("keydown", (e: KeyboardEvent) => {

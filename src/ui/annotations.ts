@@ -1945,6 +1945,79 @@ const ANNOTATION_COLOR_JSON_KEY = "annotationColor";
 const ROI_BOX_JSON_KEY = "roiBox";
 const ROI_SENTINEL_ID = "roi-box-0";
 
+/**
+ * Custom AnnotationSource for the ROI box sentinel annotation.
+ *
+ * Intercepts source.update() calls that come from the annotation-drag handler
+ * (Alt+drag on a face) and converts the resulting geometry back into
+ * roiBoxState physical units instead of storing a stale drag annotation.
+ * Geometry-controller updates (flagged via geometryUpdateActive) pass through
+ * to the base class normally.
+ */
+class RoiAnnotationSource extends AnnotationSource {
+  geometryUpdateActive = false;
+
+  constructor(
+    rank: number,
+    private readonly roiBoxState_: TrackableRoiBoxState,
+    private readonly getCoordSpace_: () => CoordinateSpace,
+  ) {
+    super(rank);
+  }
+
+  override update(
+    reference: AnnotationReference,
+    annotation: Annotation,
+  ): void {
+    if (this.geometryUpdateActive || reference.id !== ROI_SENTINEL_ID) {
+      super.update(reference, annotation);
+      return;
+    }
+    // Drag-handler update: convert new pointA/pointB → roiBoxState.
+    const box = annotation as AxisAlignedBoundingBox;
+    const { pointA, pointB } = box;
+    const coordSpace = this.getCoordSpace_();
+    if (!coordSpace.valid) return;
+    const { scales } = coordSpace;
+    const r = Math.min(pointA.length, 3);
+
+    // Identify which axis the face drag changed by comparing sizes with the
+    // current sentinel annotation (set by the geometry controller).
+    const oldBox = reference.value as AxisAlignedBoundingBox | null;
+    let dragAxis = -1;
+    if (oldBox !== null) {
+      for (let i = 0; i < r; ++i) {
+        const oldSize = Math.abs(oldBox.pointB[i] - oldBox.pointA[i]);
+        const newSize = Math.abs(pointB[i] - pointA[i]);
+        if (Math.abs(newSize - oldSize) > 0.5) {
+          dragAxis = i;
+          break;
+        }
+      }
+    }
+    if (dragAxis < 0) return; // no axis change detected — discard
+
+    // Update physical size for the dragged axis, respecting uniform lock.
+    const newPhysical =
+      Math.abs(pointB[dragAxis] - pointA[dragAxis]) * (scales[dragAxis] || 1);
+    this.roiBoxState_.setSizeComponent(dragAxis, newPhysical);
+
+    // In fixed mode, a one-sided face drag also shifts the box center along the
+    // dragged axis; write it back so the new position is the authoritative state.
+    // In follow mode the center stays synced to the navigation position, so the
+    // drag is interpreted as a (re)size only — the box re-centers on nav.
+    if (!this.roiBoxState_.followNavCenter.value) {
+      const center = vec3.clone(this.roiBoxState_.center.value);
+      center[dragAxis] = (pointA[dragAxis] + pointB[dragAxis]) / 2;
+      this.roiBoxState_.center.value = center;
+    }
+  }
+
+  override commit(_reference: AnnotationReference): void {
+    // No-op: roiBoxState is the authoritative store; no data source to commit.
+  }
+}
+
 export function UserLayerWithAnnotationsMixin<
   TBase extends { new (...args: any[]): UserLayer },
 >(Base: TBase) {
@@ -1964,6 +2037,14 @@ export function UserLayerWithAnnotationsMixin<
     roiAnnotationDisplayState = (() => {
       const s = new AnnotationDisplayState();
       s.color.value = vec3.fromValues(0, 0.9, 1); // cyan
+      // Use a shader that renders both box edges (border) and translucent face quads
+      // (fill), so all 6 faces are independently pickable in 3D perspective view.
+      s.shader.value = `
+void main() {
+  setBoundingBoxBorderColor(vec4(defaultColor(), 1.0));
+  setBoundingBoxFillColor(vec4(defaultColor(), 0.15));
+}
+`;
       return s;
     })();
 
@@ -2015,7 +2096,13 @@ export function UserLayerWithAnnotationsMixin<
           const rank = globalSpace.rank;
 
           // Annotation source holding the one sentinel bounding-box annotation.
-          const source = context.registerDisposer(new AnnotationSource(rank));
+          const source = context.registerDisposer(
+            new RoiAnnotationSource(
+              rank,
+              this.roiBoxState,
+              () => this.manager.root.coordinateSpace.value,
+            ),
+          );
           source.add({
             type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
             id: ROI_SENTINEL_ID,
@@ -2084,8 +2171,27 @@ export function UserLayerWithAnnotationsMixin<
             ),
           );
 
-          // Geometry controller: recompute pointA/pointB whenever cursor or
-          // box parameters change, then update the sentinel annotation.
+          // Nav-sync: while "follow view" is on, keep the box center synced to
+          // the navigation position. When following is turned off, this stops
+          // updating, so the box stays frozen at its last position. The center is
+          // the single authoritative box location in both modes.
+          const syncCenterToNav = () => {
+            if (!this.roiBoxState.followNavCenter.value) return;
+            const navPos = this.manager.root.globalPosition.value;
+            const next = vec3.clone(this.roiBoxState.center.value);
+            let changed = false;
+            for (let i = 0; i < 3; i++) {
+              const v = navPos[i] ?? 0;
+              if (next[i] !== v) {
+                next[i] = v;
+                changed = true;
+              }
+            }
+            if (changed) this.roiBoxState.center.value = next;
+          };
+
+          // Geometry controller: recompute pointA/pointB from the box center +
+          // size whenever the box parameters change, then update the sentinel.
           const updateGeometry = context.registerCancellable(
             animationFrameDebounce(() => {
               const ct = layerState.chunkTransform.value;
@@ -2094,49 +2200,43 @@ export function UserLayerWithAnnotationsMixin<
               if (!coordSpace.valid) return;
               const r = ct.modelTransform.unpaddedRank;
 
-              const center = new Float32Array(r);
-              if (this.roiBoxState.followCursor.value) {
-                const ms = this.manager.layerSelectedValues.mouseState;
-                const pos = getMousePositionInAnnotationCoordinates(
-                  ms,
-                  layerState,
-                );
-                if (pos === undefined) return;
-                for (let i = 0; i < r; i++) center[i] = pos[i];
-              } else {
-                const anchor = this.roiBoxState.fixedAnchor.value;
-                for (let i = 0; i < r; i++) center[i] = anchor[i] ?? 0;
-              }
-
+              const centerVec = this.roiBoxState.center.value;
               const sizeVec = this.roiBoxState.physicalSize.value;
-              const offsetVec = this.roiBoxState.offset.value;
               const pointA = new Float32Array(r);
               const pointB = new Float32Array(r);
               for (let i = 0; i < r; i++) {
                 const scale = coordSpace.scales[i] || 1;
                 const half = (sizeVec[i] ?? 1e-6) / (2 * scale);
-                const off = (offsetVec[i] ?? 0) / scale;
-                const c = center[i] + off;
+                const c = centerVec[i] ?? 0;
                 pointA[i] = c - half;
                 pointB[i] = c + half;
               }
 
-              source.update(ref, {
-                type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
-                id: ROI_SENTINEL_ID,
-                description: undefined,
-                relatedSegments: undefined,
-                properties: [],
-                pointA,
-                pointB,
-              } as AxisAlignedBoundingBox);
+              source.geometryUpdateActive = true;
+              try {
+                source.update(ref, {
+                  type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
+                  id: ROI_SENTINEL_ID,
+                  description: undefined,
+                  relatedSegments: undefined,
+                  properties: [],
+                  pointA,
+                  pointB,
+                } as AxisAlignedBoundingBox);
+              } finally {
+                source.geometryUpdateActive = false;
+              }
             }),
           );
 
+          // Navigation moves sync the center (when following), which in turn
+          // triggers updateGeometry via roiBoxState.changed below.
           context.registerDisposer(
-            this.manager.layerSelectedValues.mouseState.changed.add(
-              updateGeometry,
-            ),
+            this.manager.root.globalPosition.changed.add(syncCenterToNav),
+          );
+          // Snap the center to the nav position when follow mode is enabled.
+          context.registerDisposer(
+            this.roiBoxState.followNavCenter.changed.add(syncCenterToNav),
           );
           context.registerDisposer(
             this.roiBoxState.changed.add(updateGeometry),
@@ -2144,6 +2244,7 @@ export function UserLayerWithAnnotationsMixin<
           context.registerDisposer(
             this.manager.root.coordinateSpace.changed.add(updateGeometry),
           );
+          syncCenterToNav();
           updateGeometry();
         }, this.roiBoxState.enabled),
       );
