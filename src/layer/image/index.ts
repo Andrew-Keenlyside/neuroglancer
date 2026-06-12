@@ -264,6 +264,7 @@ export class ImageUserLayer extends Base {
             renderScaleHistogram: this.sliceViewRenderScaleHistogram,
             localPosition: this.localPosition,
             channelCoordinateSpace: this.channelCoordinateSpace,
+            roiBoxState: this.roiBoxState,
           }),
         );
         const volumeRenderLayer = context.registerDisposer(
@@ -281,6 +282,7 @@ export class ImageUserLayer extends Base {
             localPosition: this.localPosition,
             channelCoordinateSpace: this.channelCoordinateSpace,
             mode: this.volumeRenderingMode,
+            roiBoxState: this.roiBoxState,
           }),
         );
         context.registerDisposer(

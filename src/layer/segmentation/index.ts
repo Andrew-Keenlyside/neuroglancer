@@ -994,7 +994,11 @@ export class SegmentationUserLayer extends Base {
             localPosition: this.localPosition,
           };
           loadedSubsource.addRenderLayer(
-            new SegmentationRenderLayer(volume, sliceViewDisplayState),
+            new SegmentationRenderLayer(
+              volume,
+              sliceViewDisplayState,
+              this.roiBoxState,
+            ),
           );
           const volumeRenderLayer = context.registerDisposer(
             new SegmentationVolumeRenderingRenderLayer({
@@ -1011,6 +1015,7 @@ export class SegmentationUserLayer extends Base {
               mode: this.volumeRenderingMode,
               segmentationDisplayState: sliceViewDisplayState,
               opacity3d: this.volumeRenderingOpacity3d,
+              roiBoxState: this.roiBoxState,
             }),
           );
           context.registerDisposer(

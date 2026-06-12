@@ -106,8 +106,10 @@ export class SegmentationRenderLayer extends SliceViewVolumeRenderLayer<ShaderPa
   constructor(
     multiscaleSource: MultiscaleVolumeChunkSource,
     public displayState: SliceViewSegmentationDisplayState,
+    roiBoxState?: import("#src/roi_box.js").TrackableRoiBoxState | null,
   ) {
     super(multiscaleSource, {
+      roiBoxState,
       encodeShaderParameters: (p) => {
         const { shaderBuilderState, ...rest } = p;
         const {

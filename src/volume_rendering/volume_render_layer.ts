@@ -57,6 +57,11 @@ import {
 import type { RefCountedValue } from "#src/util/disposable.js";
 import { getFrustumPlanes, mat4, vec3 } from "#src/util/geom.js";
 import { clampToInterval } from "#src/util/lerp.js";
+import {
+  computeRoiGlobalBox,
+  roiGlobalBoxToLocalBounds,
+} from "#src/roi_box.js";
+import type { TrackableRoiBoxState } from "#src/roi_box.js";
 import { getObjectId } from "#src/util/object_id.js";
 import type { HistogramInformation } from "#src/volume_rendering/base.js";
 import {
@@ -157,6 +162,7 @@ export interface VolumeRenderingRenderLayerOptions {
   depthSamplesTarget: WatchableValueInterface<number>;
   chunkResolutionHistogram: RenderScaleHistogram;
   mode: TrackableVolumeRenderingModeValue;
+  roiBoxState?: TrackableRoiBoxState | null;
 }
 
 export interface VolumeRenderingShaderParameters {
@@ -195,6 +201,8 @@ interface PerChunkShaderUniforms {
 
 const tempMat4 = mat4.create();
 const tempVisibleVolumetricClippingPlanes = new Float32Array(24);
+const tempRoiLowerVol = vec3.create();
+const tempRoiUpperVol = vec3.create();
 
 export function getVolumeRenderingDepthSamplesBoundsLogScale(): [
   number,
@@ -227,6 +235,7 @@ export class VolumeRenderingRenderLayer extends PerspectiveViewRenderLayer {
   depthSamplesTarget: WatchableValueInterface<number>;
   chunkResolutionHistogram: RenderScaleHistogram;
   mode: TrackableVolumeRenderingModeValue;
+  roiBoxState: TrackableRoiBoxState | null;
   backend: ChunkRenderLayerFrontend;
   highestResolutionLoadedVoxelSize: Float32Array | undefined;
   private modeOverride: TrackableVolumeRenderingModeValue;
@@ -276,6 +285,7 @@ export class VolumeRenderingRenderLayer extends PerspectiveViewRenderLayer {
     this.depthSamplesTarget = options.depthSamplesTarget;
     this.chunkResolutionHistogram = options.chunkResolutionHistogram;
     this.mode = options.mode;
+    this.roiBoxState = options.roiBoxState ?? null;
     this.modeOverride = trackableShaderModeValue();
     this.dataHistogramSpecifications =
       this.shaderControlState.histogramSpecifications;
@@ -469,7 +479,7 @@ void main() {
   vec3 farPoint = farPointH.xyz / farPointH.w;
   vec3 rayVector = farPoint - nearPoint;
   vec3 boxStart = max(uLowerClipBound, uTranslation);
-  vec3 boxEnd = min(boxStart + uChunkDataSize, uUpperClipBound);
+  vec3 boxEnd = min(uTranslation + uChunkDataSize, uUpperClipBound);
   float intersectStart = uNearLimitFraction;
   float intersectEnd = uFarLimitFraction;
   for (int i = 0; i < 3; ++i) {
@@ -493,9 +503,17 @@ void main() {
     intersectStart = max(intersectStart, startFraction);
     intersectEnd = min(intersectEnd, endFraction);
   }
+  // When a clip bound (e.g. the ROI box) cuts the chunk away entirely along some
+  // axis, boxStart > boxEnd. The per-axis intersection above would otherwise treat
+  // the inverted gap as "inside" and sample the chunk's clamped edge voxel along
+  // the ray, producing streak artifacts at the clip-box edges. Render nothing in
+  // that case.
+  bool clipEmpty = any(lessThanEqual(boxEnd, boxStart));
   float stepSize = (uFarLimitFraction - uNearLimitFraction) / float(uMaxSteps - 1);
   int startStep = int(floor((intersectStart - uNearLimitFraction) / stepSize));
-  int endStep = min(uMaxSteps, int(floor((intersectEnd - uNearLimitFraction) / stepSize)) + 1);
+  int endStep = clipEmpty
+    ? startStep
+    : min(uMaxSteps, int(floor((intersectEnd - uNearLimitFraction) / stepSize)) + 1);
   outputColor = vec4(0, 0, 0, 0);
   revealage = 1.0;
   for (int rayStep = startStep; rayStep < endStep; ++rayStep) {
@@ -935,6 +953,22 @@ gl_Position = uModelViewProjectionMatrix * vec4(position, 1.0);
     gl.enable(WebGL2RenderingContext.CULL_FACE);
     gl.cullFace(WebGL2RenderingContext.FRONT);
 
+    // Compute ROI global box once for all sources in this frame.
+    let roiGlobalBoxVol: { lower: Float32Array; upper: Float32Array } | null =
+      null;
+    if (this.roiBoxState?.enabled.value) {
+      const state = this.roiBoxState;
+      const { displayDimensionScales } =
+        projectionParameters.displayDimensionRenderInfo;
+      roiGlobalBoxVol = computeRoiGlobalBox(
+        state.center.value,
+        state.physicalSize.value,
+        displayDimensionScales,
+        1,
+        state.zoomRelative.value,
+      );
+    }
+
     forEachVisibleVolumeRenderingChunk(
       renderContext.projectionParameters,
       this.localPosition.value,
@@ -1000,12 +1034,19 @@ gl_Position = uModelViewProjectionMatrix * vec4(position, 1.0);
         getFrustumPlanes(clippingPlanes, modelViewProjection);
         const inverseModelViewProjection = mat4.create();
         mat4.invert(inverseModelViewProjection, modelViewProjection);
-        const { near, far, adjustedNear, adjustedFar } =
-          getVolumeRenderingNearFarBounds(
-            clippingPlanes,
-            transformedSource.lowerClipDisplayBound,
-            transformedSource.upperClipDisplayBound,
+        // Intersect source clip bounds with ROI box if enabled.
+        let lowerClip = transformedSource.lowerClipDisplayBound;
+        let upperClip = transformedSource.upperClipDisplayBound;
+        if (roiGlobalBoxVol !== null) {
+          const local = roiGlobalBoxToLocalBounds(
+            roiGlobalBoxVol,
+            chunkLayout.invTransform,
           );
+          lowerClip = vec3.max(tempRoiLowerVol, lowerClip, local.lower);
+          upperClip = vec3.min(tempRoiUpperVol, upperClip, local.upper);
+        }
+        const { near, far, adjustedNear, adjustedFar } =
+          getVolumeRenderingNearFarBounds(clippingPlanes, lowerClip, upperClip);
         const optimalSampleRate = optimalSamples;
         const actualSampleRate = this.depthSamplesTarget.value;
         const brightnessFactor = optimalSampleRate / actualSampleRate;
@@ -1018,8 +1059,8 @@ gl_Position = uModelViewProjectionMatrix * vec4(position, 1.0);
           uBrightnessFactor: brightnessFactor,
           uGain: Math.exp(this.gain.value),
           uPickId: pickId,
-          uLowerClipBound: transformedSource.lowerClipDisplayBound,
-          uUpperClipBound: transformedSource.upperClipDisplayBound,
+          uLowerClipBound: lowerClip,
+          uUpperClipBound: upperClip,
           uModelViewProjectionMatrix: modelViewProjection,
           uInvModelViewProjectionMatrix: inverseModelViewProjection,
         };

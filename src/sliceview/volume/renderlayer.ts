@@ -26,6 +26,11 @@ import {
   setBoundingBoxCrossSectionShaderViewportPlane,
 } from "#src/sliceview/bounding_box_shader_helper.js";
 import type { ChunkLayout } from "#src/sliceview/chunk_layout.js";
+import {
+  computeRoiGlobalBox,
+  roiGlobalBoxToLocalBounds,
+} from "#src/roi_box.js";
+import type { TrackableRoiBoxState } from "#src/roi_box.js";
 import type {
   FrontendTransformedSource,
   SliceView,
@@ -89,6 +94,8 @@ const DEBUG_VERTICES = false;
 const CHUNK_POSITION_EPSILON = 1e-3;
 
 const tempMat4 = mat4.create();
+const tempRoiLower = vec3.create();
+const tempRoiUpper = vec3.create();
 
 function defineVolumeShader(builder: ShaderBuilder, wireFrame: boolean) {
   defineVertexId(builder);
@@ -209,6 +216,8 @@ function beginSource(
   dataToDeviceMatrix: mat4,
   tsource: FrontendTransformedSource,
   chunkLayout: ChunkLayout,
+  roiLower?: vec3 | null,
+  roiUpper?: vec3 | null,
 ) {
   const projectionParameters = sliceView.projectionParameters.value;
   const { centerDataPosition } = projectionParameters;
@@ -228,19 +237,19 @@ function beginSource(
     mat4.multiply(tempMat4, dataToDeviceMatrix, chunkLayout.transform),
   );
 
-  gl.uniform3fv(
-    shader.uniform("uLowerClipBound"),
-    tsource.lowerClipDisplayBound,
-  );
-  gl.uniform3fv(
-    shader.uniform("uUpperClipBound"),
-    tsource.upperClipDisplayBound,
-  );
+  const clipLower =
+    roiLower != null
+      ? vec3.max(tempRoiLower, tsource.lowerClipDisplayBound, roiLower)
+      : tsource.lowerClipDisplayBound;
+  const clipUpper =
+    roiUpper != null
+      ? vec3.min(tempRoiUpper, tsource.upperClipDisplayBound, roiUpper)
+      : tsource.upperClipDisplayBound;
+  gl.uniform3fv(shader.uniform("uLowerClipBound"), clipLower);
+  gl.uniform3fv(shader.uniform("uUpperClipBound"), clipUpper);
   if (DEBUG_VERTICES) {
-    (<any>window).debug_sliceView_uLowerClipBound =
-      tsource.lowerClipDisplayBound;
-    (<any>window).debug_sliceView_uUpperClipBound =
-      tsource.upperClipDisplayBound;
+    (<any>window).debug_sliceView_uLowerClipBound = clipLower;
+    (<any>window).debug_sliceView_uUpperClipBound = clipUpper;
     (<any>window).debug_sliceView = sliceView;
     (<any>window).debug_sliceView_dataToDevice = mat4.clone(tempMat4);
     (<any>window).debug_sliceView_chunkLayout = chunkLayout;
@@ -312,6 +321,7 @@ function drawChunk(
 export interface RenderLayerBaseOptions extends SliceViewRenderLayerOptions {
   shaderError?: WatchableShaderError;
   channelCoordinateSpace?: WatchableValueInterface<CoordinateSpace>;
+  roiBoxState?: TrackableRoiBoxState | null;
 }
 
 export interface RenderLayerOptions<ShaderParameters>
@@ -343,6 +353,7 @@ export abstract class SliceViewVolumeRenderLayer<
   shaderParameters: WatchableValueInterface<ShaderParameters>;
   highestResolutionLoadedVoxelSize: Float32Array | undefined;
   private vertexIdHelper: VertexIdHelper;
+  roiBoxState: TrackableRoiBoxState | null;
 
   constructor(
     multiscaleSource: MultiscaleVolumeChunkSource,
@@ -354,6 +365,7 @@ export abstract class SliceViewVolumeRenderLayer<
     const { gl } = this;
     this.vertexIdHelper = this.registerDisposer(VertexIdHelper.get(gl));
     this.shaderParameters = shaderParameters;
+    this.roiBoxState = options.roiBoxState ?? null;
     const { channelCoordinateSpace } = options;
     this.channelCoordinateSpace =
       channelCoordinateSpace === undefined
@@ -590,6 +602,22 @@ void main() {
       }
       this.endSlice(sliceView, shader, shaderResult.parameters);
     };
+    // Compute ROI global box once for all sources in this frame.
+    let roiGlobalBox: { lower: Float32Array; upper: Float32Array } | null =
+      null;
+    if (this.roiBoxState?.enabled.value) {
+      const state = this.roiBoxState;
+      const { displayDimensionScales } =
+        projectionParameters.displayDimensionRenderInfo;
+      roiGlobalBox = computeRoiGlobalBox(
+        state.center.value,
+        state.physicalSize.value,
+        displayDimensionScales,
+        projectionParameters.pixelSize,
+        state.zoomRelative.value,
+      );
+    }
+
     let newSource = true;
     for (const transformedSource of visibleSources) {
       const chunkLayout = getNormalizedChunkLayout(
@@ -626,6 +654,18 @@ void main() {
       let chunkDataSize: Uint32Array | undefined;
       const chunkRank = source.spec.rank;
 
+      // Transform ROI global box to this source's chunk display space.
+      let roiLower: vec3 | null = null;
+      let roiUpper: vec3 | null = null;
+      if (roiGlobalBox !== null) {
+        const local = roiGlobalBoxToLocalBounds(
+          roiGlobalBox,
+          chunkLayout.invTransform,
+        );
+        roiLower = local.lower;
+        roiUpper = local.upper;
+      }
+
       beginSource(
         gl,
         shader,
@@ -633,6 +673,8 @@ void main() {
         projectionParameters.viewProjectionMat,
         transformedSource,
         chunkLayout,
+        roiLower,
+        roiUpper,
       );
       if (chunkFormat !== null) {
         chunkFormat.beginSource(gl, shader);

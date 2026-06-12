@@ -98,18 +98,22 @@ export interface RoiGlobalBox {
 }
 
 /**
- * Compute the effective ROI box in global display-voxel coordinates from an
- * absolute center.
+ * Compute the effective ROI box in global ("display") voxel coordinates.
  *
- * @param center Absolute box center in global voxel coordinates. Length equals
- *     the number of display dimensions (<= 3). When following the navigation
- *     position, the caller passes the live nav position; otherwise it passes the
- *     stored `params.center`.
+ * The global display space consumed by `viewProjectionMat` /
+ * `chunkLayout.transform` is in **native voxel coordinates per display axis**
+ * (see `NavigationState.toMat4`, where the camera translation is set directly
+ * from the native `voxelCoordinates`). So both `center` and the per-axis
+ * half-extents must be expressed in native voxels of each display axis — using a
+ * single canonical scale would be wrong for anisotropic data.
+ *
+ * @param center Absolute box center in native display-voxel coordinates (i.e.
+ *     `globalPosition.value` restricted to the display axes). Length equals the
+ *     number of display dimensions (<= 3).
  * @param physicalSize Full box size per display axis, in SI meters.
- * @param displayScales Physical scale (SI meters per voxel) for each display
- *     axis. Typically `coordinateSpace.scales[displayDimIndices]`. Used to
- *     convert SI-meter physical sizes to per-axis voxel extents, correctly
- *     handling anisotropic data.
+ * @param displayScales Native physical scale (SI meters per voxel) for each
+ *     display axis (`displayDimensionRenderInfo.displayDimensionScales`). Used to
+ *     convert SI-meter sizes to per-axis voxel extents, handling anisotropy.
  * @param zoomFactor Current zoom (canonical voxels per screen pixel). When
  *     `zoomRelative` is set the half-extents are scaled by this so the box stays
  *     a constant size on screen, mirroring the depth-range convention.
