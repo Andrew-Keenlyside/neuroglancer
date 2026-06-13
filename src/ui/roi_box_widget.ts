@@ -23,6 +23,7 @@ import { TrackableBooleanCheckbox } from "#src/trackable_boolean.js";
 import { animationFrameDebounce } from "#src/util/animation_frame_debounce.js";
 import { RefCounted } from "#src/util/disposable.js";
 import { formatScaleWithUnitAsString, parseScale } from "#src/util/si_units.js";
+import { ColorWidget } from "#src/widget/color.js";
 
 const AXIS_NAMES = ["x", "y", "z"] as const;
 
@@ -82,6 +83,22 @@ export class RoiBoxWidget extends RefCounted {
     enableLabel.appendChild(enableCb.element);
     enableLabel.appendChild(document.createTextNode(" ROI Box"));
     headerRow.appendChild(enableLabel);
+
+    const showCb = this.registerDisposer(
+      new TrackableBooleanCheckbox(state.showBox, {
+        enabledTitle: "Hide box outline (loading restriction stays active)",
+        disabledTitle: "Show box outline",
+      }),
+    );
+    const showLabel = document.createElement("label");
+    showLabel.classList.add("neuroglancer-roi-box-show-label");
+    showLabel.appendChild(showCb.element);
+    showLabel.appendChild(document.createTextNode(" Show"));
+    headerRow.appendChild(showLabel);
+
+    const colorWidget = this.registerDisposer(new ColorWidget(state.color));
+    colorWidget.element.title = "Box outline color";
+    headerRow.appendChild(colorWidget.element);
 
     const editCb = this.registerDisposer(
       new TrackableBooleanCheckbox(state.editActive, {

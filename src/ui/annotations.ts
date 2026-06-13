@@ -1945,6 +1945,23 @@ const ANNOTATION_COLOR_JSON_KEY = "annotationColor";
 const ROI_BOX_JSON_KEY = "roiBox";
 const ROI_SENTINEL_ID = "roi-box-0";
 
+// Wireframe only: just the box edges, for unobtrusive visualization when not
+// editing.
+const ROI_SHADER_WIREFRAME = `
+void main() {
+  setBoundingBoxBorderColor(vec4(defaultColor(), 1.0));
+}
+`;
+// Edges + translucent face quads. The faces must be rendered to be independently
+// pickable in the 3D perspective view, which is what enables face-drag resizing,
+// so this variant is used only while edit mode is active.
+const ROI_SHADER_WITH_FACES = `
+void main() {
+  setBoundingBoxBorderColor(vec4(defaultColor(), 1.0));
+  setBoundingBoxFillColor(vec4(defaultColor(), 0.05));
+}
+`;
+
 /**
  * Custom AnnotationSource for the ROI box sentinel annotation.
  *
@@ -2036,15 +2053,17 @@ export function UserLayerWithAnnotationsMixin<
     // is not confused with user-created annotations in the selection UI.
     roiAnnotationDisplayState = (() => {
       const s = new AnnotationDisplayState();
-      s.color.value = vec3.fromValues(0, 0.9, 1); // cyan
-      // Use a shader that renders both box edges (border) and translucent face quads
-      // (fill), so all 6 faces are independently pickable in 3D perspective view.
-      s.shader.value = `
-void main() {
-  setBoundingBoxBorderColor(vec4(defaultColor(), 1.0));
-  setBoundingBoxFillColor(vec4(defaultColor(), 0.15));
-}
-`;
+      // The ROI sentinel annotation carries no properties, but the shader-controls
+      // data context returns `null` while `annotationProperties` is `undefined`,
+      // which forces an empty parsed shader (no `userMain`) and a shader error.
+      // Set it to an empty list (as the main annotation display state does) so the
+      // shader parses correctly. Without this the box only renders via the fallback
+      // shader and breaks entirely when the layer is recreated (e.g. Show toggle).
+      s.annotationProperties.value = [];
+      // Color is driven by roiBoxState.color, and the shader is swapped between
+      // wireframe (default) and edges+faces based on roiBoxState.editActive — both
+      // wired in the constructor below. Default to wireframe.
+      s.shader.value = ROI_SHADER_WIREFRAME;
       return s;
     })();
 
@@ -2084,120 +2103,145 @@ void main() {
         this.roiBoxState.changed.add(this.specificationChanged.dispatch),
       );
 
+      // Keep the ROI annotation display color in sync with the user-chosen color.
+      const syncRoiColor = () => {
+        this.roiAnnotationDisplayState.color.value =
+          this.roiBoxState.color.value;
+      };
+      syncRoiColor();
+      this.registerDisposer(this.roiBoxState.color.changed.add(syncRoiColor));
+
+      // Show translucent faces (which are what make face-drag resizing possible)
+      // only while edit mode is active; otherwise render just the wireframe for an
+      // unobtrusive view.
+      const syncRoiShader = () => {
+        this.roiAnnotationDisplayState.shader.value = this.roiBoxState
+          .editActive.value
+          ? ROI_SHADER_WITH_FACES
+          : ROI_SHADER_WIREFRAME;
+      };
+      syncRoiShader();
+      this.registerDisposer(
+        this.roiBoxState.editActive.changed.add(syncRoiShader),
+      );
+
       // When roiBoxState.enabled becomes true, create a synthetic annotation
       // layer (not in annotationStates) that renders the ROI box in 2D/3D and
       // keeps a sentinel AxisAlignedBoundingBox annotation up to date as the
       // cursor moves.
       this.registerDisposer(
-        registerNested((context, enabled) => {
-          if (!enabled) return;
-          const globalSpace = this.manager.root.coordinateSpace.value;
-          if (!globalSpace.valid) return;
-          const rank = globalSpace.rank;
+        registerNested(
+          (context, enabled, showBox, globalSpace) => {
+            if (!enabled || !showBox) return;
+            if (!globalSpace.valid) return;
+            const rank = globalSpace.rank;
 
-          // Annotation source holding the one sentinel bounding-box annotation.
-          const source = context.registerDisposer(
-            new RoiAnnotationSource(
-              rank,
-              this.roiBoxState,
-              () => this.manager.root.coordinateSpace.value,
-            ),
-          );
-          source.add({
-            type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
-            id: ROI_SENTINEL_ID,
-            description: undefined,
-            relatedSegments: undefined,
-            properties: [],
-            pointA: new Float32Array(rank),
-            pointB: new Float32Array(rank),
-          } as AxisAlignedBoundingBox);
-          const ref = context.registerDisposer(
-            source.getReference(ROI_SENTINEL_ID),
-          );
-
-          // Identity transform: annotation coordinates == global voxel coords.
-          const identityTransform = context.registerDisposer(
-            makeCachedDerivedWatchableValue(
-              (space) => makeIdentityTransform(space),
-              [this.manager.root.coordinateSpace],
-            ),
-          );
-          const layerTransform = context.registerDisposer(
-            getWatchableRenderLayerTransform(
-              this.manager.root.coordinateSpace,
-              constantWatchableValue(emptyValidCoordinateSpace),
-              identityTransform,
-              undefined,
-            ),
-          );
-
-          // Sentinel data source (not loaded; satisfies AnnotationLayerState API).
-          const sentinelDs = context.registerDisposer(
-            new LayerDataSource(this, undefined),
-          );
-
-          const layerState = context.registerDisposer(
-            new AnnotationLayerState({
-              transform: layerTransform,
-              localPosition: constantWatchableValue(new Float32Array(0)),
-              source: source.addRef(),
-              displayState: this.roiAnnotationDisplayState,
-              dataSource: sentinelDs,
-              subsourceId: ROI_SENTINEL_ID,
-              subsourceIndex: 0,
-              role: RenderLayerRole.ANNOTATION,
-            }),
-          );
-
-          // Render layers (not added to annotationStates — not user-selectable).
-          const annotationLayer = context.registerDisposer(
-            new AnnotationLayer(this.manager.chunkManager, layerState.addRef()),
-          );
-          context.registerDisposer(
-            this.addRenderLayer(
-              new SliceViewAnnotationLayer(
-                annotationLayer,
-                this.annotationCrossSectionRenderScaleHistogram,
+            // Annotation source holding the one sentinel bounding-box annotation.
+            const source = context.registerDisposer(
+              new RoiAnnotationSource(
+                rank,
+                this.roiBoxState,
+                () => this.manager.root.coordinateSpace.value,
               ),
-            ),
-          );
-          context.registerDisposer(
-            this.addRenderLayer(
-              new PerspectiveViewAnnotationLayer(
-                annotationLayer.addRef(),
-                this.annotationProjectionRenderScaleHistogram,
-              ),
-            ),
-          );
+            );
+            source.add({
+              type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
+              id: ROI_SENTINEL_ID,
+              description: undefined,
+              relatedSegments: undefined,
+              properties: [],
+              pointA: new Float32Array(rank),
+              pointB: new Float32Array(rank),
+            } as AxisAlignedBoundingBox);
+            const ref = context.registerDisposer(
+              source.getReference(ROI_SENTINEL_ID),
+            );
 
-          // Nav-sync: while "follow view" is on, keep the box center synced to
-          // the navigation position. When following is turned off, this stops
-          // updating, so the box stays frozen at its last position. The center is
-          // the single authoritative box location in both modes.
-          const syncCenterToNav = () => {
-            if (!this.roiBoxState.followNavCenter.value) return;
-            const navPos = this.manager.root.globalPosition.value;
-            const next = vec3.clone(this.roiBoxState.center.value);
-            let changed = false;
-            for (let i = 0; i < 3; i++) {
-              const v = navPos[i] ?? 0;
-              if (next[i] !== v) {
-                next[i] = v;
-                changed = true;
+            // Identity transform: annotation coordinates == global voxel coords.
+            const identityTransform = context.registerDisposer(
+              makeCachedDerivedWatchableValue(
+                (space) => makeIdentityTransform(space),
+                [this.manager.root.coordinateSpace],
+              ),
+            );
+            const layerTransform = context.registerDisposer(
+              getWatchableRenderLayerTransform(
+                this.manager.root.coordinateSpace,
+                constantWatchableValue(emptyValidCoordinateSpace),
+                identityTransform,
+                undefined,
+              ),
+            );
+
+            // Sentinel data source (not loaded; satisfies AnnotationLayerState API).
+            const sentinelDs = context.registerDisposer(
+              new LayerDataSource(this, undefined),
+            );
+
+            const layerState = context.registerDisposer(
+              new AnnotationLayerState({
+                transform: layerTransform,
+                localPosition: constantWatchableValue(new Float32Array(0)),
+                source: source.addRef(),
+                displayState: this.roiAnnotationDisplayState,
+                dataSource: sentinelDs,
+                subsourceId: ROI_SENTINEL_ID,
+                subsourceIndex: 0,
+                role: RenderLayerRole.ANNOTATION,
+              }),
+            );
+
+            // Render layers (not added to annotationStates — not user-selectable).
+            const annotationLayer = context.registerDisposer(
+              new AnnotationLayer(
+                this.manager.chunkManager,
+                layerState.addRef(),
+              ),
+            );
+            context.registerDisposer(
+              this.addRenderLayer(
+                new SliceViewAnnotationLayer(
+                  annotationLayer,
+                  this.annotationCrossSectionRenderScaleHistogram,
+                ),
+              ),
+            );
+            context.registerDisposer(
+              this.addRenderLayer(
+                new PerspectiveViewAnnotationLayer(
+                  annotationLayer.addRef(),
+                  this.annotationProjectionRenderScaleHistogram,
+                ),
+              ),
+            );
+
+            // Nav-sync: while "follow view" is on, keep the box center synced to
+            // the navigation position. When following is turned off, this stops
+            // updating, so the box stays frozen at its last position. The center is
+            // the single authoritative box location in both modes.
+            const syncCenterToNav = () => {
+              if (!this.roiBoxState.followNavCenter.value) return;
+              const navPos = this.manager.root.globalPosition.value;
+              const next = vec3.clone(this.roiBoxState.center.value);
+              let changed = false;
+              for (let i = 0; i < 3; i++) {
+                const v = navPos[i] ?? 0;
+                if (next[i] !== v) {
+                  next[i] = v;
+                  changed = true;
+                }
               }
-            }
-            if (changed) this.roiBoxState.center.value = next;
-          };
+              if (changed) this.roiBoxState.center.value = next;
+            };
 
-          // Geometry controller: recompute pointA/pointB from the box center +
-          // size whenever the box parameters change, then update the sentinel.
-          const updateGeometry = context.registerCancellable(
-            animationFrameDebounce(() => {
+            // Geometry controller: recompute pointA/pointB from the box center +
+            // size whenever the box parameters change, then update the sentinel.
+            // Returns true if the sentinel geometry was actually written.
+            const doUpdateGeometry = (): boolean => {
               const ct = layerState.chunkTransform.value;
-              if (ct.error !== undefined) return;
+              if (ct.error !== undefined) return false;
               const coordSpace = this.manager.root.coordinateSpace.value;
-              if (!coordSpace.valid) return;
+              if (!coordSpace.valid) return false;
               const r = ct.modelTransform.unpaddedRank;
 
               const centerVec = this.roiBoxState.center.value;
@@ -2226,27 +2270,54 @@ void main() {
               } finally {
                 source.geometryUpdateActive = false;
               }
-            }),
-          );
+              // Force a full-display redraw once geometry is set. The annotation
+              // render layers were just added via addRenderLayer (above) inside a
+              // debounced callback, so the per-panel visible-layer trackers have not
+              // yet subscribed to this layer's redrawNeeded — meaning the
+              // source.changed -> redrawNeeded dispatch above can be missed.
+              // DisplayContext.draw() repaints every visible panel unconditionally,
+              // so scheduling it here guarantees the box paints on first appearance
+              // (and whenever chunkTransform first becomes ready).
+              this.manager.root.display.scheduleRedraw();
+              return true;
+            };
+            const updateGeometry = context.registerCancellable(
+              animationFrameDebounce(() => {
+                doUpdateGeometry();
+              }),
+            );
 
-          // Navigation moves sync the center (when following), which in turn
-          // triggers updateGeometry via roiBoxState.changed below.
-          context.registerDisposer(
-            this.manager.root.globalPosition.changed.add(syncCenterToNav),
-          );
-          // Snap the center to the nav position when follow mode is enabled.
-          context.registerDisposer(
-            this.roiBoxState.followNavCenter.changed.add(syncCenterToNav),
-          );
-          context.registerDisposer(
-            this.roiBoxState.changed.add(updateGeometry),
-          );
-          context.registerDisposer(
-            this.manager.root.coordinateSpace.changed.add(updateGeometry),
-          );
-          syncCenterToNav();
-          updateGeometry();
-        }, this.roiBoxState.enabled),
+            // Navigation moves sync the center (when following), which in turn
+            // triggers updateGeometry via roiBoxState.changed below.
+            context.registerDisposer(
+              this.manager.root.globalPosition.changed.add(syncCenterToNav),
+            );
+            // Snap the center to the nav position when follow mode is enabled.
+            context.registerDisposer(
+              this.roiBoxState.followNavCenter.changed.add(syncCenterToNav),
+            );
+            context.registerDisposer(
+              this.roiBoxState.changed.add(updateGeometry),
+            );
+            context.registerDisposer(
+              this.manager.root.coordinateSpace.changed.add(updateGeometry),
+            );
+            // The chunk transform may not be ready synchronously when this layer
+            // is first created; re-run the geometry update (and force a redraw)
+            // once it becomes available so the box appears without a manual toggle.
+            context.registerDisposer(
+              layerState.chunkTransform.changed.add(updateGeometry),
+            );
+            syncCenterToNav();
+            // Call synchronously so the source has correct geometry before the
+            // first draw. If the chunk transform is not yet ready this is a no-op
+            // and the chunkTransform.changed listener above will retry.
+            doUpdateGeometry();
+          },
+          this.roiBoxState.enabled,
+          this.roiBoxState.showBox,
+          this.manager.root.coordinateSpace,
+        ),
       );
 
       const { mouseState } = this.manager.layerSelectedValues;

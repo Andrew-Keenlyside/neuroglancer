@@ -27,6 +27,7 @@
 
 import { TrackableBoolean } from "#src/trackable_boolean.js";
 import { TrackableVec3 } from "#src/trackable_vec3.js";
+import { TrackableRGB } from "#src/util/color.js";
 import { RefCounted } from "#src/util/disposable.js";
 import { mat4, vec3 } from "#src/util/geom.js";
 import {
@@ -196,6 +197,10 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
   changed = new NullarySignal();
 
   enabled = new TrackableBoolean(false);
+  /** When false, the box outline is hidden but loading restriction and clip remain active. */
+  showBox = new TrackableBoolean(true);
+  /** Box outline / fill color. Defaults to cyan. */
+  color = new TrackableRGB(vec3.fromValues(0, 0.9, 1));
   /** Activates box-edit interaction priority (the "mode"). */
   editActive = new TrackableBoolean(false);
   physicalSize = new TrackableVec3(
@@ -220,6 +225,8 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
     super();
     for (const t of [
       this.enabled,
+      this.showBox,
+      this.color,
       this.editActive,
       this.physicalSize,
       this.center,
@@ -266,6 +273,9 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
   toJSON() {
     const result: Record<string, unknown> = {};
     if (this.enabled.value) result.enabled = true;
+    if (!this.showBox.value) result.showBox = false;
+    const colorJson = this.color.toJSON();
+    if (colorJson !== undefined) result.color = colorJson;
     if (this.editActive.value) result.edit = true;
     const size = this.physicalSize.toJSON();
     if (size !== undefined) result.size = size;
@@ -288,6 +298,12 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
     verifyObject(obj);
     verifyOptionalObjectProperty(obj, "enabled", (x) => {
       this.enabled.restoreState(x);
+    });
+    verifyOptionalObjectProperty(obj, "showBox", (x) => {
+      this.showBox.restoreState(x);
+    });
+    verifyOptionalObjectProperty(obj, "color", (x) => {
+      this.color.restoreState(x);
     });
     verifyOptionalObjectProperty(obj, "edit", (x) => {
       this.editActive.restoreState(x);
@@ -313,6 +329,8 @@ export class TrackableRoiBoxState extends RefCounted implements Trackable {
 
   reset() {
     this.enabled.reset();
+    this.showBox.reset();
+    this.color.reset();
     this.editActive.reset();
     this.physicalSize.reset();
     this.center.reset();
