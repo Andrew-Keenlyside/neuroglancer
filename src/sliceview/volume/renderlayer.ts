@@ -374,6 +374,11 @@ export abstract class SliceViewVolumeRenderLayer<
     this.registerDisposer(
       shaderParameters.changed.add(this.redrawNeeded.dispatch),
     );
+    if (this.roiBoxState !== null) {
+      this.registerDisposer(
+        this.roiBoxState.changed.add(this.redrawNeeded.dispatch),
+      );
+    }
     // The shader depends on the `ChunkFormat` (which is a property of the `VolumeChunkSource`), the
     // `ShaderParameters` (which are determined by the derived RenderLayer class), the number of
     // channel dimensions, and the data histogram channel specifications.
@@ -613,7 +618,7 @@ void main() {
         state.center.value,
         state.physicalSize.value,
         displayDimensionScales,
-        projectionParameters.pixelSize,
+        1,
         state.zoomRelative.value,
       );
     }

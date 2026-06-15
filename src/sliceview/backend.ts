@@ -192,7 +192,7 @@ export class SliceViewBackend extends SliceViewIntermediateBase {
             center,
             roi.physicalSize,
             displayDimensionRenderInfo.displayDimensionScales,
-            projectionParameters.pixelSize,
+            1,
             roi.zoomRelative,
           );
           const bounds = roiGlobalBoxToLocalBounds(

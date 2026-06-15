@@ -2222,10 +2222,14 @@ export function UserLayerWithAnnotationsMixin<
             const syncCenterToNav = () => {
               if (!this.roiBoxState.followNavCenter.value) return;
               const navPos = this.manager.root.globalPosition.value;
+              const displayDimensionIndices: readonly number[] =
+                (this.manager.root as any).displayDimensionRenderInfo?.value
+                  ?.displayDimensionIndices ?? [0, 1, 2];
               const next = vec3.clone(this.roiBoxState.center.value);
               let changed = false;
               for (let i = 0; i < 3; i++) {
-                const v = navPos[i] ?? 0;
+                const globalDim = displayDimensionIndices[i];
+                const v = globalDim >= 0 ? (navPos[globalDim] ?? 0) : 0;
                 if (next[i] !== v) {
                   next[i] = v;
                   changed = true;
@@ -2246,12 +2250,27 @@ export function UserLayerWithAnnotationsMixin<
 
               const centerVec = this.roiBoxState.center.value;
               const sizeVec = this.roiBoxState.physicalSize.value;
+              const displayDimensionIndices: readonly number[] =
+                (this.manager.root as any).displayDimensionRenderInfo?.value
+                  ?.displayDimensionIndices ?? [0, 1, 2];
+              // centerVec/sizeVec are in display order; annotation geometry
+              // is in global (model) order, so remap via displayDimensionIndices.
               const pointA = new Float32Array(r);
               const pointB = new Float32Array(r);
               for (let i = 0; i < r; i++) {
                 const scale = coordSpace.scales[i] || 1;
-                const half = (sizeVec[i] ?? 1e-6) / (2 * scale);
-                const c = centerVec[i] ?? 0;
+                // Find which display dimension carries global dim i.
+                let displayDim = -1;
+                for (let d = 0; d < 3; d++) {
+                  if (displayDimensionIndices[d] === i) {
+                    displayDim = d;
+                    break;
+                  }
+                }
+                const half =
+                  (sizeVec[displayDim >= 0 ? displayDim : 0] ?? 1e-6) /
+                  (2 * scale);
+                const c = displayDim >= 0 ? (centerVec[displayDim] ?? 0) : 0;
                 pointA[i] = c - half;
                 pointB[i] = c + half;
               }
