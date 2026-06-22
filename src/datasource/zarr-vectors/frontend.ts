@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
+import { requestAsyncComputation } from "#src/async_computation/request.js";
 import type { AnnotationGeometryChunkSpecification } from "#src/annotation/base.js";
 import {
   AnnotationGeometryChunkSource,
@@ -75,6 +77,34 @@ import * as matrix from "#src/util/matrix.js";
 import type { ProgressOptions } from "#src/util/progress_listener.js";
 import { ProgressSpan } from "#src/util/progress_listener.js";
 import { allSiPrefixes, supportedUnits } from "#src/util/si_units.js";
+
+// ---------------------------------------------------------------
+// zstd decompression helper (object_attributes chunks may be zstd-compressed)
+
+const ZSTD_MAGIC = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]);
+
+function looksLikeZstdFe(bytes: Uint8Array): boolean {
+  return (
+    bytes.byteLength >= 4 &&
+    bytes[0] === ZSTD_MAGIC[0] &&
+    bytes[1] === ZSTD_MAGIC[1] &&
+    bytes[2] === ZSTD_MAGIC[2] &&
+    bytes[3] === ZSTD_MAGIC[3]
+  );
+}
+
+async function maybeDecompressObjAttr(
+  bytes: Uint8Array<ArrayBuffer>,
+  signal: AbortSignal,
+): Promise<Uint8Array<ArrayBuffer>> {
+  if (!looksLikeZstdFe(bytes)) return bytes;
+  return await requestAsyncComputation(
+    decodeZstd,
+    signal,
+    [bytes.buffer],
+    bytes,
+  );
+}
 
 // ---------------------------------------------------------------
 // Chunk source classes
@@ -658,8 +688,15 @@ async function buildObjectAttributePropertyMap(
         options,
       );
       if (dataResponse === undefined) return undefined;
-      const bytes = new Uint8Array(
+      const rawBytes = new Uint8Array(
         (await dataResponse.response.arrayBuffer()) as ArrayBuffer,
+      );
+      // Decompress if the writer applied zstd (the zarr codec pipeline writes
+      // zstd by default; we bypass zarr's own chunk decoder here and handle
+      // it manually so we can read the semantic dtype from the outer group).
+      const bytes = await maybeDecompressObjAttr(
+        rawBytes,
+        options.signal ?? new AbortController().signal,
       );
       const values = reinterpretObjectAttributeBytes(
         bytes,
@@ -674,8 +711,12 @@ async function buildObjectAttributePropertyMap(
           options,
         );
         if (maskResponse !== undefined) {
-          presentMask = new Uint8Array(
+          const rawMaskBytes = new Uint8Array(
             (await maskResponse.response.arrayBuffer()) as ArrayBuffer,
+          );
+          presentMask = await maybeDecompressObjAttr(
+            rawMaskBytes,
+            options.signal ?? new AbortController().signal,
           );
         }
       }
