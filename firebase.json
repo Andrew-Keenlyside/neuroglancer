@@ -5,6 +5,14 @@
       "public": "dist/client"
     },
     {
+      "target": "ng-wizard-demo",
+      "public": "dist/client"
+    },
+     {
+      "target": "ng-zarr-vectors",
+      "public": "dist/client"
+    },
+    {
       "target": "docs",
       "public": "dist/docs"
     }

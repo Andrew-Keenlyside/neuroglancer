@@ -3,6 +3,16 @@
     "default": "neuroglancer-demo"
   },
   "targets": {
+    "em-270621": {
+      "hosting": {
+        "ng-wizard-demo": [
+          "ng-wizard-demo"
+        ],
+        "ng-zarr-vectors": [
+          "ng-zarr-vectors"
+        ]
+      }
+    },
     "neuroglancer-demo": {
       "hosting": {
         "app": [
