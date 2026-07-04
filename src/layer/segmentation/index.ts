@@ -66,6 +66,7 @@ import {
   MultiscaleMeshLayer,
   MultiscaleMeshSource,
 } from "#src/mesh/frontend.js";
+import { getRenderLayerTransform } from "#src/render_coordinate_transform.js";
 import {
   RenderScaleHistogram,
   numRenderScaleHistogramBins,
@@ -127,6 +128,7 @@ import {
   SpatiallyIndexedSkeletonLayer,
   SpatiallyIndexedSkeletonSource,
   MultiscaleSpatiallyIndexedSkeletonSource,
+  computeDiagonalModelToGlobalMetersScale,
 } from "#src/skeleton/frontend.js";
 import {
   findSpatiallyIndexedSkeletonNode,
@@ -635,16 +637,27 @@ function getSpatialSkeletonGridHistogramConfig(
     if (delta > 0) minDelta = Math.min(minDelta, delta);
   }
   const span = maxLogSpacing - minLogSpacing;
-  const minBinSizeForCoverage =
-    span / Math.max(numRenderScaleHistogramBins - 4, 1);
-  const lowerBound = Math.max(minBinSizeForCoverage, 0.05);
-  let binSize = lowerBound;
-  if (Number.isFinite(minDelta)) {
-    const maxBinSizeForDistinctBars = minDelta * 0.9;
-    if (maxBinSizeForDistinctBars >= lowerBound) {
-      binSize = maxBinSizeForDistinctBars;
-    }
-  }
+  // Choose a bin size that spreads the levels across (most of) the widget
+  // width.  Reserve a few bins of padding on each side so the extreme
+  // levels aren't flush against the edges.  A single level (span 0) has no
+  // meaningful spread — fall back to the default bin size.
+  const coverageBinSize =
+    span > 0
+      ? span / Math.max(numRenderScaleHistogramBins - 4, 1)
+      : renderScaleHistogramBinSize;
+  // Never use a bin so large that two adjacent levels (minDelta apart in
+  // log space) collapse into the same bin — that would merge distinct
+  // scales into one bar.  When the coverage bin size already keeps them
+  // distinct (the common case: few, well-separated pyramid levels), the
+  // coverage value wins and the bars fan out across the full axis instead
+  // of bunching into a narrow cluster in the middle.
+  const maxBinSizeForDistinctBars = Number.isFinite(minDelta)
+    ? minDelta * 0.9
+    : Number.POSITIVE_INFINITY;
+  let binSize = Math.max(
+    0.05,
+    Math.min(coverageBinSize, maxBinSizeForDistinctBars),
+  );
   if (!Number.isFinite(binSize) || binSize <= 0) {
     binSize = renderScaleHistogramBinSize;
   }
@@ -1786,7 +1799,32 @@ export class SegmentationUserLayer extends Base {
         if (mesh instanceof MultiscaleSpatiallyIndexedSkeletonSource) {
           // Collect grid metadata outside `activate`, since `activate` is a no-op
           // when guard values are unchanged and may skip the callback.
-          spatialSkeletonGridSizes = mesh.getSpatialSkeletonGridSizes();
+          // Compose the live render-layer transform (reflects any output
+          // CoordinateSpaceTransform the user has applied, e.g. correcting
+          // a source's declared voxel size) with the global coordinate
+          // space's scales, so level sizes stay unit-consistent with the
+          // camera-driven resolution target even after such an edit.
+          //
+          // Use the plain (non-"Watchable") `getRenderLayerTransform` here,
+          // not `loadedSubsource.getRenderLayerTransform()` — that method
+          // requires `loadedSubsource.activated`, which this code runs
+          // BEFORE (`activate()` below is what sets it), and would throw.
+          let liveScale: Float64Array | undefined;
+          const { layer, transform } = loadedSubsource.loadedDataSource;
+          const transformValue = getRenderLayerTransform(
+            layer.manager.root.coordinateSpace.value,
+            layer.localPosition.coordinateSpace.value,
+            transform.value,
+            loadedSubsource,
+          );
+          if (transformValue.error === undefined) {
+            liveScale = computeDiagonalModelToGlobalMetersScale(
+              transformValue,
+              this.manager.root.coordinateSpace.value.scales,
+            );
+          }
+          spatialSkeletonGridSizes =
+            mesh.getSpatialSkeletonGridSizes(liveScale);
         }
         loadedSubsource.activate(() => {
           const displayState = {

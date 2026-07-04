@@ -77,6 +77,13 @@ export interface SkeletonChunkDownloadOptions {
   /** Geometry kind (drives whether per-vertex tangents are precomputed). */
   readonly geometryKind: SkeletonGeometryKind;
   /**
+   * Whether `fragment_attributes/segment_id` chunks are present in this
+   * level.  When false the fetch is skipped entirely (avoids 404 noise for
+   * stores that never wrote per-fragment segment ids, e.g. streamline stores).
+   * Defaults to true for backward-compatibility with callers that don't set it.
+   */
+  readonly hasFragmentSegmentIds?: boolean;
+  /**
    * Async key-value-store read.  Resolves to a decompressed byte buffer,
    * or `undefined` if the key is absent (sparse chunk presence).  The
    * `subpath` is relative to the level group, e.g.
@@ -324,10 +331,13 @@ export async function downloadSkeletonChunk(
   // unified across chunks (`[f, 0]`).
   const numFragments = fragmentIndex.numFragments;
   let fragSegIds: BigUint64Array | undefined;
-  const segFragBytes = await kvStoreRead(
-    `fragment_attributes/segment_id/${chunkKey}/c/0`,
-    signal,
-  );
+  const segFragBytes =
+    (options.hasFragmentSegmentIds ?? true)
+      ? await kvStoreRead(
+          `fragment_attributes/segment_id/${chunkKey}/c/0`,
+          signal,
+        )
+      : undefined;
   if (
     segFragBytes !== undefined &&
     segFragBytes.byteLength >= numFragments * 8

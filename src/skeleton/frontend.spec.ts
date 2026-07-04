@@ -17,6 +17,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { Uint64Set } from "#src/uint64_set.js";
+import { mat4 } from "#src/util/geom.js";
 import { DataType } from "#src/util/data_type.js";
 
 if (!("WebGL2RenderingContext" in globalThis)) {
@@ -37,6 +38,8 @@ const {
   SpatiallyIndexedSkeletonLayer,
   getSpatialSkeletonCellKeyPrefix,
   resolveSpatiallyIndexedSkeletonSegmentPick,
+  computeDiagonalModelToGlobalMetersScale,
+  maybeUpdateAutoSpatialSkeletonGridResolutionTarget,
 } = await import("#src/skeleton/frontend.js");
 
 describe("resolveSpatiallyIndexedSkeletonSegmentPick", () => {
@@ -233,5 +236,158 @@ describe("SpatiallyIndexedSkeletonLayer browse exclusions", () => {
     const excludedSegments = (layer as any).getBrowsePassExcludedSegments();
     expect(excludedSegments).toBeInstanceOf(Uint64Set);
     expect([...excludedSegments]).toEqual([29n]);
+  });
+});
+
+function makeIdentityMappedTransform(modelToRenderLayerTransform: Float32Array) {
+  return {
+    rank: 3,
+    unpaddedRank: 3,
+    localToRenderLayerDimensions: [0, 1, 2],
+    globalToRenderLayerDimensions: [0, 1, 2],
+    channelToRenderLayerDimensions: [],
+    channelToModelDimensions: [],
+    channelSpaceShape: new Uint32Array(0),
+    modelToRenderLayerTransform,
+    modelDimensionNames: ["x", "y", "z"],
+    layerDimensionNames: ["x", "y", "z"],
+  };
+}
+
+function diagonalMat4(
+  diag: readonly [number, number, number],
+  offDiag?: { row: number; col: number; value: number },
+): Float32Array {
+  const m = new Float32Array(16);
+  m[0] = diag[0];
+  m[5] = diag[1];
+  m[10] = diag[2];
+  m[15] = 1;
+  if (offDiag !== undefined) {
+    m[offDiag.row + 4 * offDiag.col] = offDiag.value;
+  }
+  return m;
+}
+
+describe("computeDiagonalModelToGlobalMetersScale", () => {
+  it("composes a diagonal model->renderLayer scale with per-axis global scales", () => {
+    const transform = makeIdentityMappedTransform(diagonalMat4([2, 3, 4]));
+    const result = computeDiagonalModelToGlobalMetersScale(
+      transform as any,
+      new Float64Array([10, 20, 30]),
+    );
+    expect(result).toBeDefined();
+    expect(Array.from(result!)).toEqual([20, 60, 120]);
+  });
+
+  it("reflects a live 1000x output rescale (the mm-to-µm bug scenario)", () => {
+    // The render-layer transform scales model coordinates by 1e-3
+    // relative to the store's own declared unit -- e.g. the user
+    // corrected the source's output dimensions from mm to µm.
+    const transform = makeIdentityMappedTransform(
+      diagonalMat4([1e-3, 1e-3, 1e-3]),
+    );
+    const result = computeDiagonalModelToGlobalMetersScale(
+      transform as any,
+      new Float64Array([1, 1, 1]),
+    );
+    expect(result).toBeDefined();
+    for (const v of result!) {
+      expect(v).toBeCloseTo(1e-3, 9);
+    }
+  });
+
+  it("returns undefined when a model dimension is unmapped", () => {
+    const transform = makeIdentityMappedTransform(diagonalMat4([2, 3, 4]));
+    (transform as any).localToRenderLayerDimensions = [0, -1, 2];
+    const result = computeDiagonalModelToGlobalMetersScale(
+      transform as any,
+      new Float64Array([1, 1, 1]),
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined for a non-diagonal (rotated/sheared) transform", () => {
+    const transform = makeIdentityMappedTransform(
+      diagonalMat4([2, 3, 4], { row: 0, col: 1, value: 5 }),
+    );
+    const result = computeDiagonalModelToGlobalMetersScale(
+      transform as any,
+      new Float64Array([1, 1, 1]),
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when the corresponding global scale is invalid", () => {
+    const transform = makeIdentityMappedTransform(diagonalMat4([2, 3, 4]));
+    const result = computeDiagonalModelToGlobalMetersScale(
+      transform as any,
+      new Float64Array([10, 0, 30]),
+    );
+    expect(result).toBeUndefined();
+  });
+});
+
+describe("maybeUpdateAutoSpatialSkeletonGridResolutionTarget bias stability", () => {
+  function makeWatchable(initial: number) {
+    let v = initial;
+    return {
+      get value() {
+        return v;
+      },
+      set value(x: number) {
+        v = x;
+      },
+      changed: { dispatch: () => {} },
+    };
+  }
+
+  it("does not corrupt the persisted bias across repeated sub-threshold updates", () => {
+    const target = makeWatchable(0);
+    const bias = makeWatchable(1);
+    const displayState = {
+      autoSpatialSkeletonGridLevel3d: { value: true },
+      spatialSkeletonGridResolutionTarget3d: target,
+      spatialSkeletonGridResolutionBias3d: bias,
+    } as any;
+
+    // Identity view-projection: w=1 regardless of world position; only
+    // the varying `width` below perturbs the computed target by a tiny
+    // (sub-0.1%) amount frame to frame, matching the real skip-write path.
+    const viewProjectionMat = mat4.create();
+    const localPosition = new Float32Array(0);
+
+    maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+      displayState,
+      { viewProjectionMat, width: 1000, height: 1, globalPosition: new Float32Array(3) },
+      localPosition,
+      "3d",
+    );
+    // First call always writes (no prior `lastAuto`).
+    expect(target.value).toBeCloseTo(0.2, 10);
+    expect(bias.value).toBe(1);
+
+    // Two more frames with a change small enough to land in the
+    // "skip write" branch (< 0.1%), matching ordinary smooth camera
+    // motion.  Before the fix, `lastAuto` advanced on the skipped
+    // write anyway, drifted away from the un-changed `target.value`,
+    // and on the very next frame got misread as a manual widget drag —
+    // corrupting `bias`.
+    for (let i = 0; i < 5; ++i) {
+      maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+        displayState,
+        {
+          viewProjectionMat,
+          width: 1000.1,
+          height: 1,
+          globalPosition: new Float32Array(3),
+        },
+        localPosition,
+        "3d",
+      );
+    }
+
+    expect(bias.value).toBe(1);
+    expect(target.value).toBeCloseTo(0.2, 10);
   });
 });

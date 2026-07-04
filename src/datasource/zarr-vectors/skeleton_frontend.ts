@@ -346,13 +346,20 @@ export interface ZarrVectorsSkeletonSpatialLevel {
  */
 export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends MultiscaleSpatiallyIndexedSkeletonSource {
   /**
-   * Opt in to camera-driven LOD picking: zarr-vectors stores publish
-   * synthetic per-level spacings via `getSpatialSkeletonGridSizes()`,
-   * so the picker can pick a meaningful level for the current camera
-   * zoom.  See `src/skeleton/frontend.ts:maybeUpdateAutoSpatialSkeletonGridResolutionTarget`.
+   * Opt in to camera-driven LOD picking ONLY when there are ≥2 pyramid
+   * levels for the picker to choose between.  With a single level, auto-LOD
+   * is meaningless: `maybeUpdateAutoSpatialSkeletonGridResolutionTarget`
+   * overwrites the resolution target every frame with a camera-derived
+   * spacing (e.g. 100–285 mm when zoomed out) that is far coarser than the
+   * lone level's spacing (~6.4 mm).  Empirically that mismatch leaves the
+   * chunks loaded ("N/N present" in the render-scale widget) but **undrawn**,
+   * so a single-level store renders nothing.  Returning false here for the
+   * single-level case reverts to the manual/default picker, which always
+   * draws the one available level regardless of zoom.  Multi-level stores
+   * keep camera-driven LOD.  See `getSpatialSkeletonGridSizes()`.
    */
   override get prefersAutoSpatialSkeletonGridLevel(): boolean {
-    return true;
+    return this.levels.length > 1;
   }
 
   /** Per-level chunk-source parameter blobs in finest-first order. */
@@ -395,16 +402,21 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
    * ``chunk_scale_factors`` so each level's chunk_shape is monotonically
    * different.
    */
-  override getSpatialSkeletonGridSizes(): {
+  override getSpatialSkeletonGridSizes(liveScale?: Float64Array): {
     x: number;
     y: number;
     z: number;
   }[] {
     // Report in physical meters (chunk_shape × meters-per-unit) so the
     // resolution widget reads in real units and the auto-LOD target
-    // (also meters) compares correctly, independent of the global
-    // coordinate space's voxel size.
-    const m = this.metersPerUnit;
+    // (also meters) compares correctly.  Prefer `liveScale` — it
+    // composes the store's own declared native-unit scale with any
+    // output CoordinateSpaceTransform the user has applied (e.g.
+    // correcting a source's declared voxel size from mm to µm) — over
+    // the frozen `metersPerUnit` captured at construction time, which
+    // only reflects the store's own metadata and silently goes stale
+    // relative to the camera-driven target after such an edit.
+    const m = liveScale ?? this.metersPerUnit;
     return this.perLevelChunkShape.map((cs) => ({
       x: cs[0] * m[0],
       y: cs[1] * m[1],

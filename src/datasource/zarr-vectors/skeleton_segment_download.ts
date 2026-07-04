@@ -183,6 +183,8 @@ export interface DownloadSegmentSkeletonOptions {
    * objects.
    */
   readonly crossChunkLinks?: CrossChunkLinksTable;
+  /** Whether to fetch `fragment_attributes/segment_id` per chunk. */
+  readonly hasFragmentSegmentIds?: boolean;
 }
 
 /**
@@ -328,6 +330,7 @@ export async function downloadSegmentSkeleton(
     linksConvention,
     geometryKind,
     crossChunkLinks,
+    hasFragmentSegmentIds,
   } = options;
   const manifest = await readObjectManifest(oid, manifestReader, signal);
   if (manifest === undefined || manifest.length === 0) return undefined;
@@ -383,6 +386,7 @@ export async function downloadSegmentSkeleton(
         attributeDtypes,
         linksConvention,
         geometryKind,
+        hasFragmentSegmentIds,
         kvStoreRead: manifestReader.kvStoreRead,
       },
       signal,

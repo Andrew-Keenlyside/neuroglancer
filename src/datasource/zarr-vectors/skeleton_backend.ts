@@ -35,7 +35,10 @@ import {
   type ZarrVectorsSkeletonGeometryKind,
 } from "#src/datasource/zarr-vectors/base.js";
 import {
+  createCrossChunkLinksCaches,
   readCrossChunkLinks,
+  readCrossChunkLinksForChunk,
+  type CrossChunkLinksCaches,
   type CrossChunkLinksTable,
 } from "#src/datasource/zarr-vectors/cross_chunk_links.js";
 import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
@@ -127,6 +130,74 @@ function makeKvStoreRead(
 }
 
 /**
+ * Build a `kvStoreRead` callback like {@link makeKvStoreRead} but WITHOUT
+ * the magic-byte-sniffing auto-decompress step.  Required by
+ * {@link readCrossChunkLinks}: a v0.8 cross-chunk-links shard file is a
+ * multi-cell concatenation (each cell independently zstd-framed), not a
+ * single zstd stream, so auto-decompressing the whole shard blob would
+ * corrupt the shard-index/cell-boundary parsing.
+ */
+function makeRawKvStoreRead(
+  baseUrl: string,
+  sharedKvStoreContext: {
+    kvStoreContext: {
+      read: (url: string, options: { signal: AbortSignal }) => Promise<any>;
+    };
+  },
+) {
+  return async (
+    subpath: string,
+    signal: AbortSignal,
+  ): Promise<Uint8Array | undefined> => {
+    const url = joinBaseUrlAndPath(baseUrl, subpath);
+    const response = await sharedKvStoreContext.kvStoreContext.read(url, {
+      signal,
+    });
+    if (response === undefined) return undefined;
+    return new Uint8Array(
+      (await response.response.arrayBuffer()) as ArrayBuffer,
+    );
+  };
+}
+
+/**
+ * Build a `kvStoreList` callback bound to a base URL and the worker-side
+ * shared kvstore context.  Used by {@link readCrossChunkLinks} to
+ * recursively discover which shards of a v0.8 ``kK`` array are
+ * populated.  Mirrors ``listAttributeNames`` in `frontend.ts`, but
+ * returns bare (no-trailing-slash) names for both directories and files
+ * instead of a single merged list.
+ */
+function makeKvStoreList(
+  baseUrl: string,
+  sharedKvStoreContext: {
+    kvStoreContext: {
+      list: (
+        urlPrefix: string,
+        options: { responseKeys: "suffix"; signal: AbortSignal },
+      ) => Promise<{ entries: { key: string }[]; directories: string[] }>;
+    };
+  },
+) {
+  return async (
+    prefix: string,
+    signal: AbortSignal,
+  ): Promise<{ directories: string[]; files: string[] }> => {
+    const url = joinBaseUrlAndPath(baseUrl, prefix);
+    const response = await sharedKvStoreContext.kvStoreContext.list(url, {
+      responseKeys: "suffix",
+      signal,
+    });
+    const stripTrailingSlash = (s: string) =>
+      s.endsWith("/") ? s.slice(0, -1) : s;
+    return {
+      directories: response.directories.map(stripTrailingSlash),
+      files: response.entries.map((e) => stripTrailingSlash(e.key)),
+    };
+  };
+}
+
+/**
  * The parameter types in `base.ts` declare `ZarrVectorsLinkDtype` and
  * `ZarrVectorsAttributeDtype` as union subsets of the orchestrator's
  * dtypes.  The orchestrator's `LinkDtype` / `AttributeDtype` are
@@ -163,35 +234,61 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
   ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
 ) {
   /**
-   * Cached decoded ``cross_chunk_links/0/`` table for this level.  Read
-   * lazily on first ``download()`` and reused for every subsequent chunk
-   * — the table is per-level, not per-chunk.
+   * Shared shard-discovery / shard-byte caches for this level's
+   * ``cross_chunk_links/0/`` tree, reused across every chunk's
+   * per-chunk-targeted query (see {@link getCrossChunkLinksForChunk}).
    *
-   * ``null`` means "probed, store has no such table" (older zarr-vectors
-   * stores written without ``cross_chunk_strategy="explicit_links"``).
-   * ``undefined`` means "not yet probed".
+   * ``false`` means "probed, store has no such table at all" (older
+   * zarr-vectors stores written without
+   * ``cross_chunk_strategy="explicit_links"``) — skip all future
+   * queries.  ``undefined`` means "not yet probed".
+   *
+   * Deliberately NOT a cache of decoded records (that was the previous
+   * design: a single ``CrossChunkLinksTable`` holding every record in
+   * the level, read once and reused for every chunk).  For a real
+   * dataset that whole-table decode can be tens of millions of records
+   * — multiple gigabytes once V8's per-object overhead is counted for
+   * the deeply-nested `record → endpoints[] → {chunkCoords[]}`
+   * representation — and, being a plain field rather than a `Chunk`,
+   * it was invisible to `ChunkState`'s GPU/system memory budget and
+   * never evicted under memory pressure.  `CrossChunkLinksCaches` only
+   * retains cheap shard-coordinate lists and byte-budgeted raw
+   * (still-compressed) shard bytes; per-chunk queries decode only the
+   * records actually needed.  See `cross_chunk_links.ts`'s
+   * `CrossChunkLinksCaches` docstring for the full rationale.
    *
    * Mirror of the same field on
    * {@link ZarrVectorsObjectKeyedSkeletonSourceBackend}; the two
    * backends share a parameter type's ``baseUrl`` for the same store
-   * level, but each holds its own cache copy.  Could be promoted to a
-   * per-level shared cache later if memory becomes a concern (16832-
-   * byte tables are typical, so two copies is fine for now).
+   * level, but each holds its own cache instance.
    */
-  private crossChunkLinks_: CrossChunkLinksTable | null | undefined;
+  private crossChunkLinksCaches_: CrossChunkLinksCaches | false | undefined;
 
-  private async getCrossChunkLinks(
+  private async getCrossChunkLinksForChunk(
+    targetChunkCoords: readonly number[],
     kvStoreRead: (
       subpath: string,
       signal: AbortSignal,
     ) => Promise<Uint8Array | undefined>,
+    kvStoreList: (
+      prefix: string,
+      signal: AbortSignal,
+    ) => Promise<{ directories: string[]; files: string[] }>,
     signal: AbortSignal,
   ): Promise<CrossChunkLinksTable | undefined> {
-    if (this.crossChunkLinks_ !== undefined) {
-      return this.crossChunkLinks_ ?? undefined;
+    if (this.crossChunkLinksCaches_ === false) return undefined;
+    if (this.crossChunkLinksCaches_ === undefined) {
+      this.crossChunkLinksCaches_ = createCrossChunkLinksCaches();
     }
-    const table = await readCrossChunkLinks({ kvStoreRead }, signal);
-    this.crossChunkLinks_ = table ?? null;
+    const table = await readCrossChunkLinksForChunk(
+      { kvStoreRead, kvStoreList },
+      targetChunkCoords,
+      this.crossChunkLinksCaches_,
+      signal,
+    );
+    if (table === undefined) {
+      this.crossChunkLinksCaches_ = false;
+    }
     return table;
   }
 
@@ -323,10 +420,13 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
       linksConvention,
       geometryKind,
       linkDtype,
+      hasFragmentSegmentIds,
     } = this.parameters;
     const { chunkGridPosition } = chunk;
     const chunkKey = Array.from(chunkGridPosition, (v) => String(v)).join(".");
     const kvStoreRead = makeKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    const rawKvStoreRead = makeRawKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    const kvStoreList = makeKvStoreList(baseUrl, this.sharedKvStoreContext);
 
     const decoded = await downloadSkeletonChunk(
       {
@@ -337,6 +437,7 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
         attributeDtypes: attributeDtypes.map(asAttributeDtype),
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
         geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
+        hasFragmentSegmentIds,
         kvStoreRead,
       },
       signal,
@@ -361,7 +462,12 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
     // ~/.claude/plans/i-wanted-you-to-spicy-candy.md (option 3) for
     // the full rationale.
     let withBridges = decoded;
-    const table = await this.getCrossChunkLinks(kvStoreRead, signal);
+    const table = await this.getCrossChunkLinksForChunk(
+      Array.from(chunkGridPosition, (v) => Number(v)),
+      rawKvStoreRead,
+      kvStoreList,
+      signal,
+    );
     if (table !== undefined) {
       const {
         ghostRequests,
@@ -521,6 +627,27 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
    * ``null`` means "checked, store has no such table" (older
    * zarr-vectors stores written without ``cross_chunk_strategy =
    * "explicit_links"``).  ``undefined`` means "not yet probed".
+   *
+   * Only fetched for ``explicit`` / ``implicit_sequential_with_branches``
+   * geometry (graphs / skeletons) — see the ``download()`` call site.
+   * For ``implicit_sequential`` (streamline/polyline) stores,
+   * `downloadSegmentSkeleton` reconstructs cross-chunk edges purely from
+   * manifest order (`deriveImplicitSequentialCrossChunkEdges`) and never
+   * reads this table at all (its `vi` fields are literal `0`
+   * placeholders for that convention — see the comment at
+   * `skeleton_segment_download.ts`'s call site), so fetching it
+   * unconditionally was pure waste: a real dataset's whole-level
+   * decode can be tens of millions of records / multiple gigabytes
+   * (the same issue fixed for the spatially-indexed pass-1 backend via
+   * `readCrossChunkLinksForChunk` — see that class's
+   * `crossChunkLinksCaches_` docstring).
+   *
+   * TODO: graphs/skeletons still pay the whole-table decode here since
+   * one object's manifest can span many chunks (not the single target
+   * a per-chunk query assumes) — a proper fix needs a multi-chunk-
+   * scoped query (or deferring the query until `ownedChunks` is known
+   * inside `downloadSegmentSkeleton`), out of scope for this pass since
+   * it doesn't affect the reported streamline crash.
    */
   private crossChunkLinks_: CrossChunkLinksTable | null | undefined;
 
@@ -584,12 +711,16 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       subpath: string,
       signal: AbortSignal,
     ) => Promise<Uint8Array | undefined>,
+    kvStoreList: (
+      prefix: string,
+      signal: AbortSignal,
+    ) => Promise<{ directories: string[]; files: string[] }>,
     signal: AbortSignal,
   ): Promise<CrossChunkLinksTable | undefined> {
     if (this.crossChunkLinks_ !== undefined) {
       return this.crossChunkLinks_ ?? undefined;
     }
-    const table = await readCrossChunkLinks({ kvStoreRead }, signal);
+    const table = await readCrossChunkLinks({ kvStoreRead, kvStoreList }, signal);
     this.crossChunkLinks_ = table ?? null;
     return table;
   }
@@ -603,8 +734,11 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       linksConvention,
       geometryKind,
       linkDtype,
+      hasFragmentSegmentIds,
     } = this.parameters;
     const kvStoreRead = makeKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    const rawKvStoreRead = makeRawKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    const kvStoreList = makeKvStoreList(baseUrl, this.sharedKvStoreContext);
 
     // The manifests array's `numObjects` / `chunkSize` aren't carried
     // on the parameter blob (slice 4c will plumb them through from
@@ -617,7 +751,14 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       signal,
     );
 
-    const crossChunkLinks = await this.getCrossChunkLinks(kvStoreRead, signal);
+    // See `crossChunkLinks_`'s docstring: `implicit_sequential` streamline
+    // stores never consult this table (cross-chunk edges come from
+    // manifest order instead), so skip the potentially multi-gigabyte
+    // whole-level decode entirely for that convention.
+    const crossChunkLinks =
+      linksConvention === "implicit_sequential"
+        ? undefined
+        : await this.getCrossChunkLinks(rawKvStoreRead, kvStoreList, signal);
 
     // Map the selected segment id (e.g. a flywire uint64) to the dense
     // object index via object_attributes/segment_id before the manifest
@@ -659,6 +800,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
         geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
         crossChunkLinks,
+        hasFragmentSegmentIds,
       },
       signal,
     );

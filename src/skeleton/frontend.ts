@@ -1860,9 +1860,22 @@ export abstract class MultiscaleSpatiallyIndexedSkeletonSource extends Multiscal
     return this.getPerspectiveSources();
   }
 
-  getSpatialSkeletonGridSizes():
-    | { x: number; y: number; z: number }[]
-    | undefined {
+  /**
+   * @param liveScale Optional current effective meters-per-model-axis
+   *     scale (see `computeDiagonalModelToGlobalMetersScale`), composing
+   *     the datasource's own declared native-unit scale with any output
+   *     `CoordinateSpaceTransform` the user has applied.  `undefined`
+   *     when the caller couldn't reduce the live transform to a
+   *     diagonal per-axis scale (rotation/shear) or it isn't available
+   *     yet — implementations should fall back to a static scale in
+   *     that case.  Subclasses that don't need transform-awareness
+   *     (e.g. CATMAID, which never opts into
+   *     `prefersAutoSpatialSkeletonGridLevel`) may ignore this.
+   */
+  getSpatialSkeletonGridSizes(
+    liveScale?: Float64Array,
+  ): { x: number; y: number; z: number }[] | undefined {
+    liveScale;
     return undefined;
   }
 }
@@ -2010,19 +2023,75 @@ class SkeletonOverlayChunk implements SkeletonGPUGeometry {
   }
 }
 
-function getSpatialSkeletonGridSpacing(
-  transformedSource: TransformedSource,
-  levels:
-    | Array<{ size: { x: number; y: number; z: number }; lod: number }>
-    | undefined,
-  gridIndex: number,
-) {
-  const levelSize = levels?.[gridIndex]?.size;
-  if (levelSize !== undefined) {
-    return Math.max(Math.min(levelSize.x, levelSize.y, levelSize.z), 1e-6);
+/**
+ * Attempts to compute, for each of a multiscale skeleton source's first 3
+ * "model" (native/chunk-grid) dimensions, the CURRENT effective scale to
+ * real-world meters — composing the datasource's own `modelToRenderLayer
+ * Transform` (which reflects any output `CoordinateSpaceTransform` the user
+ * has applied, e.g. correcting a source's declared voxel size from mm to
+ * µm) with the corresponding global dimension's declared meters-per-unit
+ * (`globalScales`, i.e. `coordinateSpace.scales`).
+ *
+ * Diagonal-only: returns `undefined` (caller should fall back to a static,
+ * transform-oblivious scale) when a model dimension is unmapped, when a
+ * render-layer dimension mixes contributions from more than one model
+ * dimension by more than a small tolerance (rotation/shear — this function
+ * does not attempt to reduce a non-axis-aligned transform to a per-axis
+ * spacing), or when the corresponding global scale isn't a finite positive
+ * number.
+ *
+ * This exists because `getSpatialSkeletonGridSizes()` previously reported
+ * level sizes using only the datasource's own frozen, load-time native-unit
+ * scale, which silently went stale relative to the camera-driven resolution
+ * target (itself always computed from the live transform) whenever the
+ * user edited the layer's output coordinate transform — producing a
+ * systematic mismatch proportional to the rescale factor.
+ */
+export function computeDiagonalModelToGlobalMetersScale(
+  transform: RenderLayerTransform,
+  globalScales: Float64Array,
+): Float64Array | undefined {
+  const {
+    rank: layerRank,
+    localToRenderLayerDimensions,
+    globalToRenderLayerDimensions,
+    modelToRenderLayerTransform,
+  } = transform;
+  const result = new Float64Array(3);
+  for (let modelDim = 0; modelDim < 3; ++modelDim) {
+    const layerDim = localToRenderLayerDimensions[modelDim];
+    if (layerDim === -1) return undefined;
+    const diagValue =
+      modelToRenderLayerTransform[layerDim + (layerRank + 1) * modelDim];
+    // Reject if any OTHER model dimension also contributes non-negligibly
+    // to this render-layer dimension (rotation/shear) — diagonal-only.
+    for (let otherModelDim = 0; otherModelDim < layerRank; ++otherModelDim) {
+      if (otherModelDim === modelDim) continue;
+      const v =
+        modelToRenderLayerTransform[
+          layerDim + (layerRank + 1) * otherModelDim
+        ];
+      if (Math.abs(v) > Math.abs(diagValue) * 1e-3 + 1e-12) {
+        return undefined;
+      }
+    }
+    let globalDim = -1;
+    for (let g = 0; g < globalToRenderLayerDimensions.length; ++g) {
+      if (globalToRenderLayerDimensions[g] === layerDim) {
+        globalDim = g;
+        break;
+      }
+    }
+    if (globalDim === -1 || globalDim >= globalScales.length) {
+      return undefined;
+    }
+    const metersPerGlobalUnit = globalScales[globalDim];
+    if (!Number.isFinite(metersPerGlobalUnit) || metersPerGlobalUnit <= 0) {
+      return undefined;
+    }
+    result[modelDim] = Math.abs(diagValue) * metersPerGlobalUnit;
   }
-  const chunkSize = transformedSource.chunkLayout.size;
-  return Math.max(Math.min(chunkSize[0], chunkSize[1], chunkSize[2]), 1e-6);
+  return result;
 }
 
 /**
@@ -2138,7 +2207,7 @@ const AUTO_SPATIAL_SKELETON_GRID_MAX_OCTAVE_STEP = 0.5;
  * choice only matters for perspective views; either way the helper
  * returns a meaningful value for any of these fallbacks.
  */
-function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+export function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
   displayState: SpatiallyIndexedSkeletonLayerDisplayState,
   projectionParameters: {
     viewProjectionMat: mat4;
@@ -2239,11 +2308,18 @@ function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
   }
   // Only write when the value changes by more than 0.1% — the setter
   // dispatches `changed` unconditionally (level pick → re-attach chain).
+  // Leave `lastAuto` untouched on this branch: it must only track the
+  // last value actually WRITTEN to `target.value`.  Advancing it here
+  // (as this used to do) lets it drift away from `cur` — which stays at
+  // its last-written value while we skip the write — by up to just
+  // under 0.1% per skipped frame.  That's comfortably past the 1e-6
+  // "did the user manually move the widget" threshold above, so nearly
+  // every skipped frame got misread as manual interaction on the very
+  // next frame, corrupting the persisted `bias` continuously.
   if (
     st.lastAuto !== undefined &&
     Math.abs(cur - stabilizedNext) < Math.max(cur, stabilizedNext) * 1e-3
   ) {
-    st.lastAuto = stabilizedNext;
     return;
   }
   target.value = stabilizedNext;
@@ -2259,77 +2335,6 @@ const autoSpatialSkeletonBias = new WeakMap<
   WatchableValueInterface<number>,
   { lastAuto: number | undefined }
 >();
-
-// Tracks chunk keys already counted for a given histogram within a single frame,
-// preventing the same chunk from being counted multiple times when it falls within
-// the visible frustum of more than one slice panel in the same frame.
-const seenChunkKeysPerFrame = new WeakMap<
-  RenderScaleHistogram,
-  { frameNumber: number; keys: Set<string> }
->();
-
-function updateSpatialSkeletonGridRenderScaleHistogram(
-  histogram: RenderScaleHistogram,
-  frameNumber: number,
-  transformedSources: readonly TransformedSource[][],
-  projectionParameters: any,
-  localPosition: Float32Array,
-  lod: number | undefined,
-  levels:
-    | Array<{ size: { x: number; y: number; z: number }; lod: number }>
-    | undefined,
-) {
-  histogram.begin(frameNumber);
-  if (lod === undefined || transformedSources.length === 0) {
-    return;
-  }
-  const lodSuffix = `:${lod}`;
-  const scales = transformedSources[0] ?? [];
-  if (scales.length === 0) {
-    return;
-  }
-  let seen = seenChunkKeysPerFrame.get(histogram);
-  if (seen === undefined || seen.frameNumber !== frameNumber) {
-    seen = { frameNumber, keys: new Set() };
-    seenChunkKeysPerFrame.set(histogram, seen);
-  }
-  const seenKeys = seen.keys;
-  for (const tsource of scales) {
-    const gridIndex = getSpatiallyIndexedSkeletonGridIndex(tsource.source);
-    if (gridIndex === undefined) {
-      continue;
-    }
-    const source = tsource.source as SpatiallyIndexedSkeletonSource;
-    let presentCount = 0;
-    let missingCount = 0;
-    forEachVisibleVolumetricChunk(
-      projectionParameters,
-      localPosition,
-      tsource,
-      (positionInChunks) => {
-        const chunkKey = `${positionInChunks.join()}${lodSuffix}`;
-        const seenKey = `${gridIndex}:${chunkKey}`;
-        if (seenKeys.has(seenKey)) return;
-        seenKeys.add(seenKey);
-        const chunk = source.chunks.get(chunkKey);
-        if (chunk?.state === ChunkState.GPU_MEMORY) {
-          presentCount++;
-        } else {
-          missingCount++;
-        }
-      },
-    );
-    const spacing = getSpatialSkeletonGridSpacing(tsource, levels, gridIndex);
-    const total = presentCount + missingCount;
-    if (total > 0) {
-      histogram.add(spacing, spacing, presentCount, missingCount);
-    } else if (!histogram.spatialScales.has(spacing)) {
-      // Keep the row visible in the histogram when no chunks are in view,
-      // but only if no earlier panel already populated it this frame.
-      histogram.add(spacing, spacing, 0, 1, true);
-    }
-  }
-}
 
 export interface SpatiallyIndexedSkeletonLayerDisplayState
   extends SkeletonLayerDisplayState {
@@ -3430,6 +3435,81 @@ export class SpatiallyIndexedSkeletonLayer
     return result;
   }
 
+  /**
+   * Populate the spatial-skeleton grid render-scale histogram using the
+   * SAME visible-chunk enumeration the render path uses
+   * (`forEachVisibleChunkSlot`), so the widget's bars reflect exactly the
+   * chunks being drawn — present chunks fill the "present" (bright) colour
+   * and grow the bar height as they load; not-yet-loaded slots contribute
+   * to the dim "not-present" portion.
+   *
+   * This replaces an earlier implementation that ran a *parallel*
+   * per-source `forEachVisibleVolumetricChunk` pass, which enumerated no
+   * chunks in the perspective view (source arbitration is required) and so
+   * left every bar an empty placeholder.  Placeholder bars are still added
+   * for pyramid levels with no chunks in view, so all scales stay visible
+   * in the widget.
+   */
+  updateGridRenderScaleHistogram(
+    view: SpatiallyIndexedSkeletonView,
+    gridLevel: number | undefined,
+    transformedSources: readonly TransformedSource[][],
+    projectionParameters: ProjectionParameters,
+    lod: number | undefined,
+    levels:
+      | ReadonlyArray<{ size: { x: number; y: number; z: number }; lod: number }>
+      | undefined,
+    histogram: RenderScaleHistogram,
+    frameNumber: number,
+  ) {
+    histogram.begin(frameNumber);
+    if (lod === undefined || transformedSources.length === 0) return;
+    const spacingOf = (size: { x: number; y: number; z: number }) =>
+      Math.max(Math.min(size.x, size.y, size.z), 1e-6);
+    const perSpacing = new Map<number, { present: number; missing: number }>();
+    this.forEachVisibleChunkSlot(
+      view,
+      gridLevel,
+      transformedSources,
+      projectionParameters,
+      lod,
+      (chunkKey, chunkSource, chunkLayout) => {
+        const gridIndex = getSpatiallyIndexedSkeletonGridIndex(chunkSource);
+        // Prefer the level's physical (meters) spacing — the same value the
+        // histogram axis is calibrated against — falling back to the raw
+        // chunk-layout spacing only when the level lookup is unavailable.
+        const levelSize =
+          gridIndex !== undefined ? levels?.[gridIndex]?.size : undefined;
+        const spacing =
+          levelSize !== undefined
+            ? spacingOf(levelSize)
+            : this.getChunkSpacing(chunkLayout);
+        let entry = perSpacing.get(spacing);
+        if (entry === undefined) {
+          entry = { present: 0, missing: 0 };
+          perSpacing.set(spacing, entry);
+        }
+        const chunk = chunkSource.chunks.get(chunkKey);
+        if (chunk?.state === ChunkState.GPU_MEMORY) {
+          entry.present++;
+        } else {
+          entry.missing++;
+        }
+      },
+    );
+    for (const [spacing, { present, missing }] of perSpacing) {
+      histogram.add(spacing, spacing, present, missing);
+    }
+    // Keep every pyramid level visible in the widget by adding a
+    // render-only placeholder bar for any level with no chunks in view.
+    for (const level of levels ?? []) {
+      const spacing = spacingOf(level.size);
+      if (!histogram.spatialScales.has(spacing)) {
+        histogram.add(spacing, spacing, 0, 1, true);
+      }
+    }
+  }
+
   private areVisibleChunksReady(
     view: SpatiallyIndexedSkeletonView,
     gridLevel: number | undefined,
@@ -4157,14 +4237,15 @@ export class PerspectiveViewSpatiallyIndexedSkeletonLayer extends PerspectiveVie
     if (histogram !== undefined) {
       const frameNumber =
         this.base.chunkManager.chunkQueueManager.frameNumberCounter.frameNumber;
-      updateSpatialSkeletonGridRenderScaleHistogram(
-        histogram,
-        frameNumber,
+      this.base.updateGridRenderScaleHistogram(
+        "3d",
+        displayState.spatialSkeletonGridLevel3d?.value,
         this.transformedSources,
         renderContext.projectionParameters,
-        this.base.localPosition.value,
         lodValue,
         levels,
+        histogram,
+        frameNumber,
       );
     }
     const modelMatrix = update3dRenderLayerAttachment(
@@ -4342,14 +4423,15 @@ export class SliceViewPanelSpatiallyIndexedSkeletonLayer extends SliceViewPanelR
     if (histogram !== undefined) {
       const frameNumber =
         this.base.chunkManager.chunkQueueManager.frameNumberCounter.frameNumber;
-      updateSpatialSkeletonGridRenderScaleHistogram(
-        histogram,
-        frameNumber,
+      this.base.updateGridRenderScaleHistogram(
+        "2d",
+        displayState.spatialSkeletonGridLevel2d?.value,
         this.transformedSources,
         renderContext.sliceView.projectionParameters.value,
-        this.base.localPosition.value,
         lodValue,
         levels,
+        histogram,
+        frameNumber,
       );
     }
     const modelMatrix = update3dRenderLayerAttachment(

@@ -1331,6 +1331,9 @@ async function buildSkeletonMetadata(
   pass2Params.linksConvention = linksConvention;
   pass2Params.geometryKind = geometryKind;
   pass2Params.linkDtype = linkDtype;
+  // Filled in below after per-level metadata is fetched; default true so
+  // older stores (which don't stamp arrays_present) keep their existing behavior.
+  pass2Params.hasFragmentSegmentIds = true;
 
   // Pass-1 (spatially-indexed) wiring — only when the store is 3-D.
   // Neuroglancer's spatially-indexed skeleton machinery hardcodes a
@@ -1367,34 +1370,46 @@ async function buildSkeletonMetadata(
     const upperBoundsF32 = Float32Array.from(upperBounds);
 
     // Fetch each level's zarr.json in parallel to read its optional
-    // per-level chunk_shape override.  Reuses kvstore caching: the
-    // same files are read again below by the chunk-source download
-    // path with zero net traffic.
-    const perLevelChunkShape: Float32Array[] = await Promise.all(
-      levelPaths.map(async (levelPath) => {
-        const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
-          pipelineUrlJoin(storeUrl, levelPath),
-        );
-        try {
-          const levelJson = await getJsonResource(
-            sharedKvStoreContext,
-            joinBaseUrlAndPath(levelUrl, "zarr.json"),
-            `zarr-vectors level ${JSON.stringify(levelPath)} metadata`,
-            options,
+    // per-level chunk_shape override and arrays_present list.  Reuses
+    // kvstore caching: the same files are read again below by the
+    // chunk-source download path with zero net traffic.
+    const perLevelMeta: { chunkShape: Float32Array; hasFragmentSegmentIds: boolean }[] =
+      await Promise.all(
+        levelPaths.map(async (levelPath) => {
+          const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
+            pipelineUrlJoin(storeUrl, levelPath),
           );
-          const override =
-            levelJson?.attributes?.zarr_vectors_level?.chunk_shape;
-          if (Array.isArray(override) && override.length === rank) {
-            const arr = new Float32Array(rank);
-            for (let i = 0; i < rank; ++i) arr[i] = Number(override[i]);
-            return arr;
+          try {
+            const levelJson = await getJsonResource(
+              sharedKvStoreContext,
+              joinBaseUrlAndPath(levelUrl, "zarr.json"),
+              `zarr-vectors level ${JSON.stringify(levelPath)} metadata`,
+              options,
+            );
+            const lvlAttrs = levelJson?.attributes?.zarr_vectors_level ?? {};
+            const override = lvlAttrs?.chunk_shape;
+            const chunkShape =
+              Array.isArray(override) && override.length === rank
+                ? (() => {
+                    const arr = new Float32Array(rank);
+                    for (let i = 0; i < rank; ++i) arr[i] = Number(override[i]);
+                    return arr;
+                  })()
+                : new Float32Array(rootChunkShapeF32);
+            const arraysPresent: string[] = Array.isArray(lvlAttrs?.arrays_present)
+              ? lvlAttrs.arrays_present
+              : [];
+            // When arrays_present is not stamped (older stores), assume present.
+            const hasFragmentSegmentIds =
+              arraysPresent.length === 0 || arraysPresent.includes("fragment_attributes");
+            return { chunkShape, hasFragmentSegmentIds };
+          } catch {
+            // fall through to defaults
           }
-        } catch {
-          // fall through to default
-        }
-        return new Float32Array(rootChunkShapeF32);
-      }),
-    );
+          return { chunkShape: new Float32Array(rootChunkShapeF32), hasFragmentSegmentIds: true };
+        }),
+      );
+    const perLevelChunkShape = perLevelMeta.map((m) => m.chunkShape);
 
     // Per-level parameter blobs.  Each level gets its own chunkShape
     // (may differ when the writer used ``chunk_scale_factors``).
@@ -1423,6 +1438,7 @@ async function buildSkeletonMetadata(
       // `src/layer/segmentation/index.ts:588-603` for the picker that
       // then looks up sources by `gridIndex`.
       params.gridIndex = levelPaths.length - 1 - k;
+      params.hasFragmentSegmentIds = perLevelMeta[k].hasFragmentSegmentIds;
       levels.push({ parameters: params });
     }
 
@@ -1432,6 +1448,10 @@ async function buildSkeletonMetadata(
       lowerBounds: lowerBoundsF32,
       upperBounds: upperBoundsF32,
     };
+    // Pass-2 always operates at level 0 — use its arrays_present to gate
+    // the fragment_attributes/segment_id fetch.  Overrides the default-true
+    // placeholder set above.
+    pass2Params.hasFragmentSegmentIds = perLevelMeta[0].hasFragmentSegmentIds;
   }
 
   // Discover per-object attributes at level 0 and build the
@@ -1444,6 +1464,16 @@ async function buildSkeletonMetadata(
     options,
   );
 
+  // Do NOT apply the NGFF per-level `translation` to skeleton/streamline/
+  // polyline/graph vertices.  zarr-vectors writers store vertices in exact
+  // physical coordinates; the per-level NGFF translation is a bin-center
+  // convention (`bin_shape / 2`, written by `create_resolution_level` and
+  // also used to round-trip `bin_shape`) that describes the chunk *grid*, not
+  // the vertex positions.  Applying it shifts every vertex by half a chunk off
+  // its true coordinate (a uniform misregistration — e.g. ~3.2 mm at
+  // chunk_shape ≈ 6.4 mm), which breaks coordinate-based navigation.  All
+  // spatial-index calculations (chunk assignment, cull bounds) are already done
+  // in raw coordinates, so the layer transform must be identity here.
   return {
     rank,
     coordinateSpace,

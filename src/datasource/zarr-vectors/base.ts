@@ -153,6 +153,8 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceParameters {
    * (#src/skeleton/source_selection.ts) for the consumer side.
    */
   gridIndex!: number;
+  /** Whether `fragment_attributes/segment_id` exists for this level. */
+  hasFragmentSegmentIds!: boolean;
   static RPC_ID = "zarr-vectors/SpatiallyIndexedSkeletonSource";
 }
 
@@ -178,5 +180,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceParameters {
   linksConvention!: ZarrVectorsLinksConvention;
   geometryKind!: ZarrVectorsSkeletonGeometryKind;
   linkDtype!: ZarrVectorsLinkDtype;
+  /** Whether `fragment_attributes/segment_id` exists at level 0. */
+  hasFragmentSegmentIds!: boolean;
   static RPC_ID = "zarr-vectors/ObjectKeyedSkeletonSource";
 }

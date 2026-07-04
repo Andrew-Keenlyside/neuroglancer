@@ -86,7 +86,6 @@ export interface SpatiallyIndexedSkeletonChunkSpecification
 }
 
 const SKELETON_CHUNK_PRIORITY = 60;
-export const SPATIALLY_INDEXED_SKELETON_PRIORITY_BOOST = -BASE_PRIORITY;
 const SPATIALLY_INDEXED_SKELETON_LOD_DEBOUNCE_MS = 300;
 const tempCenter = vec3.create();
 const tempChunkSize = vec3.create();
@@ -234,9 +233,18 @@ export function getSpatiallyIndexedSkeletonRenderPriority(
   chunkSize: Float32Array,
   positionInChunks: Float32Array,
 ) {
+  // No boost relative to other VISIBLE-tier sources (volume rendering,
+  // annotations, meshes): spatially-indexed skeleton chunks compete for
+  // the shared chunk memory budget purely on distance-to-view relevance,
+  // like everything else.  A prior boost here
+  // (SPATIALLY_INDEXED_SKELETON_PRIORITY_BOOST = -BASE_PRIORITY) exactly
+  // canceled the shared BASE_PRIORITY baseline every VISIBLE-tier source
+  // is anchored to, which meant EVERY skeleton chunk — even far ones —
+  // unconditionally outranked EVERY other layer's visible chunks, letting
+  // an actively-loading skeleton layer evict an unrelated image layer's
+  // required chunks entirely.
   return (
     basePriority +
-    SPATIALLY_INDEXED_SKELETON_PRIORITY_BOOST +
     SCALE_PRIORITY_MULTIPLIER * scaleIndex +
     getSpatiallyIndexedSkeletonChunkPriority(
       localCenter,

@@ -19,7 +19,6 @@ import { describe, expect, it } from "vitest";
 import {
   getSpatiallyIndexedSkeletonChunkPriority,
   getSpatiallyIndexedSkeletonRenderPriority,
-  SPATIALLY_INDEXED_SKELETON_PRIORITY_BOOST,
   SpatiallyIndexedSkeletonChunkRequestOwner,
 } from "#src/skeleton/backend.js";
 import {
@@ -59,11 +58,13 @@ describe("skeleton/backend chunk priority", () => {
     );
   });
 
-  it("uses a view-agnostic boost tied to the shared volumetric base priority", () => {
-    expect(SPATIALLY_INDEXED_SKELETON_PRIORITY_BOOST).toBe(-BASE_PRIORITY);
-  });
-
-  it("boosts spatial skeleton chunks in all views above equivalent volume-rendering chunks", () => {
+  it("matches equivalent volume-rendering chunks' priority exactly (no boost)", () => {
+    // Spatially-indexed skeleton chunks must compete for the shared chunk
+    // memory budget on equal footing with other VISIBLE-tier sources
+    // (volume rendering, annotations, meshes) — differentiated only by
+    // genuine distance-to-view relevance, never by an unconditional boost.
+    // A boost here previously let every skeleton chunk, however
+    // irrelevant, outrank and evict every other layer's required chunks.
     const basePriority = BASE_PRIORITY;
     const scaleIndex = 2;
     const localCenter = Float32Array.of(10, 20, 30);
@@ -90,16 +91,11 @@ describe("skeleton/backend chunk priority", () => {
         positionInChunks,
       );
 
-      expect(skeletonPriority).toBeGreaterThan(
-        equivalentVolumeRenderingPriority,
-      );
-      expect(skeletonPriority - equivalentVolumeRenderingPriority).toBeCloseTo(
-        SPATIALLY_INDEXED_SKELETON_PRIORITY_BOOST,
-      );
+      expect(skeletonPriority).toBeCloseTo(equivalentVolumeRenderingPriority);
     }
   });
 
-  it("keeps spatial skeleton chunks ordered by distance after applying the boost", () => {
+  it("keeps spatial skeleton chunks ordered by distance", () => {
     const basePriority = BASE_PRIORITY;
     const scaleIndex = 1;
     const localCenter = Float32Array.of(10, 20, 30);
