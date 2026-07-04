@@ -535,21 +535,32 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     );
     const scheduleUpdateChunkPriorities = () =>
       this.chunkManager.scheduleUpdateChunkPriorities();
+    // Anything that can change the grid-anchor/level selection made in
+    // recomputeChunkPriorities must also mark stale downloads for cleanup
+    // (see `pendingLodCleanup` below) — otherwise in-flight downloads from
+    // the superseded selection are never cancelled and just accumulate as
+    // the camera moves/zooms, compounding with each recompute's marginally
+    // different selection into an ever-growing, never-converging request
+    // count. Previously only the skeletonLod slider did this.
+    const scheduleUpdateAndMarkStaleCleanup = () => {
+      this.pendingLodCleanup = true;
+      scheduleUpdateChunkPriorities();
+    };
     this.registerDisposer(
-      this.localPosition.changed.add(scheduleUpdateChunkPriorities),
+      this.localPosition.changed.add(scheduleUpdateAndMarkStaleCleanup),
     );
     this.registerDisposer(
-      this.renderScaleTarget.changed.add(scheduleUpdateChunkPriorities),
+      this.renderScaleTarget.changed.add(scheduleUpdateAndMarkStaleCleanup),
     );
     this.registerDisposer(
-      this.skeletonGridLevel.changed.add(scheduleUpdateChunkPriorities),
+      this.skeletonGridLevel.changed.add(scheduleUpdateAndMarkStaleCleanup),
     );
     this.registerDisposer(
-      this.skeletonGridLevel2d.changed.add(scheduleUpdateChunkPriorities),
+      this.skeletonGridLevel2d.changed.add(scheduleUpdateAndMarkStaleCleanup),
     );
     this.registerDisposer(
       this.skeletonGridResolutionTarget3d.changed.add(
-        scheduleUpdateChunkPriorities,
+        scheduleUpdateAndMarkStaleCleanup,
       ),
     );
 
@@ -705,11 +716,27 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
               getSpatiallyIndexedSkeletonGridIndex(scale) !== undefined,
           )
         ) {
-          return selectSpatiallyIndexedSkeletonEntriesByGridWithFallback(
+          // `...WithFallback` returns EVERY level in fallback-preference
+          // order (preferred first, then progressively finer/coarser
+          // alternatives) for a caller to try in sequence and stop at the
+          // first viable one -- see its docstring. It is not a list of
+          // levels to request/use simultaneously (the grid-anchor path a
+          // few hundred lines below, in recomputeChunkPriorities's own
+          // per-position candidate loop, uses it correctly this way). This
+          // branch was instead returning the WHOLE list directly as "the
+          // selected scales", so its caller looped over every pyramid
+          // level and requested chunks from all of them -- the direct
+          // cause of thousands of stray requests whenever grid indices are
+          // present (which for zarr-vectors multi-resolution sources is
+          // always true), including in 2D views where this is the only
+          // code path (the grid-anchor arbitration path below only runs
+          // for 3D views).
+          const ordered = selectSpatiallyIndexedSkeletonEntriesByGridWithFallback(
             scales.map((tsource, scaleIndex) => ({ tsource, scaleIndex })),
             skeletonGridLevel,
             ({ tsource }) => getSpatiallyIndexedSkeletonGridIndex(tsource),
           );
+          return ordered.length > 0 ? [ordered[0]] : [];
         }
         if (resolvedPixelSize === undefined) {
           return scales.map((tsource, scaleIndex) => ({
@@ -800,14 +827,29 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
             }) =>
               getChunkSpacing(candidate.tsource.chunkLayout.size) *
               metersPerUnit;
-            const anchor = orderedCandidates.reduce((best, candidate) =>
+            // Anchor the position-enumeration grid on whichever candidate's
+            // spacing is CLOSEST to the desired resolution target, not
+            // unconditionally the finest level: enumerating at the finest
+            // level's cell density across the whole visible frustum for a
+            // coarse/zoomed-out view is orders of magnitude more iteration
+            // work than the view needs, and independently re-derives a
+            // distance-based LOD per tiny finest-grid cell -- fragmenting
+            // what should be one coarse-level selection into many different
+            // levels scattered across the view.
+            const fallbackAnchor = orderedCandidates.reduce((best, candidate) =>
               spacingMeters(candidate) < spacingMeters(best) ? candidate : best,
             );
             const targetSpacingMeters =
               Number.isFinite(this.skeletonGridResolutionTarget3d.value) &&
               this.skeletonGridResolutionTarget3d.value > 0
                 ? this.skeletonGridResolutionTarget3d.value
-                : spacingMeters(anchor);
+                : spacingMeters(fallbackAnchor);
+            const anchor = orderedCandidates.reduce((best, candidate) =>
+              Math.abs(spacingMeters(candidate) - targetSpacingMeters) <
+              Math.abs(spacingMeters(best) - targetSpacingMeters)
+                ? candidate
+                : best,
+            );
             const refPoint =
               projectionParameters.globalPosition.length >= 3
                 ? projectionParameters.globalPosition

@@ -3282,15 +3282,25 @@ export class SpatiallyIndexedSkeletonLayer
         })
         .filter((x): x is NonNullable<typeof x> => x !== undefined);
       if (arbitrationCandidates.length > 1) {
-        const anchor = arbitrationCandidates.reduce((best, candidate) =>
-          candidate.spacingMeters < best.spacingMeters ? candidate : best,
-        );
         const worldCenter = new Float32Array(3);
         const candidateChunkPosition = new Float32Array(3);
         const targetSpacingMeters =
           this.getArbitrationTargetSpacingMeters3d(projectionParameters);
         const referencePixelSize =
           this.getReferencePixelSize(projectionParameters);
+        // Anchor the position-enumeration grid on whichever candidate's
+        // spacing is CLOSEST to the desired target, not unconditionally the
+        // finest level -- same bug (and same fix) as
+        // recomputeChunkPriorities's grid-anchor arbitration in
+        // skeleton/backend.ts: anchoring on the finest level unconditionally
+        // makes this walk the finest level's cell density across the whole
+        // visible frustum even for a coarse/zoomed-out view.
+        const anchor = arbitrationCandidates.reduce((best, candidate) =>
+          Math.abs(candidate.spacingMeters - targetSpacingMeters) <
+          Math.abs(best.spacingMeters - targetSpacingMeters)
+            ? candidate
+            : best,
+        );
         const emittedChunkSlots = new Set<string>();
         let shouldContinue = true;
         forEachVisibleVolumetricChunk(
