@@ -134,9 +134,14 @@ export interface CrossChunkLinksReaderOptions {
  * `skeleton_backend.ts`), reusing two caches so repeated chunk queries
  * amortize the discovery/fetch cost without re-decoding the world:
  *
- * - `shardCoords`: populated-shard-coordinate lists are cheap to keep
- *   (arrays of small coordinate tuples, not decoded records) and avoid
- *   re-walking the `kvStoreList` discovery tree on every chunk query.
+ * - `shardCoords`: populated-shard-coordinate discovery results, keyed by
+ *   `kBase` *and* the queried target chunk (see below for why) — cheap to
+ *   keep (arrays of small coordinate tuples, not decoded records) and
+ *   avoid re-walking the `kvStoreList` discovery tree for a repeat query
+ *   of the same chunk.  Values are `Promise`s, not resolved arrays, so
+ *   that concurrent queries for the same key (e.g. every visible chunk's
+ *   `download()` firing at once before the first one's walk resolves)
+ *   share one discovery walk instead of each independently re-running it.
  * - `shardBytes`: raw (still-compressed) whole-shard byte blobs, bounded
  *   by {@link BoundedByteCache} so a huge dataset's shard bytes don't
  *   accumulate without limit — nearby chunks' queries typically land in
@@ -147,15 +152,21 @@ export interface CrossChunkLinksReaderOptions {
  * linked — a heavily-decimated coarse pyramid level's boundary-crossing
  * points can be many original samples apart, so a cross-chunk link can
  * legitimately span chunks that aren't neighbors.  That rules out a
- * "only check nearby chunk pairs" shortcut; the safe optimization is to
- * skip *decoding* a cell once its chunk coordinates are known (cheap —
- * derived from the cell's position within the shard, no decompression
- * needed) to not include the target chunk, not to skip *discovering*
- * cells in the first place.
+ * "only check nearby chunk pairs" shortcut — but a shard's *coordinate
+ * range* is exactly known from its position in the discovery tree before
+ * ever fetching it, so `listPopulatedShardCoords` prunes subtrees that
+ * provably cannot contain a cell touching the target chunk (see
+ * `ShardDiscoveryPruneTarget`), mirroring the equivalent shard-range
+ * pre-filter zarr-vectors-py's `list_cross_chunk_link_leaves` applies on
+ * the write/tooling side.  Because that pruning depends on which chunk is
+ * being queried, the discovered shard list is no longer valid for a
+ * *different* target chunk sharing the same `kBase` — hence the
+ * per-target cache key instead of the simpler `kBase`-only key this cache
+ * used before pruning existed.
  */
 export interface CrossChunkLinksCaches {
-  /** `kBase` path -> populated shard coordinate list. */
-  readonly shardCoords: Map<string, number[][]>;
+  /** `"kBase:targetChunkCoords.join(',')"` -> discovered shard coordinates. */
+  readonly shardCoords: Map<string, Promise<number[][]>>;
   /** `"kBase/c/shardCoord.join('/')"` -> raw (compressed) shard bytes. */
   readonly shardBytes: BoundedByteCache;
 }
@@ -392,6 +403,26 @@ function createConcurrencyLimiter(maxConcurrent: number) {
 }
 
 /**
+ * Target-chunk-aware pruning info for {@link listPopulatedShardCoords}. A
+ * ``kK`` array's ``ndim = sidNdim * K`` axes are ``K`` consecutive
+ * ``sidNdim``-wide "slots," one per endpoint chunk a cell's K-tuple
+ * touches. A cell can equal the target chunk in slot ``k`` only if
+ * *every* axis of that slot's block contains the target's (origin
+ * -shifted) coordinate — and a shard's axis range at each depth is known
+ * from the path prefix alone, before any request is made for it. Once
+ * every slot has been proven impossible along a given path (an axis
+ * inside it failed containment), no completion of that path can ever
+ * yield a matching cell, so the whole subtree is skipped.
+ */
+interface ShardDiscoveryPruneTarget {
+  /** Target chunk's coordinates minus the array's `chunk_origin` (length `sidNdim`). */
+  readonly targetShifted: readonly number[];
+  readonly sidNdim: number;
+  /** The `kK` array's shard shape (length `ndim = sidNdim * K`). */
+  readonly shardShape: readonly number[];
+}
+
+/**
  * Recursively list every populated shard's coordinate tuple under
  * ``<kKBasePath>/c``.  zarr v3's default chunk-key encoding lays a
  * ``ndim``-D chunk coordinate out as ``ndim`` nested path segments
@@ -402,6 +433,12 @@ function createConcurrencyLimiter(maxConcurrent: number) {
  * Requests are routed through a shared concurrency limiter (see
  * ``MAX_CONCURRENT_SHARD_LIST_REQUESTS``) so a wide/deep shard grid can't
  * fire an unbounded burst of simultaneous ``kvStoreList`` calls.
+ *
+ * When ``pruneTarget`` is supplied, subtrees that provably cannot contain
+ * a cell touching the target chunk are skipped without ever calling
+ * ``kvStoreList`` on them — see {@link ShardDiscoveryPruneTarget}. Omit it
+ * (as {@link readCrossChunkLinks}'s whole-table read does) to walk the
+ * full tree unfiltered.
  */
 async function listPopulatedShardCoords(
   kvStoreList: (
@@ -411,10 +448,17 @@ async function listPopulatedShardCoords(
   cBasePath: string,
   ndim: number,
   signal: AbortSignal,
+  pruneTarget?: ShardDiscoveryPruneTarget,
 ): Promise<number[][]> {
   const results: number[][] = [];
   const limit = createConcurrencyLimiter(MAX_CONCURRENT_SHARD_LIST_REQUESTS);
-  async function walk(prefix: string, coordsSoFar: number[]): Promise<void> {
+  const numSlots =
+    pruneTarget !== undefined ? ndim / pruneTarget.sidNdim : 0;
+  async function walk(
+    prefix: string,
+    coordsSoFar: number[],
+    slotPossible: readonly boolean[],
+  ): Promise<void> {
     if (coordsSoFar.length === ndim) {
       results.push(coordsSoFar);
       return;
@@ -424,15 +468,46 @@ async function listPopulatedShardCoords(
     );
     const isLastLevel = coordsSoFar.length === ndim - 1;
     const names = isLastLevel ? [...directories, ...files] : directories;
+    const depth = coordsSoFar.length;
     await Promise.all(
       names.map((name) => {
         const idx = Number(name);
         if (!Number.isInteger(idx)) return Promise.resolve();
-        return walk(`${prefix}/${name}`, [...coordsSoFar, idx]);
+        let nextSlotPossible = slotPossible;
+        if (pruneTarget !== undefined) {
+          const { targetShifted, sidNdim, shardShape } = pruneTarget;
+          const slot = Math.floor(depth / sidNdim);
+          if (slotPossible[slot]) {
+            const axis = depth % sidNdim;
+            const width = shardShape[depth];
+            const lo = idx * width;
+            if (targetShifted[axis] < lo || targetShifted[axis] >= lo + width) {
+              const copy = slotPossible.slice();
+              copy[slot] = false;
+              nextSlotPossible = copy;
+              // Every slot proven impossible (slots not yet visited stay
+              // `true` until disproven, so this can only fire once the
+              // last slot's own axes have been ruled out) — no
+              // completion of this path can match; skip it entirely.
+              if (copy.every((possible) => !possible)) {
+                return Promise.resolve();
+              }
+            }
+          }
+        }
+        return walk(
+          `${prefix}/${name}`,
+          [...coordsSoFar, idx],
+          nextSlotPossible,
+        );
       }),
     );
   }
-  await walk(cBasePath, []);
+  await walk(
+    cBasePath,
+    [],
+    pruneTarget !== undefined ? new Array(numSlots).fill(true) : [],
+  );
   return results;
 }
 
@@ -543,6 +618,8 @@ async function readCrossChunkLinksImpl(
   getShardCoords: (
     kBase: string,
     ndim: number,
+    chunkOrigin: readonly number[],
+    shardShape: readonly number[],
   ) => Promise<number[][]>,
   getShardBytes: (shardKey: string) => Promise<Uint8Array | undefined>,
 ): Promise<CrossChunkLinksTable | undefined> {
@@ -622,7 +699,7 @@ async function readCrossChunkLinksImpl(
           `a kvStoreList callback to discover its shards`,
       );
     }
-    const shardCoords = await getShardCoords(kBase, ndim);
+    const shardCoords = await getShardCoords(kBase, ndim, chunkOrigin, shardShape);
     for (const shardCoord of shardCoords) {
       const shardKey = `${kBase}/c/${shardCoord.join("/")}`;
       const shardBytes = await getShardBytes(shardKey);
@@ -708,11 +785,13 @@ export async function readCrossChunkLinks(
  *
  * NOTE: a chunk's linked partners are not guaranteed to be spatially
  * adjacent (see {@link CrossChunkLinksCaches}'s docstring), so this
- * still discovers every shard the way {@link readCrossChunkLinks} does
- * — the savings are in skipping decode/object-allocation for
- * non-matching cells and in the two caches, not in visiting fewer
- * shards for a single isolated query.  The caches are what make repeat
- * queries (i.e. every chunk actually rendered) cheap.
+ * cannot shortcut to "only check nearby shards" — but it does prune
+ * shard *discovery* itself (not just decoding) to the subtrees that could
+ * possibly hold a cell touching ``targetChunkCoords``, via
+ * {@link ShardDiscoveryPruneTarget}. Concurrent calls for the same
+ * ``(delta, K, targetChunkCoords)`` share one discovery walk (the cache
+ * stores in-flight promises, not just resolved results) instead of each
+ * independently re-walking the tree.
  */
 export async function readCrossChunkLinksForChunk(
   options: CrossChunkLinksReaderOptions,
@@ -721,23 +800,34 @@ export async function readCrossChunkLinksForChunk(
   signal: AbortSignal,
 ): Promise<CrossChunkLinksTable | undefined> {
   const { kvStoreRead, kvStoreList } = options;
+  const targetKey = targetChunkCoords.join(",");
   return readCrossChunkLinksImpl(
     options,
     signal,
     (sortedChunks) =>
       sortedChunks.some((c) => arraysEqual(c, targetChunkCoords)),
-    async (kBase, ndim) => {
-      let coords = caches.shardCoords.get(kBase);
-      if (coords === undefined) {
-        coords = await listPopulatedShardCoords(
+    (kBase, ndim, chunkOrigin, shardShape) => {
+      const cacheKey = `${kBase}:${targetKey}`;
+      let pending = caches.shardCoords.get(cacheKey);
+      if (pending === undefined) {
+        const targetShifted = targetChunkCoords.map(
+          (v, a) => v - chunkOrigin[a],
+        );
+        pending = listPopulatedShardCoords(
           kvStoreList!,
           `${kBase}/c`,
           ndim,
           signal,
-        );
-        caches.shardCoords.set(kBase, coords);
+          { targetShifted, sidNdim: targetChunkCoords.length, shardShape },
+        ).catch((error) => {
+          // Don't let a transient failure (network blip, aborted signal)
+          // permanently poison future queries for this same chunk.
+          caches.shardCoords.delete(cacheKey);
+          throw error;
+        });
+        caches.shardCoords.set(cacheKey, pending);
       }
-      return coords;
+      return pending;
     },
     async (shardKey) => {
       let bytes = caches.shardBytes.get(shardKey);

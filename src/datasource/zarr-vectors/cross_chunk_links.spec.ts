@@ -562,8 +562,35 @@ describe("readCrossChunkLinksForChunk", () => {
     expect(table!.records).toHaveLength(4);
   });
 
-  it("caches shard discovery and shard bytes across repeated queries", async () => {
-    const { kvStoreRead, kvStoreList, reads, lists } = makeTwoShardStore();
+  it("caches shard bytes across queries for different target chunks", async () => {
+    const { kvStoreRead, kvStoreList, reads } = makeTwoShardStore();
+    const caches = createCrossChunkLinksCaches();
+    const signal = new AbortController().signal;
+
+    await readCrossChunkLinksForChunk(
+      { kvStoreRead, kvStoreList },
+      [1, 0, 0],
+      caches,
+      signal,
+    );
+    const shardReadsAfterFirst = reads.filter((r) => r.includes("/c/")).length;
+    expect(shardReadsAfterFirst).toBeGreaterThan(0);
+
+    // Second query, same target chunk: shard bytes for the (already
+    // fetched) matching shard must not be re-read.
+    await readCrossChunkLinksForChunk(
+      { kvStoreRead, kvStoreList },
+      [1, 0, 0],
+      caches,
+      signal,
+    );
+    expect(reads.filter((r) => r.includes("/c/")).length).toBe(
+      shardReadsAfterFirst,
+    );
+  });
+
+  it("repeat queries for the same target chunk reuse the cached discovery walk", async () => {
+    const { kvStoreRead, kvStoreList, lists } = makeTwoShardStore();
     const caches = createCrossChunkLinksCaches();
     const signal = new AbortController().signal;
 
@@ -574,23 +601,64 @@ describe("readCrossChunkLinksForChunk", () => {
       signal,
     );
     const listsAfterFirst = lists.length;
-    const shardReadsAfterFirst = reads.filter((r) => r.includes("/c/")).length;
     expect(listsAfterFirst).toBeGreaterThan(0);
-    expect(shardReadsAfterFirst).toBeGreaterThan(0);
 
-    // Second query (different target chunk, so it still needs to inspect
-    // both shards) must not re-walk the discovery tree or re-fetch shard
-    // bytes already cached from the first query.
     await readCrossChunkLinksForChunk(
       { kvStoreRead, kvStoreList },
-      [2, 0, 0],
+      [1, 0, 0],
       caches,
       signal,
     );
     expect(lists.length).toBe(listsAfterFirst);
-    expect(reads.filter((r) => r.includes("/c/")).length).toBe(
-      shardReadsAfterFirst,
+  });
+
+  it("prunes discovery to subtrees that could contain the target chunk", async () => {
+    // Target (1,0,0) can only ever appear in the "1/0/0" branch off the
+    // shared (0,0,0) prefix — the "2/0/0" branch (holding chunk (2,0,0),
+    // not (1,0,0), in both K-slots) must never be listed at all.
+    const { kvStoreRead, kvStoreList, lists } = makeTwoShardStore();
+    const caches = createCrossChunkLinksCaches();
+    await readCrossChunkLinksForChunk(
+      { kvStoreRead, kvStoreList },
+      [1, 0, 0],
+      caches,
+      new AbortController().signal,
     );
+    expect(lists).not.toContain("cross_chunk_links/0/k2/c/0/0/0/2/");
+    expect(lists).not.toContain("cross_chunk_links/0/k2/c/0/0/0/2/0/");
+    expect(lists).toContain("cross_chunk_links/0/k2/c/0/0/0/1/");
+  });
+
+  it("concurrent queries for the same target chunk share one discovery walk", async () => {
+    // Regression test for a cache-stampede: before results are cached,
+    // several concurrent download() calls for the same chunk must not
+    // each independently kick off their own listPopulatedShardCoords walk.
+    const { kvStoreRead, kvStoreList, lists } = makeTwoShardStore();
+    const caches = createCrossChunkLinksCaches();
+    const signal = new AbortController().signal;
+
+    await Promise.all([
+      readCrossChunkLinksForChunk(
+        { kvStoreRead, kvStoreList },
+        [1, 0, 0],
+        caches,
+        signal,
+      ),
+      readCrossChunkLinksForChunk(
+        { kvStoreRead, kvStoreList },
+        [1, 0, 0],
+        caches,
+        signal,
+      ),
+      readCrossChunkLinksForChunk(
+        { kvStoreRead, kvStoreList },
+        [1, 0, 0],
+        caches,
+        signal,
+      ),
+    ]);
+    const uniqueLists = new Set(lists);
+    expect(lists.length).toBe(uniqueLists.size);
   });
 
   it("matches readCrossChunkLinks's full-table result filtered to one chunk", async () => {
