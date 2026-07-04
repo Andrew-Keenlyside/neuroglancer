@@ -2473,6 +2473,17 @@ export class SpatiallyIndexedSkeletonLayer
   private cachedSelectedNodeId: number | undefined;
   private overlayRebuildFrame = -1;
   private pendingOverlaySegmentLoads = new Set<number>();
+  // Segments whose `getFullSegmentNodes` call rejected (e.g. the active
+  // data source doesn't implement full-skeleton inspection at all, as is
+  // the case for every zarr-vectors layer today). Without this, a
+  // permanently-failing fetch is retried on every redraw forever: each
+  // retry's `.finally()` disposes the overlay chunk and dispatches
+  // another redraw, which triggers another retry — an infinite loop that
+  // starves the render loop the moment any segment becomes visible.
+  // Evicted alongside the success cache in `resolveSourceBackedOverlayChunk`
+  // so a segment that becomes active again after going inactive gets one
+  // more attempt, in case the earlier failure was transient.
+  private failedOverlaySegmentLoads = new Set<number>();
   private browseExcludedSegments = new Uint64Set();
   private gpuBrowseExcludedSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private browseExcludedSegmentsKey: string | undefined;
@@ -2491,16 +2502,23 @@ export class SpatiallyIndexedSkeletonLayer
   private requestOverlaySegmentLoad(segmentId: number) {
     if (
       this.inspectionState === undefined ||
-      this.pendingOverlaySegmentLoads.has(segmentId)
+      this.pendingOverlaySegmentLoads.has(segmentId) ||
+      this.failedOverlaySegmentLoads.has(segmentId)
     ) {
       return;
     }
     this.pendingOverlaySegmentLoads.add(segmentId);
+    let failed = false;
     void this.inspectionState
       .getFullSegmentNodes(this, segmentId)
-      .catch(() => {})
+      .catch(() => {
+        failed = true;
+      })
       .finally(() => {
         this.pendingOverlaySegmentLoads.delete(segmentId);
+        if (failed) {
+          this.failedOverlaySegmentLoads.add(segmentId);
+        }
         this.disposeOverlayChunk();
         this.redrawNeeded.dispatch();
       });
@@ -2661,6 +2679,14 @@ export class SpatiallyIndexedSkeletonLayer
       return undefined;
     }
     this.inspectionState.evictInactiveSegmentNodes(overlaySegmentIds);
+    if (this.failedOverlaySegmentLoads.size > 0) {
+      const activeSegmentIds = new Set(overlaySegmentIds);
+      for (const segmentId of this.failedOverlaySegmentLoads) {
+        if (!activeSegmentIds.has(segmentId)) {
+          this.failedOverlaySegmentLoads.delete(segmentId);
+        }
+      }
+    }
 
     // Pass 1: cheap scan to determine which segments are loaded and check cache.
     const loadedSegmentIds: number[] = [];

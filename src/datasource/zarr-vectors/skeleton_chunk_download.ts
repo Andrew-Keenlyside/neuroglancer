@@ -299,22 +299,37 @@ export async function downloadSkeletonChunk(
   // the spatially-indexed skeleton shader handles "this segment has no
   // value" elsewhere and avoids cascading layer failures from a
   // single missing optional blob.
-  const vertexAttributes: AttributeTypedArray[] = await Promise.all(
-    attributeNames.map(async (name, i) => {
-      const bytes = await kvStoreRead(
-        `vertex_attributes/${name}/${chunkKey}/c/0`,
-        signal,
-      );
-      if (bytes === undefined) {
-        return reinterpretBytes(
-          new Uint8Array(numVertices * BYTES_PER_ELEMENT[attributeDtypes[i]]),
-          attributeDtypes[i],
-          numVertices,
+  // Fetched concurrently with `fragment_attributes/segment_id` below (5):
+  // both are independent per-chunk reads, and awaiting them sequentially
+  // would tack a full extra round trip onto every chunk's download — this
+  // sits directly on the critical path for how quickly a chunk newly
+  // scrolled into view becomes pickable, which visibly stalled continuous
+  // multi-segment drag-selection once `hasFragmentSegmentIds` (5) became
+  // true for every pyramid level instead of only some.
+  const numFragments = fragmentIndex.numFragments;
+  const segFragBytesPromise: Promise<Uint8Array | undefined> =
+    (options.hasFragmentSegmentIds ?? true)
+      ? kvStoreRead(`fragment_attributes/segment_id/${chunkKey}/c/0`, signal)
+      : Promise.resolve(undefined);
+  const [vertexAttributes, segFragBytes] = await Promise.all([
+    Promise.all(
+      attributeNames.map(async (name, i) => {
+        const bytes = await kvStoreRead(
+          `vertex_attributes/${name}/${chunkKey}/c/0`,
+          signal,
         );
-      }
-      return reinterpretBytes(bytes, attributeDtypes[i], numVertices);
-    }),
-  );
+        if (bytes === undefined) {
+          return reinterpretBytes(
+            new Uint8Array(numVertices * BYTES_PER_ELEMENT[attributeDtypes[i]]),
+            attributeDtypes[i],
+            numVertices,
+          );
+        }
+        return reinterpretBytes(bytes, attributeDtypes[i], numVertices);
+      }),
+    ),
+    segFragBytesPromise,
+  ]);
 
   // 5. Per-fragment segment_id → synthesised per-vertex "segment" column.
   // The writer stores one uint64 flywire id per fragment under
@@ -329,15 +344,7 @@ export async function downloadSkeletonChunk(
   // streamline/polyline geometries that never wrote it), fall back to the
   // fragment's index within the chunk: still distinct per fragment, just not
   // unified across chunks (`[f, 0]`).
-  const numFragments = fragmentIndex.numFragments;
   let fragSegIds: BigUint64Array | undefined;
-  const segFragBytes =
-    (options.hasFragmentSegmentIds ?? true)
-      ? await kvStoreRead(
-          `fragment_attributes/segment_id/${chunkKey}/c/0`,
-          signal,
-        )
-      : undefined;
   if (
     segFragBytes !== undefined &&
     segFragBytes.byteLength >= numFragments * 8
