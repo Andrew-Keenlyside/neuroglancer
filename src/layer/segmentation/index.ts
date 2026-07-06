@@ -119,9 +119,13 @@ import type {
   SpatialSkeletonSourceState,
 } from "#src/skeleton/api.js";
 import {
+  MultiscaleSkeletonLayer,
+  MultiscaleSkeletonSource,
+  PerspectiveViewMultiscaleSkeletonLayer,
   PerspectiveViewSkeletonLayer,
   SkeletonLayer,
   SkeletonRenderingOptions,
+  SliceViewPanelMultiscaleSkeletonLayer,
   SliceViewPanelSkeletonLayer,
   PerspectiveViewSpatiallyIndexedSkeletonLayer,
   SliceViewPanelSpatiallyIndexedSkeletonLayer,
@@ -1492,7 +1496,9 @@ export class SegmentationUserLayer extends Base {
             x instanceof PerspectiveViewSkeletonLayer ||
             x instanceof SliceViewPanelSkeletonLayer ||
             x instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
-            x instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer,
+            x instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer ||
+            x instanceof PerspectiveViewMultiscaleSkeletonLayer ||
+            x instanceof SliceViewPanelMultiscaleSkeletonLayer,
         ),
       { changed: this.layersChanged, value: this.renderLayers },
     ),
@@ -1504,7 +1510,8 @@ export class SegmentationUserLayer extends Base {
         layers.some(
           (x) =>
             x instanceof PerspectiveViewSkeletonLayer ||
-            x instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer,
+            x instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
+            x instanceof PerspectiveViewMultiscaleSkeletonLayer,
         ),
       { changed: this.layersChanged, value: this.renderLayers },
     ),
@@ -1522,12 +1529,37 @@ export class SegmentationUserLayer extends Base {
     ),
   );
 
+  // Deliberately narrower than `hasSpatiallyIndexedSkeletonsLayer`: gates
+  // the "Resolution (skeleton grid 2D/3D)" controls only, which apply
+  // equally to pass-1 (spatially-indexed) and pass-2 (object-keyed
+  // multiscale) skeleton layers — both pick a pyramid level from the same
+  // `spatialSkeletonGridResolutionTarget{2d,3d}` controls. Unlike
+  // `hasSpatiallyIndexedSkeletonsLayer`, this must NOT gate "Hidden Opacity
+  // (3d)" or node-inspection controls — those are pass-1-only concepts
+  // with no pass-2 equivalent.
+  readonly hasSkeletonGridResolutionLayer = this.registerDisposer(
+    makeCachedLazyDerivedWatchableValue(
+      (layers) =>
+        layers.some(
+          (x) =>
+            x instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
+            x instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer ||
+            x instanceof PerspectiveViewMultiscaleSkeletonLayer ||
+            x instanceof SliceViewPanelMultiscaleSkeletonLayer,
+        ),
+      { changed: this.layersChanged, value: this.renderLayers },
+    ),
+  );
+
   readonly getSkeletonLayer = () => {
     for (const layer of this.renderLayers) {
       if (layer instanceof PerspectiveViewSkeletonLayer) {
         return layer.base;
       }
       if (layer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer) {
+        return layer.base;
+      }
+      if (layer instanceof PerspectiveViewMultiscaleSkeletonLayer) {
         return layer.base;
       }
     }
@@ -1796,7 +1828,10 @@ export class SegmentationUserLayer extends Base {
           this.displayState.segmentationGroupState.value,
         );
       } else if (mesh !== undefined) {
-        if (mesh instanceof MultiscaleSpatiallyIndexedSkeletonSource) {
+        if (
+          mesh instanceof MultiscaleSpatiallyIndexedSkeletonSource ||
+          mesh instanceof MultiscaleSkeletonSource
+        ) {
           // Collect grid metadata outside `activate`, since `activate` is a no-op
           // when guard values are unchanged and may skip the callback.
           // Compose the live render-layer transform (reflects any output
@@ -1809,6 +1844,13 @@ export class SegmentationUserLayer extends Base {
           // not `loadedSubsource.getRenderLayerTransform()` — that method
           // requires `loadedSubsource.activated`, which this code runs
           // BEFORE (`activate()` below is what sets it), and would throw.
+          //
+          // Pass-1 (`MultiscaleSpatiallyIndexedSkeletonSource`) and pass-2
+          // (`MultiscaleSkeletonSource`) report the same physical per-level
+          // grid when both are present on one datasource (they read the
+          // same underlying pyramid), so it's safe for either to (re)set
+          // this shared variable — whichever subsource is active wires up
+          // the "Resolution (skeleton grid 2D/3D)" widgets identically.
           let liveScale: Float64Array | undefined;
           const { layer, transform } = loadedSubsource.loadedDataSource;
           const transformValue = getRenderLayerTransform(
@@ -1924,6 +1966,20 @@ export class SegmentationUserLayer extends Base {
             );
             loadedSubsource.addRenderLayer(
               new SliceViewPanelSpatiallyIndexedSkeletonLayer(
+                /* transfer ownership */ base,
+              ),
+            );
+          } else if (mesh instanceof MultiscaleSkeletonSource) {
+            const base = new MultiscaleSkeletonLayer(
+              this.manager.chunkManager,
+              mesh,
+              displayState,
+            );
+            loadedSubsource.addRenderLayer(
+              new PerspectiveViewMultiscaleSkeletonLayer(base.addRef()),
+            );
+            loadedSubsource.addRenderLayer(
+              new SliceViewPanelMultiscaleSkeletonLayer(
                 /* transfer ownership */ base,
               ),
             );

@@ -116,11 +116,10 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     toolJson: json_keys.SKELETON_CROSS_SECTION_RENDER_SCALE_JSON_KEY,
     isValid: (layer) =>
       makeCachedDerivedWatchableValue(
-        (levels, hasSpatialSkeletons) =>
-          hasSpatialSkeletons && levels.length > 0,
+        (levels, hasSkeletonGrid) => hasSkeletonGrid && levels.length > 0,
         [
           layer.displayState.spatialSkeletonGridLevels,
-          layer.hasSpatiallyIndexedSkeletonsLayer,
+          layer.hasSkeletonGridResolutionLayer,
         ],
       ),
     title:
@@ -139,11 +138,10 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     toolJson: json_keys.SKELETON_PERSPECTIVE_RENDER_SCALE_JSON_KEY,
     isValid: (layer) =>
       makeCachedDerivedWatchableValue(
-        (levels, hasSpatialSkeletons) =>
-          hasSpatialSkeletons && levels.length > 0,
+        (levels, hasSkeletonGrid) => hasSkeletonGrid && levels.length > 0,
         [
           layer.displayState.spatialSkeletonGridLevels,
-          layer.hasSpatiallyIndexedSkeletonsLayer,
+          layer.hasSkeletonGridResolutionLayer,
         ],
       ),
     title:

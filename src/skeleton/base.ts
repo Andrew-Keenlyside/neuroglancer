@@ -23,6 +23,14 @@ export const SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID =
 export const SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID =
   "skeleton/SpatiallyIndexedSkeletonRenderLayer.updateSources";
 
+// Object-keyed, per-object multi-resolution skeleton source (mirrors the
+// precomputed multiscale mesh RPC pair, `MULTISCALE_FRAGMENT_SOURCE_RPC_ID`/
+// `MULTISCALE_MESH_LAYER_RPC_ID` in `src/mesh/base.ts`).
+export const MULTISCALE_SKELETON_FRAGMENT_SOURCE_RPC_ID =
+  "skeleton/MultiscaleSkeletonFragmentSource";
+export const MULTISCALE_SKELETON_LAYER_RPC_ID =
+  "skeleton/MultiscaleSkeletonLayer";
+
 export interface VertexAttributeInfo {
   dataType: DataType;
   numComponents: number;

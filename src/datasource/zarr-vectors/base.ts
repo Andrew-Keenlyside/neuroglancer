@@ -182,5 +182,71 @@ export class ZarrVectorsObjectKeyedSkeletonSourceParameters {
   linkDtype!: ZarrVectorsLinkDtype;
   /** Whether `fragment_attributes/segment_id` exists at level 0. */
   hasFragmentSegmentIds!: boolean;
+  /**
+   * Whether the `vertices` array is uncompressed + byte-range-addressable
+   * per fragment (`vertices_layout: "raw_v1"`); gates scoped range reads.
+   * Defaults false (legacy whole-chunk-compressed) when the frontend
+   * doesn't set it (e.g. non-3D stores).
+   */
+  verticesRangeAddressable = false;
   static RPC_ID = "zarr-vectors/ObjectKeyedSkeletonSource";
+}
+
+/** One pyramid level's per-level fields for {@link ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters}. */
+export interface ZarrVectorsSkeletonPyramidLevelRef {
+  baseUrl: string;
+  /** Whether `fragment_attributes/segment_id` exists at this level. */
+  hasFragmentSegmentIds: boolean;
+  /**
+   * Spatial chunk-grid shape (length `rank`, world/level-local units) —
+   * the same per-level chunk shape pass-1 already resolves. Used both to
+   * derive a scalar chunk spacing for on-screen-size LOD arbitration
+   * (`getChunkSpacing`) and to convert a manifest block's `chunkCoords`
+   * into a world-space bounding box (`probeObjectAcrossLevels`).
+   */
+  chunkShape: number[];
+  /**
+   * Whether this level's `vertices` array is stored uncompressed and
+   * byte-range-addressable per fragment (writer stamped
+   * `vertices_layout: "raw_v1"`). When true (and the kvstore supports
+   * offset reads), pass-2 fetches only the selected object's fragment
+   * vertex bytes instead of the whole chunk. When false (legacy
+   * whole-chunk-compressed), the whole-chunk read path is used.
+   */
+  verticesRangeAddressable: boolean;
+}
+
+/**
+ * Parameters for the multi-resolution object-keyed skeleton source — the
+ * level-aware counterpart of {@link ZarrVectorsObjectKeyedSkeletonSourceParameters}.
+ * Used only for genuinely multi-level 3D stores (see `buildSkeletonMetadata`
+ * in `frontend.ts`); single-level/non-3D stores keep using the plain
+ * single-`baseUrl` parameters class above, unchanged.
+ *
+ * OID resolution (`object_attributes/segment_id`) only needs to happen
+ * against `levels[0]` — streamline/skeleton pyramids preserve object IDs
+ * identically across levels, so a single resolved OID is reused for every
+ * level's `object_index/manifests` lookup (see
+ * `ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend`).
+ */
+export class ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters {
+  /** Finest-first (index 0 = level 0). */
+  levels!: ZarrVectorsSkeletonPyramidLevelRef[];
+  rank!: number;
+  attributeNames!: string[];
+  attributeDtypes!: ZarrVectorsAttributeDtype[];
+  linksConvention!: ZarrVectorsLinksConvention;
+  geometryKind!: ZarrVectorsSkeletonGeometryKind;
+  linkDtype!: ZarrVectorsLinkDtype;
+  /**
+   * Meters per coordinate unit, per axis (from the store's NGFF scale +
+   * unit) — frontend-only, unused by the backend. Lets
+   * `getSpatialSkeletonGridSizes()` report grid spacings in physical
+   * meters without needing a bespoke constructor (this source is built
+   * via `chunkManager.getChunkSource`, unlike pass-1's
+   * `ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource`, which takes
+   * `metersPerUnit` as a direct constructor option).
+   */
+  metersPerUnit!: number[];
+  static RPC_ID = "zarr-vectors/MultiscaleObjectKeyedSkeletonSource";
 }

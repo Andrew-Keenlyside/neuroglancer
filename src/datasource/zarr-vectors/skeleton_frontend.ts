@@ -32,6 +32,7 @@
 import type { ChunkManager } from "#src/chunk_manager/frontend.js";
 import { WithParameters } from "#src/chunk_manager/frontend.js";
 import {
+  ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters,
   ZarrVectorsObjectKeyedSkeletonSourceParameters,
   ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
   type ZarrVectorsAttributeDtype,
@@ -46,6 +47,7 @@ import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js"
 import type { SharedKvStoreContext } from "#src/kvstore/frontend.js";
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import {
+  MultiscaleSkeletonSource,
   MultiscaleSpatiallyIndexedSkeletonSource,
   SkeletonSource,
   SPATIAL_SKELETON_SOURCE_OPTIONS,
@@ -311,6 +313,54 @@ export class ZarrVectorsObjectKeyedSkeletonSource extends WithParameters(
    */
   get defaultFragmentMain(): string | undefined {
     return KIND_CAPABILITIES[this.parameters.geometryKind].defaultFragmentMain;
+  }
+}
+
+/**
+ * Frontend chunk source backing the multi-resolution object-keyed (pass-2)
+ * render layer. Paired with
+ * `ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend`. Mirrors
+ * `ZarrVectorsObjectKeyedSkeletonSource` above — same vertex-attribute
+ * shape and default-shader lookup, since a single store's `levels` all
+ * share the same declared attributes/geometry kind — just built on the
+ * generic `MultiscaleSkeletonSource` two-tier (manifest + fragment) base
+ * instead of the flat `SkeletonSource`.
+ */
+export class ZarrVectorsMultiscaleObjectKeyedSkeletonSource extends WithParameters(
+  WithSharedKvStoreContext(MultiscaleSkeletonSource),
+  ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters,
+) {
+  get skeletonVertexCoordinatesInVoxels() {
+    return false;
+  }
+
+  get vertexAttributes(): Map<string, VertexAttributeInfo> {
+    return buildVertexAttributeMap(this.parameters);
+  }
+
+  get defaultFragmentMain(): string | undefined {
+    return KIND_CAPABILITIES[this.parameters.geometryKind].defaultFragmentMain;
+  }
+
+  /**
+   * Every object in the store shares the same per-level chunk grid (see
+   * `MultiscaleSkeletonManifestChunk`'s `levelSpacings` doc comment), so
+   * this is static per-level metadata already carried on `parameters` —
+   * no object needs to be resolved first. Mirrors
+   * `ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource.getSpatialSkeletonGridSizes`
+   * (same `liveScale`-preferred-over-frozen-metersPerUnit convention).
+   */
+  override getSpatialSkeletonGridSizes(liveScale?: Float64Array): {
+    x: number;
+    y: number;
+    z: number;
+  }[] {
+    const m = liveScale ?? this.parameters.metersPerUnit;
+    return this.parameters.levels.map((level) => ({
+      x: level.chunkShape[0] * m[0],
+      y: level.chunkShape[1] * m[1],
+      z: level.chunkShape[2] * m[2],
+    }));
   }
 }
 

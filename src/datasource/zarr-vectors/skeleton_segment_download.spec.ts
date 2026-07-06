@@ -467,6 +467,286 @@ describe("downloadSegmentSkeleton", () => {
     expect(Array.from(result!.indices)).toEqual([0, 1, 2, 3, 3, 4, 1, 2]);
   });
 
+  it("prefers real cross_chunk_links endpoints over manifest-order reconstruction when the manifest is chunk-sorted rather than path-ordered", async () => {
+    // True path order is A -> B -> C, but the manifest lists blocks
+    // sorted by chunk coordinate (B, C, A) -- mirroring what the
+    // zarr-vectors-tools pyramid coarsener's `_reduce_object_index_shard`
+    // actually produces for a coarsened level.  Naively bridging
+    // consecutive *manifest* entries (the `implicit_sequential` fallback)
+    // would wrongly emit B->C and C->A.  A real cross_chunk_links table
+    // carrying the true A->B and B->C transitions must win instead.
+    const chunkA = [2, 0, 0];
+    const chunkB = [0, 0, 0];
+    const chunkC = [1, 0, 0];
+    const manifestBlocks = [chunkB, chunkC, chunkA]; // chunk-coordinate order
+    const manifestBytes = new Uint8Array(4 + (8 * 3 + 1 + 8) * manifestBlocks.length);
+    const manifestView = new DataView(manifestBytes.buffer);
+    manifestView.setUint32(0, manifestBlocks.length, true);
+    let off = 4;
+    for (const cc of manifestBlocks) {
+      for (const c of cc) {
+        manifestView.setBigInt64(off, BigInt(c), true);
+        off += 8;
+      }
+      manifestView.setUint8(off, MANIFEST_MODE_SINGLE);
+      off += 1;
+      manifestView.setBigInt64(off, 0n, true);
+      off += 8;
+    }
+    const manifestChunk = buildVlenBytesChunk([manifestBytes]);
+    const oneVertFrag = packFragmentIndexBlob([{ range: { start: 0, count: 1 } }]);
+    const kvStoreRead = makeKvStore({
+      "object_index/manifests/c/0": manifestChunk,
+      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0]),
+      "vertex_fragments/0.0.0/c/0": oneVertFrag,
+      "vertices/1.0.0/c/0": verticesBlob([10, 0, 0]),
+      "vertex_fragments/1.0.0/c/0": oneVertFrag,
+      "vertices/2.0.0/c/0": verticesBlob([20, 0, 0]),
+      "vertex_fragments/2.0.0/c/0": oneVertFrag,
+    });
+    const crossChunkLinks: CrossChunkLinksTable = {
+      linkWidth: 2,
+      sidNdim: rank,
+      records: [
+        {
+          endpoints: [
+            { chunkCoords: chunkA, vertexIndex: 0 },
+            { chunkCoords: chunkB, vertexIndex: 0 },
+          ],
+        },
+        {
+          endpoints: [
+            { chunkCoords: chunkB, vertexIndex: 0 },
+            { chunkCoords: chunkC, vertexIndex: 0 },
+          ],
+        },
+      ],
+    };
+
+    const result = await downloadSegmentSkeleton(
+      0,
+      {
+        manifestReader: {
+          numObjects: 1,
+          chunkSize: 16384,
+          sidNdim: rank,
+          kvStoreRead,
+        },
+        rank,
+        linkDtype: "int64",
+        attributeNames,
+        attributeDtypes,
+        linksConvention: "implicit_sequential",
+        geometryKind: "streamline",
+        crossChunkLinks,
+      },
+      new AbortController().signal,
+    );
+
+    expect(result).toBeDefined();
+    // Merged vertex order follows manifest order: B=0, C=1, A=2.  The
+    // real-link-derived bridges are A->B (2,0) and B->C (0,1) -- the
+    // manifest-order fallback would instead produce the wrong B->C
+    // (0,1) and C->A (1,2).
+    expect(Array.from(result!.indices)).toEqual([2, 0, 0, 1]);
+  });
+
+  it("uses queryCrossChunkLinksForChunks (scoped) instead of decoding a whole-level table", async () => {
+    // Same fixture as the previous test, but via the scoped query
+    // callback rather than a pre-fetched whole-level table -- this is
+    // what the real backends use for `implicit_sequential` specifically
+    // to avoid decoding a whole-level cross_chunk_links table (which for
+    // a real streamline pyramid can be large enough to exhaust memory)
+    // just to resolve one object's handful of cross-chunk edges.
+    const chunkA = [2, 0, 0];
+    const chunkB = [0, 0, 0];
+    const chunkC = [1, 0, 0];
+    const manifestBlocks = [chunkB, chunkC, chunkA]; // chunk-coordinate order
+    const manifestBytes = new Uint8Array(4 + (8 * 3 + 1 + 8) * manifestBlocks.length);
+    const manifestView = new DataView(manifestBytes.buffer);
+    manifestView.setUint32(0, manifestBlocks.length, true);
+    let off = 4;
+    for (const cc of manifestBlocks) {
+      for (const c of cc) {
+        manifestView.setBigInt64(off, BigInt(c), true);
+        off += 8;
+      }
+      manifestView.setUint8(off, MANIFEST_MODE_SINGLE);
+      off += 1;
+      manifestView.setBigInt64(off, 0n, true);
+      off += 8;
+    }
+    const manifestChunk = buildVlenBytesChunk([manifestBytes]);
+    const oneVertFrag = packFragmentIndexBlob([{ range: { start: 0, count: 1 } }]);
+    const kvStoreRead = makeKvStore({
+      "object_index/manifests/c/0": manifestChunk,
+      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0]),
+      "vertex_fragments/0.0.0/c/0": oneVertFrag,
+      "vertices/1.0.0/c/0": verticesBlob([10, 0, 0]),
+      "vertex_fragments/1.0.0/c/0": oneVertFrag,
+      "vertices/2.0.0/c/0": verticesBlob([20, 0, 0]),
+      "vertex_fragments/2.0.0/c/0": oneVertFrag,
+    });
+    // Simulates per-chunk scoped lookups: each call returns just the
+    // records touching the requested chunks, as `readCrossChunkLinksForChunk`
+    // would.
+    const allRecords: CrossChunkLinksTable["records"] = [
+      {
+        endpoints: [
+          { chunkCoords: chunkA, vertexIndex: 0 },
+          { chunkCoords: chunkB, vertexIndex: 0 },
+        ],
+      },
+      {
+        endpoints: [
+          { chunkCoords: chunkB, vertexIndex: 0 },
+          { chunkCoords: chunkC, vertexIndex: 0 },
+        ],
+      },
+    ];
+    const queriedChunkCoordsLists: (readonly number[])[][] = [];
+    const queryCrossChunkLinksForChunks = async (
+      chunkCoordsList: readonly (readonly number[])[],
+    ): Promise<CrossChunkLinksTable | undefined> => {
+      queriedChunkCoordsLists.push(chunkCoordsList.map((c) => [...c]));
+      const records = allRecords.filter((r) =>
+        r.endpoints.some((ep) =>
+          chunkCoordsList.some(
+            (cc) =>
+              cc.length === ep.chunkCoords.length &&
+              cc.every((v, i) => v === ep.chunkCoords[i]),
+          ),
+        ),
+      );
+      return { linkWidth: 2, sidNdim: rank, records };
+    };
+
+    const result = await downloadSegmentSkeleton(
+      0,
+      {
+        manifestReader: {
+          numObjects: 1,
+          chunkSize: 16384,
+          sidNdim: rank,
+          kvStoreRead,
+        },
+        rank,
+        linkDtype: "int64",
+        attributeNames,
+        attributeDtypes,
+        linksConvention: "implicit_sequential",
+        geometryKind: "streamline",
+        queryCrossChunkLinksForChunks,
+      },
+      new AbortController().signal,
+    );
+
+    expect(result).toBeDefined();
+    expect(Array.from(result!.indices)).toEqual([2, 0, 0, 1]);
+    // Called once, after the manifest walk, with every distinct chunk
+    // the object's manifest touches (first-seen order: B, C, A).
+    expect(queriedChunkCoordsLists).toEqual([[chunkB, chunkC, chunkA]]);
+  });
+
+  it("range-reads only the owned fragment's vertices when kvStoreReadRange is supplied, matching the whole-chunk result", async () => {
+    // Chunk 5.5.5 holds 3 streamline fragments; object 0 owns only
+    // fragment 1 (verts 2,3,4). The scoped reader must byte-range-read
+    // ONLY that fragment's vertices, never the whole 7-vertex blob, and
+    // produce output identical to the whole-chunk path.
+    const manifestBlob = buildManifestBlob([5, 5, 5], /* fragmentIndex */ 1);
+    const manifestChunk = buildVlenBytesChunk([manifestBlob]);
+    const fragmentBlob = packFragmentIndexBlob([
+      { range: { start: 0, count: 2 } }, // frag 0: verts 0,1
+      { range: { start: 2, count: 3 } }, // frag 1: verts 2,3,4 (owned)
+      { range: { start: 5, count: 2 } }, // frag 2: verts 5,6
+    ]);
+    const verticesBytes = verticesBlob([
+      0, 0, 0, 1, 0, 0, // frag 0
+      10, 0, 0, 11, 0, 0, 12, 0, 0, // frag 1 (owned)
+      20, 0, 0, 21, 0, 0, // frag 2
+    ]);
+    const store: Record<string, Uint8Array> = {
+      "object_index/manifests/c/0": manifestChunk,
+      "vertices/5.5.5/c/0": verticesBytes,
+      "vertex_fragments/5.5.5/c/0": fragmentBlob,
+    };
+
+    const commonOptions = {
+      manifestReader: {
+        numObjects: 1,
+        chunkSize: 16384,
+        sidNdim: rank,
+        kvStoreRead: makeKvStore(store),
+      },
+      rank,
+      linkDtype: "int64" as const,
+      attributeNames,
+      attributeDtypes,
+      linksConvention: "implicit_sequential" as const,
+      geometryKind: "streamline" as const,
+    };
+
+    // Baseline: whole-chunk read.
+    const baseline = await downloadSegmentSkeleton(
+      0,
+      commonOptions,
+      new AbortController().signal,
+    );
+    expect(baseline).toBeDefined();
+
+    // Scoped: record which whole-reads and which range-reads happen.
+    const wholeReads: string[] = [];
+    const rangeReads: { subpath: string; offset: number; length: number }[] = [];
+    const recordingKvStoreRead = async (path: string) => {
+      wholeReads.push(path);
+      return store[path];
+    };
+    const kvStoreReadRange = async (
+      subpath: string,
+      byteRange: { offset: number; length: number },
+    ) => {
+      rangeReads.push({ subpath, ...byteRange });
+      const whole = store[subpath];
+      if (whole === undefined) return undefined;
+      return whole.subarray(
+        byteRange.offset,
+        byteRange.offset + byteRange.length,
+      );
+    };
+    const scoped = await downloadSegmentSkeleton(
+      0,
+      {
+        ...commonOptions,
+        manifestReader: { ...commonOptions.manifestReader, kvStoreRead: recordingKvStoreRead },
+        kvStoreReadRange,
+      },
+      new AbortController().signal,
+    );
+    expect(scoped).toBeDefined();
+
+    // Byte-identical to the whole-chunk path.
+    expect(Array.from(scoped!.vertexPositions)).toEqual(
+      Array.from(baseline!.vertexPositions),
+    );
+    expect(Array.from(scoped!.indices)).toEqual(Array.from(baseline!.indices));
+    expect(scoped!.vertexAttributes.length).toBe(
+      baseline!.vertexAttributes.length,
+    );
+    expect(Array.from(scoped!.vertexAttributes[0])).toEqual(
+      Array.from(baseline!.vertexAttributes[0]),
+    );
+
+    // The vertices blob was fetched ONLY via a byte range covering
+    // fragment 1 (verts 2..4): offset 2*3*4=24, length 3*3*4=36 — never
+    // as a whole read.
+    expect(wholeReads).not.toContain("vertices/5.5.5/c/0");
+    expect(rangeReads).toContainEqual({
+      subpath: "vertices/5.5.5/c/0",
+      offset: 24,
+      length: 36,
+    });
+  });
+
   it("returns undefined when the OID has no manifest", async () => {
     const manifestChunk = buildVlenBytesChunk([
       new Uint8Array(4), // B = 0, empty manifest

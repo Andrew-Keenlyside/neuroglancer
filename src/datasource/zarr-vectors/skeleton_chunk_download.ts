@@ -390,6 +390,249 @@ export async function downloadSkeletonChunk(
 }
 
 /**
+ * A byte-range key-value read: resolves to exactly the requested
+ * `[offset, offset+length)` bytes of `subpath`, or `undefined` if the
+ * key is absent.  Distinct from {@link SkeletonChunkDownloadOptions.kvStoreRead}
+ * (which reads + decompresses a whole value): a range read is only valid
+ * for the store's uncompressed `raw`-encoded arrays (`vertices`,
+ * `vertex_attributes`) and MUST NOT auto-decompress (a mid-array byte
+ * slice is not a standalone compressed frame).
+ */
+export type KvStoreReadRange = (
+  subpath: string,
+  byteRange: { offset: number; length: number },
+  signal: AbortSignal,
+) => Promise<Uint8Array | undefined>;
+
+/**
+ * Fragment-scoped counterpart of {@link downloadSkeletonChunk}: decode a
+ * chunk but fetch, over the network, ONLY the vertices (and per-vertex
+ * attributes) of the fragments named by `restrictToFragments`, via
+ * byte-range reads keyed off the (small, whole-read) `vertex_fragments`
+ * index — instead of downloading the whole chunk's vertex blob just to
+ * discard everything but one selected object's fragments.
+ *
+ * This is the pass-2 (object-keyed) path: a selected streamline owns only
+ * a handful of a chunk's (often thousands of) fragments, so the whole-
+ * chunk read is mostly waste.  Pass-1 (spatial) still uses
+ * {@link downloadSkeletonChunk} — it renders every fragment in the chunk.
+ *
+ * Correctness is by construction: the returned `SkeletonChunk` is
+ * identical to what {@link downloadSkeletonChunk} would produce EXCEPT
+ * that vertices/attributes outside the owned fragments' covering span are
+ * left zero-filled. `filterChunkByFragments` (the required next step)
+ * reads only owned-fragment vertices, so the zero-filled remainder is
+ * dropped and the filtered output matches the whole-chunk path exactly.
+ * (CPU/memory still scale with the chunk's vertex count — only the
+ * network read is scoped; the win is I/O, which is the bottleneck for
+ * remote stores.)
+ *
+ * Scoped to `implicit_sequential` (streamline/polyline): it reads no
+ * `links/0` array (edges are synthesised from fragment ranges), so no
+ * whole-array edge read is needed. Other conventions keep the whole-chunk
+ * path.
+ *
+ * Returns `undefined` for an absent chunk (no `vertex_fragments`), same
+ * as {@link downloadSkeletonChunk}'s empty signal. Throws if a range read
+ * returns an unexpected length (a store that silently ignored the range —
+ * the caller should have gated on offset-read support first).
+ */
+export async function downloadSkeletonChunkScoped(
+  options: SkeletonChunkDownloadOptions & {
+    readonly restrictToFragments: Uint32Array;
+    readonly kvStoreReadRange: KvStoreReadRange;
+  },
+  signal: AbortSignal,
+): Promise<SkeletonChunk | undefined> {
+  const {
+    chunkKey,
+    rank,
+    attributeNames,
+    attributeDtypes,
+    linksConvention,
+    geometryKind,
+    kvStoreRead,
+    kvStoreReadRange,
+    restrictToFragments,
+  } = options;
+  if (attributeNames.length !== attributeDtypes.length) {
+    throw new Error(
+      `downloadSkeletonChunkScoped: attributeNames (${attributeNames.length}) ` +
+        `and attributeDtypes (${attributeDtypes.length}) length mismatch`,
+    );
+  }
+  if (linksConvention !== "implicit_sequential") {
+    throw new Error(
+      `downloadSkeletonChunkScoped: only supports implicit_sequential, ` +
+        `got ${linksConvention}`,
+    );
+  }
+
+  // 1. Fragment index — read whole (small); needed to size the chunk and
+  // locate each owned fragment's contiguous vertex range. Its absence is
+  // the canonical "chunk has no data" signal (mirrors downloadSkeletonChunk).
+  const fragmentBytes = await kvStoreRead(
+    `vertex_fragments/${chunkKey}/c/0`,
+    signal,
+  );
+  if (fragmentBytes === undefined) return undefined;
+  const fragmentIndex = decodeFragments(fragmentBytes);
+
+  // True chunk vertex count = highest vertex index referenced by any
+  // fragment + 1 (every vertex belongs to a fragment). Lets us allocate a
+  // full-length positions array without a separate size read, so
+  // fragment-index-referenced indices stay in-bounds during decode.
+  let numVertices = 0;
+  for (let f = 0; f < fragmentIndex.numFragments; ++f) {
+    if (fragmentIndex.isRange(f)) {
+      const { start, count } = fragmentIndex.range(f);
+      if (count > 0) numVertices = Math.max(numVertices, start + count);
+    } else {
+      const idx = fragmentIndex.indices(f);
+      for (let k = 0; k < idx.length; ++k) {
+        numVertices = Math.max(numVertices, idx[k] + 1);
+      }
+    }
+  }
+  if (numVertices === 0) return undefined;
+
+  // Covering [minIdx, maxIdx] over all owned fragments' vertex indices.
+  // For streamlines (contiguous range fragments, usually one per chunk)
+  // this is tight; scattered explicit fragments widen it (still correct,
+  // just less savings).
+  let minIdx = Number.POSITIVE_INFINITY;
+  let maxIdx = -1;
+  for (let i = 0; i < restrictToFragments.length; ++i) {
+    const f = restrictToFragments[i];
+    if (f >= fragmentIndex.numFragments) continue;
+    if (fragmentIndex.isRange(f)) {
+      const { start, count } = fragmentIndex.range(f);
+      if (count > 0) {
+        minIdx = Math.min(minIdx, start);
+        maxIdx = Math.max(maxIdx, start + count - 1);
+      }
+    } else {
+      const idx = fragmentIndex.indices(f);
+      for (let k = 0; k < idx.length; ++k) {
+        minIdx = Math.min(minIdx, idx[k]);
+        maxIdx = Math.max(maxIdx, idx[k]);
+      }
+    }
+  }
+
+  const bytesPerVertex = rank * 4; // float32
+  const positions = new Float32Array(numVertices * rank);
+  if (maxIdx >= 0) {
+    const spanVertices = maxIdx - minIdx + 1;
+    const offset = minIdx * bytesPerVertex;
+    const length = spanVertices * bytesPerVertex;
+    const spanBytes = await kvStoreReadRange(
+      `vertices/${chunkKey}/c/0`,
+      { offset, length },
+      signal,
+    );
+    // Owned fragments exist (maxIdx >= 0) so their vertices must too;
+    // an absent or wrong-length range read means the store didn't honor
+    // the request — throw so the caller falls back to a whole-chunk read
+    // rather than silently dropping this block's geometry.
+    if (spanBytes === undefined || spanBytes.byteLength !== length) {
+      throw new Error(
+        `zarr-vectors vertices/${chunkKey}: scoped range read returned ` +
+          `${spanBytes === undefined ? "no data" : `${spanBytes.byteLength} bytes`}, ` +
+          `expected ${length}`,
+      );
+    }
+    const spanFloats = reinterpretBytes(
+      spanBytes,
+      "float32",
+      spanVertices * rank,
+    ) as Float32Array;
+    positions.set(spanFloats, minIdx * rank);
+  }
+
+  // Per-vertex attributes — same covering span. A missing attribute blob
+  // (undefined) zero-fills, exactly as downloadSkeletonChunk does.
+  const vertexAttributes = await Promise.all(
+    attributeNames.map(async (name, i) => {
+      const dtype = attributeDtypes[i];
+      const elementSize = BYTES_PER_ELEMENT[dtype];
+      const arr = reinterpretBytes(
+        new Uint8Array(numVertices * elementSize),
+        dtype,
+        numVertices,
+      );
+      if (maxIdx >= 0) {
+        const spanElements = maxIdx - minIdx + 1;
+        const spanBytes = await kvStoreReadRange(
+          `vertex_attributes/${name}/${chunkKey}/c/0`,
+          { offset: minIdx * elementSize, length: spanElements * elementSize },
+          signal,
+        );
+        if (
+          spanBytes !== undefined &&
+          spanBytes.byteLength === spanElements * elementSize
+        ) {
+          const span = reinterpretBytes(spanBytes, dtype, spanElements);
+          (arr as unknown as { set: (a: ArrayLike<number>, o: number) => void }).set(
+            span as unknown as ArrayLike<number>,
+            minIdx,
+          );
+        }
+      }
+      return arr;
+    }),
+  );
+
+  // Per-fragment segment_id → per-vertex [lo, hi] column. Read whole (it's
+  // one small uint64 per fragment); identical expansion to downloadSkeletonChunk.
+  const numFragments = fragmentIndex.numFragments;
+  const segFragBytes = (options.hasFragmentSegmentIds ?? true)
+    ? await kvStoreRead(
+        `fragment_attributes/segment_id/${chunkKey}/c/0`,
+        signal,
+      )
+    : undefined;
+  let fragSegIds: BigUint64Array | undefined;
+  if (segFragBytes !== undefined && segFragBytes.byteLength >= numFragments * 8) {
+    fragSegIds = new BigUint64Array(
+      segFragBytes.buffer.slice(
+        segFragBytes.byteOffset,
+        segFragBytes.byteOffset + numFragments * 8,
+      ),
+    );
+  }
+  const segmentIds = new Uint32Array(numVertices * 2);
+  for (let f = 0; f < numFragments; ++f) {
+    let lo: number;
+    let hi: number;
+    if (fragSegIds !== undefined) {
+      const id = fragSegIds[f];
+      lo = Number(id & 0xffffffffn) >>> 0;
+      hi = Number((id >> 32n) & 0xffffffffn) >>> 0;
+    } else {
+      lo = f;
+      hi = 0;
+    }
+    const idxs = fragmentIndex.indices(f);
+    for (let k = 0; k < idxs.length; ++k) {
+      const v = idxs[k];
+      segmentIds[v * 2] = lo;
+      segmentIds[v * 2 + 1] = hi;
+    }
+  }
+
+  return buildSkeletonChunk({
+    rank,
+    positions,
+    fragmentIndex,
+    linksConvention,
+    geometryKind,
+    vertexAttributes,
+    segmentIds,
+  });
+}
+
+/**
  * One request for a ghost vertex.  `hostLocalVertex` identifies the
  * endpoint in the current chunk; `neighborChunkKey` + `neighborLocalVertex`
  * identify the source vertex in a different chunk to copy into the host.

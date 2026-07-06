@@ -28,6 +28,7 @@ import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
 import { requestAsyncComputation } from "#src/async_computation/request.js";
 import { WithParameters } from "#src/chunk_manager/backend.js";
 import {
+  ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters,
   ZarrVectorsObjectKeyedSkeletonSourceParameters,
   ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
   type ZarrVectorsLinkDtype,
@@ -53,16 +54,21 @@ import {
   fetchGhostVertices,
   type AttributeDtype,
   type GhostVertexRequest,
+  type KvStoreReadRange,
   type LinkDtype,
 } from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
 import { downloadSegmentSkeleton } from "#src/datasource/zarr-vectors/skeleton_segment_download.js";
+import { probeObjectAcrossLevels } from "#src/datasource/zarr-vectors/multiscale_manifest.js";
 import { WithSharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
 import { joinBaseUrlAndPath } from "#src/kvstore/url.js";
 import type {
+  MultiscaleSkeletonFragmentChunk,
+  MultiscaleSkeletonManifestChunk,
   SkeletonChunk,
   SpatiallyIndexedSkeletonChunk,
 } from "#src/skeleton/backend.js";
 import {
+  MultiscaleSkeletonSource,
   SkeletonSource,
   SpatiallyIndexedSkeletonSourceBackend,
 } from "#src/skeleton/backend.js";
@@ -152,6 +158,75 @@ function makeRawKvStoreRead(
     const url = joinBaseUrlAndPath(baseUrl, subpath);
     const response = await sharedKvStoreContext.kvStoreContext.read(url, {
       signal,
+    });
+    if (response === undefined) return undefined;
+    return new Uint8Array(
+      (await response.response.arrayBuffer()) as ArrayBuffer,
+    );
+  };
+}
+
+/**
+ * Whether the store backing `baseUrl` supports byte-offset reads. Only
+ * such stores can serve the fragment-scoped vertex range reads
+ * ({@link downloadSkeletonChunkScoped}); issuing a range read to a store
+ * that can't honor it risks a hung request (a hang can't be caught, so
+ * gate BEFORE issuing rather than catching after). Returns false on any
+ * probe failure so the caller safely falls back to whole-chunk reads.
+ *
+ * Scoped reads are additionally gated on the writer having stamped
+ * `vertices_layout: "raw_v1"` (surfaced as `verticesRangeAddressable`):
+ * a compressed `vertices` chunk is not byte-range-addressable, so a range
+ * read of it would decode to garbage. See the pass-2 backends' download
+ * paths and `frontend.ts buildSkeletonMetadata`.
+ *
+ * NOTE: the HTTP driver returns `true` here unconditionally — it cannot
+ * tell whether the *server* honors Range — so this is necessary but not
+ * sufficient; the data server must return `206` for `Range` requests (and
+ * answer the CORS preflight for the `Range` header on cross-origin loads).
+ */
+function storeSupportsOffsetReads(
+  baseUrl: string,
+  sharedKvStoreContext: {
+    kvStoreContext: {
+      getKvStore: (url: string) => { store: { supportsOffsetReads?: boolean } };
+    };
+  },
+): boolean {
+  try {
+    const { store } = sharedKvStoreContext.kvStoreContext.getKvStore(baseUrl);
+    return store.supportsOffsetReads === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build a byte-range `kvStoreReadRange` callback (see {@link KvStoreReadRange}):
+ * reads exactly `[offset, offset+length)` of a `raw`-encoded array chunk
+ * with NO auto-decompress. `strictByteRange` makes the read throw if the
+ * store didn't honor the range (e.g. a driver without offset-read
+ * support returned the whole value) — the caller catches that and falls
+ * back to a whole-chunk read. Returns `undefined` for an absent key.
+ */
+function makeKvStoreReadRange(
+  baseUrl: string,
+  sharedKvStoreContext: {
+    kvStoreContext: {
+      read: (url: string, options: any) => Promise<any>;
+    };
+  },
+): KvStoreReadRange {
+  return async (
+    subpath: string,
+    byteRange: { offset: number; length: number },
+    signal: AbortSignal,
+  ): Promise<Uint8Array | undefined> => {
+    const url = joinBaseUrlAndPath(baseUrl, subpath);
+    const response = await sharedKvStoreContext.kvStoreContext.read(url, {
+      signal,
+      byteRange,
+      strictByteRange: true,
     });
     if (response === undefined) return undefined;
     return new Uint8Array(
@@ -628,28 +703,122 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
    * zarr-vectors stores written without ``cross_chunk_strategy =
    * "explicit_links"``).  ``undefined`` means "not yet probed".
    *
-   * Only fetched for ``explicit`` / ``implicit_sequential_with_branches``
-   * geometry (graphs / skeletons) — see the ``download()`` call site.
-   * For ``implicit_sequential`` (streamline/polyline) stores,
-   * `downloadSegmentSkeleton` reconstructs cross-chunk edges purely from
-   * manifest order (`deriveImplicitSequentialCrossChunkEdges`) and never
-   * reads this table at all (its `vi` fields are literal `0`
-   * placeholders for that convention — see the comment at
-   * `skeleton_segment_download.ts`'s call site), so fetching it
-   * unconditionally was pure waste: a real dataset's whole-level
-   * decode can be tens of millions of records / multiple gigabytes
-   * (the same issue fixed for the spatially-indexed pass-1 backend via
-   * `readCrossChunkLinksForChunk` — see that class's
-   * `crossChunkLinksCaches_` docstring).
+   * Only used for ``explicit`` / ``implicit_sequential_with_branches``
+   * (graphs / skeletons), whose manifests span far fewer chunks per
+   * object than a streamline pyramid — the whole-level decode cost
+   * (tens of millions of records / multiple gigabytes for a real
+   * dataset) is a known, currently-accepted tradeoff for those (see the
+   * TODO below). ``implicit_sequential`` (streamline/polyline) uses
+   * {@link crossChunkLinksCaches_} instead — the scoped, per-chunk
+   * reader — because a whole-brain tractogram's level-0 table can be
+   * large enough to OOM the tab (confirmed in practice) just to resolve
+   * one selected segment's handful of cross-chunk edges.
+   *
+   * `downloadSegmentSkeleton` prefers real cross_chunk_links-derived
+   * edges (`collectOwnedCrossChunkEdges`) over
+   * `deriveImplicitSequentialCrossChunkEdges` (manifest-order
+   * reconstruction), which is fragile against any coarsening pipeline
+   * that doesn't preserve per-object manifest block order — the
+   * zarr-vectors-tools pyramid coarsener's `_reduce_object_index_shard`
+   * does not; it sorts blocks by chunk coordinate. The manifest-order
+   * path remains as a fallback for stores where no cross_chunk_links
+   * table exists at all.
    *
    * TODO: graphs/skeletons still pay the whole-table decode here since
    * one object's manifest can span many chunks (not the single target
-   * a per-chunk query assumes) — a proper fix needs a multi-chunk-
-   * scoped query (or deferring the query until `ownedChunks` is known
-   * inside `downloadSegmentSkeleton`), out of scope for this pass since
-   * it doesn't affect the reported streamline crash.
+   * a per-chunk query assumes) — a proper fix would move them onto the
+   * same scoped-query mechanism as `implicit_sequential`, merging
+   * per-chunk results the way `queryCrossChunkLinksForChunks` below
+   * does. Out of scope for this pass since it hasn't caused a reported
+   * crash.
    */
   private crossChunkLinks_: CrossChunkLinksTable | null | undefined;
+
+  /**
+   * Shared shard-discovery / shard-byte caches for this level's
+   * ``cross_chunk_links/0/`` tree, used by ``implicit_sequential``
+   * downloads via {@link queryCrossChunkLinksForChunks} — mirrors
+   * {@link ZarrVectorsSpatiallyIndexedSkeletonSourceBackend
+   * .crossChunkLinksCaches_} exactly (see that field's docstring for why
+   * this holds only cheap shard-coordinate lists and byte-budgeted raw
+   * shard bytes, not decoded records).
+   */
+  private crossChunkLinksCaches_: CrossChunkLinksCaches | false | undefined;
+
+  private async getCrossChunkLinksForChunk(
+    targetChunkCoords: readonly number[],
+    kvStoreRead: (
+      subpath: string,
+      signal: AbortSignal,
+    ) => Promise<Uint8Array | undefined>,
+    kvStoreList: (
+      prefix: string,
+      signal: AbortSignal,
+    ) => Promise<{ directories: string[]; files: string[] }>,
+    signal: AbortSignal,
+  ): Promise<CrossChunkLinksTable | undefined> {
+    if (this.crossChunkLinksCaches_ === false) return undefined;
+    if (this.crossChunkLinksCaches_ === undefined) {
+      this.crossChunkLinksCaches_ = createCrossChunkLinksCaches();
+    }
+    const table = await readCrossChunkLinksForChunk(
+      { kvStoreRead, kvStoreList },
+      targetChunkCoords,
+      this.crossChunkLinksCaches_,
+      signal,
+    );
+    if (table === undefined) {
+      this.crossChunkLinksCaches_ = false;
+    }
+    return table;
+  }
+
+  /**
+   * Scoped alternative to {@link getCrossChunkLinks}, passed to
+   * `downloadSegmentSkeleton` as `queryCrossChunkLinksForChunks` for
+   * `implicit_sequential` downloads. Queries each of the object's owned
+   * chunks individually (sharing {@link crossChunkLinksCaches_} across
+   * both this call and every other object's downloads for the level)
+   * and merges the results — never decodes more than the records
+   * incident on chunks this specific object actually touches.
+   *
+   * A record whose both endpoints are among the queried chunks is
+   * returned once per matching side and so may appear twice in the
+   * merged table; `collectOwnedCrossChunkEdges` just emits the
+   * (identical) edge twice in that case, which is harmless — cheaper
+   * than deduplicating given how few cross-chunk records one object
+   * has.
+   */
+  private async queryCrossChunkLinksForChunks(
+    chunkCoordsList: readonly (readonly number[])[],
+    kvStoreRead: (
+      subpath: string,
+      signal: AbortSignal,
+    ) => Promise<Uint8Array | undefined>,
+    kvStoreList: (
+      prefix: string,
+      signal: AbortSignal,
+    ) => Promise<{ directories: string[]; files: string[] }>,
+    signal: AbortSignal,
+  ): Promise<CrossChunkLinksTable | undefined> {
+    const records: CrossChunkLinksTable["records"] = [];
+    let linkWidth: number | undefined;
+    let sidNdim: number | undefined;
+    for (const chunkCoords of chunkCoordsList) {
+      const table = await this.getCrossChunkLinksForChunk(
+        chunkCoords,
+        kvStoreRead,
+        kvStoreList,
+        signal,
+      );
+      if (table === undefined) continue;
+      linkWidth = table.linkWidth;
+      sidNdim = table.sidNdim;
+      for (const record of table.records) records.push(record);
+    }
+    if (linkWidth === undefined) return undefined;
+    return { linkWidth, sidNdim: sidNdim!, records };
+  }
 
   /**
    * Cached ``object_attributes/segment_id`` array (uint64, dense-OID
@@ -735,9 +904,21 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       geometryKind,
       linkDtype,
       hasFragmentSegmentIds,
+      verticesRangeAddressable,
     } = this.parameters;
     const kvStoreRead = makeKvStoreRead(baseUrl, this.sharedKvStoreContext);
     const rawKvStoreRead = makeRawKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    // Fragment-scoped range reads: enabled when the store's `vertices`
+    // array is uncompressed + range-addressable (`vertices_layout:
+    // "raw_v1"`, surfaced as `verticesRangeAddressable`), the convention
+    // is `implicit_sequential`, and the kvstore honors offset reads. A
+    // compressed store falls through to the whole-chunk read path.
+    const kvStoreReadRange =
+      verticesRangeAddressable &&
+      linksConvention === "implicit_sequential" &&
+      storeSupportsOffsetReads(baseUrl, this.sharedKvStoreContext)
+        ? makeKvStoreReadRange(baseUrl, this.sharedKvStoreContext)
+        : undefined;
     const kvStoreList = makeKvStoreList(baseUrl, this.sharedKvStoreContext);
 
     // The manifests array's `numObjects` / `chunkSize` aren't carried
@@ -751,10 +932,10 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       signal,
     );
 
-    // See `crossChunkLinks_`'s docstring: `implicit_sequential` streamline
-    // stores never consult this table (cross-chunk edges come from
-    // manifest order instead), so skip the potentially multi-gigabyte
-    // whole-level decode entirely for that convention.
+    // See `crossChunkLinks_`'s docstring: `implicit_sequential` uses the
+    // scoped per-chunk query (avoids decoding a whole-level table that
+    // can be large enough to OOM the tab for a streamline pyramid);
+    // other conventions keep the whole-table fetch.
     const crossChunkLinks =
       linksConvention === "implicit_sequential"
         ? undefined
@@ -800,6 +981,21 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
         geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
         crossChunkLinks,
+        queryCrossChunkLinksForChunks:
+          linksConvention === "implicit_sequential"
+            ? (chunkCoordsList, sig) =>
+                this.queryCrossChunkLinksForChunks(
+                  chunkCoordsList,
+                  rawKvStoreRead,
+                  kvStoreList,
+                  sig,
+                )
+            : undefined,
+        // Byte-range-scoped vertex reads for streamline stores (see
+        // `downloadSkeletonChunkScoped`): fetch only the selected object's
+        // fragments, not the whole chunk. `undefined` unless the store is
+        // `implicit_sequential` AND supports offset reads (gated above).
+        kvStoreReadRange,
         hasFragmentSegmentIds,
       },
       signal,
@@ -824,6 +1020,415 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
           ...chunk.vertexAttributes,
         ];
       }
+      return;
+    }
+
+    chunk.vertexPositions = aggregated.vertexPositions;
+    chunk.indices = aggregated.indices;
+    chunk.vertexAttributes = aggregated.vertexAttributes;
+  }
+}
+
+/**
+ * Multi-resolution counterpart of {@link ZarrVectorsObjectKeyedSkeletonSourceBackend}
+ * — see `ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters`'s
+ * docstring and the `MultiscaleSkeletonSource`/`MultiscaleSkeletonFragmentChunk`
+ * two-tier chunk model in `src/skeleton/backend.ts`.
+ *
+ * `download()` (the manifest chunk) resolves the OID once against
+ * `levels[0]` and probes every level's `object_index/manifests` for
+ * presence/extent via `probeObjectAcrossLevels` — no vertex/edge data is
+ * fetched here. `downloadFragment()` (one fragment chunk = one level) then
+ * calls `downloadSegmentSkeleton` completely unchanged, exactly as the
+ * single-level backend does, just pointed at that fragment's own level's
+ * `baseUrl` instead of a single fixed one.
+ */
+@registerSharedObject()
+export class ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend extends WithParameters(
+  WithSharedKvStoreContextCounterpart(MultiscaleSkeletonSource),
+  ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters,
+) {
+  /**
+   * Cached `object_attributes/segment_id` array, resolved against
+   * `levels[0]` only — streamline/skeleton pyramids preserve object IDs
+   * identically across levels, so this one resolution is reused for every
+   * level's manifest lookup. Same semantics as the single-level backend's
+   * `segmentIds_` (see that class's docstring).
+   */
+  private segmentIds_: BigUint64Array | null | undefined;
+
+  /** Per-level `object_index/manifests` array shape, parallel to `levels`. */
+  private manifestShapeByLevel_: (
+    | { numObjects: number; chunkSize: number }
+    | undefined
+  )[] = [];
+
+  /**
+   * Per-level whole-table `cross_chunk_links/0/` cache, parallel to
+   * `levels`. Only used for non-`implicit_sequential` conventions — see
+   * {@link ZarrVectorsObjectKeyedSkeletonSourceBackend.crossChunkLinks_}'s
+   * docstring for why `implicit_sequential` uses the scoped
+   * {@link crossChunkLinksCachesByLevel_} instead.
+   */
+  private crossChunkLinksByLevel_: (CrossChunkLinksTable | null | undefined)[] =
+    [];
+
+  /**
+   * Per-level scoped shard-discovery / shard-byte caches, parallel to
+   * `levels`. Used for `implicit_sequential` downloads via
+   * {@link queryCrossChunkLinksForChunksAtLevel} — mirrors
+   * {@link ZarrVectorsObjectKeyedSkeletonSourceBackend.crossChunkLinksCaches_}.
+   */
+  private crossChunkLinksCachesByLevel_: (
+    | CrossChunkLinksCaches
+    | false
+    | undefined
+  )[] = [];
+
+  private async getCrossChunkLinksForChunkAtLevel(
+    level: number,
+    targetChunkCoords: readonly number[],
+    kvStoreRead: (
+      subpath: string,
+      signal: AbortSignal,
+    ) => Promise<Uint8Array | undefined>,
+    kvStoreList: (
+      prefix: string,
+      signal: AbortSignal,
+    ) => Promise<{ directories: string[]; files: string[] }>,
+    signal: AbortSignal,
+  ): Promise<CrossChunkLinksTable | undefined> {
+    let caches = this.crossChunkLinksCachesByLevel_[level];
+    if (caches === false) return undefined;
+    if (caches === undefined) {
+      caches = createCrossChunkLinksCaches();
+      this.crossChunkLinksCachesByLevel_[level] = caches;
+    }
+    const table = await readCrossChunkLinksForChunk(
+      { kvStoreRead, kvStoreList },
+      targetChunkCoords,
+      caches,
+      signal,
+    );
+    if (table === undefined) {
+      this.crossChunkLinksCachesByLevel_[level] = false;
+    }
+    return table;
+  }
+
+  /**
+   * Scoped alternative to {@link getCrossChunkLinksForLevel}, passed to
+   * `downloadSegmentSkeleton` as `queryCrossChunkLinksForChunks` for
+   * `implicit_sequential` fragment downloads — see
+   * {@link ZarrVectorsObjectKeyedSkeletonSourceBackend
+   * .queryCrossChunkLinksForChunks}'s docstring (identical merge
+   * strategy, just parameterized by level).
+   */
+  private async queryCrossChunkLinksForChunksAtLevel(
+    level: number,
+    chunkCoordsList: readonly (readonly number[])[],
+    kvStoreRead: (
+      subpath: string,
+      signal: AbortSignal,
+    ) => Promise<Uint8Array | undefined>,
+    kvStoreList: (
+      prefix: string,
+      signal: AbortSignal,
+    ) => Promise<{ directories: string[]; files: string[] }>,
+    signal: AbortSignal,
+  ): Promise<CrossChunkLinksTable | undefined> {
+    const records: CrossChunkLinksTable["records"] = [];
+    let linkWidth: number | undefined;
+    let sidNdim: number | undefined;
+    for (const chunkCoords of chunkCoordsList) {
+      const table = await this.getCrossChunkLinksForChunkAtLevel(
+        level,
+        chunkCoords,
+        kvStoreRead,
+        kvStoreList,
+        signal,
+      );
+      if (table === undefined) continue;
+      linkWidth = table.linkWidth;
+      sidNdim = table.sidNdim;
+      for (const record of table.records) records.push(record);
+    }
+    if (linkWidth === undefined) return undefined;
+    return { linkWidth, sidNdim: sidNdim!, records };
+  }
+
+  private async resolveObjectIndex(
+    objectId: number | bigint,
+    numObjects: number,
+    kvStoreRead: (
+      subpath: string,
+      signal: AbortSignal,
+    ) => Promise<Uint8Array | undefined>,
+    signal: AbortSignal,
+  ): Promise<number | undefined> {
+    if (this.segmentIds_ === undefined) {
+      const bytes = await kvStoreRead(
+        "object_attributes/segment_id/data/c/0",
+        signal,
+      );
+      if (bytes === undefined || bytes.byteLength < numObjects * 8) {
+        this.segmentIds_ = null;
+      } else {
+        const copy = bytes.slice(0, numObjects * 8);
+        this.segmentIds_ = new BigUint64Array(copy.buffer);
+      }
+    }
+    const ids = this.segmentIds_;
+    const target = BigInt(objectId);
+    if (ids === null) {
+      return target >= 0n && target < BigInt(numObjects)
+        ? Number(target)
+        : undefined;
+    }
+    let lo = 0;
+    let hi = ids.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const v = ids[mid];
+      if (v === target) return mid;
+      if (v < target) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return undefined;
+  }
+
+  private async getManifestShape(
+    level: number,
+    baseUrl: string,
+    signal: AbortSignal,
+  ): Promise<{ numObjects: number; chunkSize: number }> {
+    let cached = this.manifestShapeByLevel_[level];
+    if (cached === undefined) {
+      cached = await readManifestArrayShape(
+        baseUrl,
+        this.sharedKvStoreContext,
+        signal,
+      );
+      this.manifestShapeByLevel_[level] = cached;
+    }
+    return cached;
+  }
+
+  private async getCrossChunkLinksForLevel(
+    level: number,
+    kvStoreRead: (
+      subpath: string,
+      signal: AbortSignal,
+    ) => Promise<Uint8Array | undefined>,
+    kvStoreList: (
+      prefix: string,
+      signal: AbortSignal,
+    ) => Promise<{ directories: string[]; files: string[] }>,
+    signal: AbortSignal,
+  ): Promise<CrossChunkLinksTable | undefined> {
+    const cached = this.crossChunkLinksByLevel_[level];
+    if (cached !== undefined) return cached ?? undefined;
+    const table = await readCrossChunkLinks({ kvStoreRead, kvStoreList }, signal);
+    this.crossChunkLinksByLevel_[level] = table ?? null;
+    return table;
+  }
+
+  async download(
+    chunk: MultiscaleSkeletonManifestChunk,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const { levels, rank, metersPerUnit } = this.parameters;
+    const level0 = levels[0];
+    const kvStoreRead0 = makeKvStoreRead(level0.baseUrl, this.sharedKvStoreContext);
+    const { numObjects: numObjects0 } = await this.getManifestShape(
+      0,
+      level0.baseUrl,
+      signal,
+    );
+    const resolvedOid = await this.resolveObjectIndex(
+      chunk.objectId,
+      numObjects0,
+      kvStoreRead0,
+      signal,
+    );
+    chunk.resolvedOid = resolvedOid;
+    if (resolvedOid === undefined) {
+      chunk.presentLevels = null;
+      chunk.levelSpacings = null;
+      return;
+    }
+
+    // A level whose `object_index/manifests` array doesn't exist at all
+    // (as opposed to existing but having an empty manifest for this
+    // particular object) must not fail the probe for every *other*
+    // level — `getManifestShape`/`readManifestArrayShape` throws for a
+    // missing array, so catch per-level and pass `undefined` through to
+    // `probeObjectAcrossLevels`, which treats it as "not present" there.
+    const levelProbeOptions = await Promise.all(
+      levels.map(async (levelRef, level) => {
+        try {
+          const { numObjects, chunkSize } = await this.getManifestShape(
+            level,
+            levelRef.baseUrl,
+            signal,
+          );
+          return {
+            numObjects,
+            chunkSize,
+            kvStoreRead: makeKvStoreRead(levelRef.baseUrl, this.sharedKvStoreContext),
+          };
+        } catch {
+          return undefined;
+        }
+      }),
+    );
+    const { presentLevels } = await probeObjectAcrossLevels(
+      resolvedOid,
+      levelProbeOptions,
+      rank,
+      signal,
+    );
+    chunk.presentLevels = presentLevels;
+    // Per-level spacing in REAL-WORLD METERS, using the store's own
+    // declared scale (`metersPerUnit`, from the NGFF coordinate space) —
+    // NOT raw coordinate units. This is the same basis that calibrates
+    // the "Resolution (skeleton grid 3D)" widget axis/slider and pass-1's
+    // level selection (both derive from `getSpatialSkeletonGridSizes` =
+    // `chunkShape * metersPerUnit`), so pass-2's requesting, drawing, and
+    // histogram all agree with the slider. Computing it here (rather than
+    // converting coordinate-unit spacings with
+    // `getMetersPerUnit(projectionParameters)` at use sites) avoids the
+    // display-space-vs-store-space scale mismatch that previously made
+    // every level collapse to one bar.
+    chunk.levelSpacings = Float32Array.from(
+      levels.map((levelRef) => {
+        const cs = levelRef.chunkShape;
+        let minMeters = Number.POSITIVE_INFINITY;
+        for (let a = 0; a < cs.length; ++a) {
+          const m =
+            metersPerUnit[a] ?? metersPerUnit[metersPerUnit.length - 1] ?? 1;
+          minMeters = Math.min(minMeters, cs[a] * m);
+        }
+        return Math.max(minMeters, 1e-6);
+      }),
+    );
+  }
+
+  async downloadFragment(
+    chunk: MultiscaleSkeletonFragmentChunk,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const { manifestChunk, level } = chunk;
+    const {
+      levels,
+      rank,
+      attributeNames,
+      attributeDtypes,
+      linksConvention,
+      geometryKind,
+      linkDtype,
+    } = this.parameters;
+    const levelRef = levels[level];
+
+    const setEmpty = () => {
+      chunk.vertexPositions = new Float32Array(0);
+      chunk.indices = new Uint32Array(0);
+      chunk.vertexAttributes = attributeNames.map(() => new Float32Array(0));
+      if (
+        hasSynthesisedTangent(geometryKind as ZarrVectorsSkeletonGeometryKind)
+      ) {
+        chunk.vertexAttributes = [
+          new Float32Array(0),
+          ...chunk.vertexAttributes,
+        ];
+      }
+    };
+
+    const resolvedOid = manifestChunk?.resolvedOid;
+    if (resolvedOid === undefined) {
+      // Shouldn't normally happen — the render layer only requests
+      // fragment chunks for manifests with `presentLevels !== null` — but
+      // guard defensively since `downloadFragment` is reachable directly.
+      setEmpty();
+      return;
+    }
+
+    const kvStoreRead = makeKvStoreRead(levelRef.baseUrl, this.sharedKvStoreContext);
+    const rawKvStoreRead = makeRawKvStoreRead(
+      levelRef.baseUrl,
+      this.sharedKvStoreContext,
+    );
+    // Fragment-scoped range reads: enabled when this level's `vertices`
+    // array is stored uncompressed + range-addressable (writer stamped
+    // `vertices_layout: "raw_v1"`, surfaced as `verticesRangeAddressable`),
+    // the convention is `implicit_sequential`, and the kvstore honors
+    // offset reads. A compressed level (legacy) can't be range-read, so it
+    // falls through to the whole-chunk path.
+    const kvStoreReadRange =
+      levelRef.verticesRangeAddressable &&
+      linksConvention === "implicit_sequential" &&
+      storeSupportsOffsetReads(levelRef.baseUrl, this.sharedKvStoreContext)
+        ? makeKvStoreReadRange(levelRef.baseUrl, this.sharedKvStoreContext)
+        : undefined;
+    const kvStoreList = makeKvStoreList(levelRef.baseUrl, this.sharedKvStoreContext);
+    const { numObjects, chunkSize } = await this.getManifestShape(
+      level,
+      levelRef.baseUrl,
+      signal,
+    );
+
+    // See `ZarrVectorsObjectKeyedSkeletonSourceBackend.crossChunkLinks_`'s
+    // docstring: `implicit_sequential` uses the scoped per-chunk query
+    // (avoids decoding a whole-level table that can be large enough to
+    // OOM the tab for a streamline pyramid); other conventions keep the
+    // whole-table fetch.
+    const crossChunkLinks =
+      linksConvention === "implicit_sequential"
+        ? undefined
+        : await this.getCrossChunkLinksForLevel(
+            level,
+            rawKvStoreRead,
+            kvStoreList,
+            signal,
+          );
+
+    const aggregated = await downloadSegmentSkeleton(
+      resolvedOid,
+      {
+        manifestReader: {
+          numObjects,
+          chunkSize,
+          sidNdim: rank,
+          kvStoreRead,
+        },
+        rank,
+        linkDtype: asLinkDtype(linkDtype),
+        attributeNames,
+        attributeDtypes: attributeDtypes.map(asAttributeDtype),
+        linksConvention: linksConvention as ZarrVectorsLinksConvention,
+        geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
+        crossChunkLinks,
+        queryCrossChunkLinksForChunks:
+          linksConvention === "implicit_sequential"
+            ? (chunkCoordsList, sig) =>
+                this.queryCrossChunkLinksForChunksAtLevel(
+                  level,
+                  chunkCoordsList,
+                  rawKvStoreRead,
+                  kvStoreList,
+                  sig,
+                )
+            : undefined,
+        // Byte-range-scoped vertex reads (see `downloadSkeletonChunkScoped`);
+        // `undefined` unless implicit_sequential AND offset reads supported.
+        kvStoreReadRange,
+        hasFragmentSegmentIds: levelRef.hasFragmentSegmentIds,
+      },
+      signal,
+    );
+
+    if (aggregated === undefined) {
+      setEmpty();
       return;
     }
 

@@ -70,10 +70,17 @@ import type {
 } from "#src/skeleton/api.js";
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import {
+  MULTISCALE_SKELETON_FRAGMENT_SOURCE_RPC_ID,
+  MULTISCALE_SKELETON_LAYER_RPC_ID,
   SKELETON_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
 } from "#src/skeleton/base.js";
+import {
+  pickFinestPresentLevelAtOrBelow,
+  pickReadyLevelToDraw,
+  pickTargetLevelByScreenSize,
+} from "#src/skeleton/multiscale_object_selection.js";
 import {
   buildSpatiallyIndexedSkeletonOverlayGeometry,
   type SpatiallyIndexedSkeletonOverlayGeometry,
@@ -184,6 +191,7 @@ import {
 } from "#src/webgl/texture_access.js";
 import { defineVertexId, VertexIdHelper } from "#src/webgl/vertex_id.js";
 import type { RPC } from "#src/worker_rpc.js";
+import { registerSharedObjectOwner } from "#src/worker_rpc.js";
 
 const DEBUG_SPATIAL_SKELETON_OVERLAY = false;
 const DEBUG_EXCLUDED_SEGMENTS = false;
@@ -4546,5 +4554,657 @@ export class SkeletonSource extends ChunkSource {
 
   get vertexAttributes(): Map<string, VertexAttributeInfo> {
     return emptyVertexAttributes;
+  }
+}
+
+/**
+ * Object-keyed, multi-resolution skeleton source and render layer — the
+ * "[skeleton]" subsource's multi-resolution counterpart to the flat
+ * `SkeletonSource`/`SkeletonLayer` above. Mirrors precomputed multiscale
+ * meshes' `MultiscaleMeshSource`/`MultiscaleMeshLayer`
+ * (`src/mesh/frontend.ts`): a manifest chunk per selected object records
+ * which pyramid levels it's present at (`presentLevels`), while separate
+ * fragment chunks (keyed `${objectKey}/${level}`) hold one level's
+ * whole-object aggregated geometry — otherwise structurally identical to
+ * a `SkeletonChunk` (same GPU upload path), since a skeleton/streamline
+ * object has no natural spatial octree to partition fragments the way
+ * mesh geometry does. Level selection is driven by a real-world
+ * resolution target (shared with pass-1), not by this object's on-screen
+ * footprint, so unlike precomputed meshes' manifests, no bounding box is
+ * tracked here.
+ */
+export class MultiscaleSkeletonManifestChunk extends Chunk {
+  declare source: MultiscaleSkeletonSource;
+  presentLevels: boolean[] | null = null;
+  levelSpacings: Float32Array | null = null;
+
+  constructor(source: MultiscaleSkeletonSource, x: any) {
+    super(source);
+    this.presentLevels = x.presentLevels ?? null;
+    this.levelSpacings = x.levelSpacings ?? null;
+  }
+}
+
+export class MultiscaleSkeletonFragmentChunk
+  extends Chunk
+  implements SkeletonChunkBase
+{
+  declare source: MultiscaleSkeletonFragmentSource;
+  vertexAttributes: Uint8Array;
+  indices: Uint32Array;
+  indexBuffer!: GLBuffer;
+  numIndices: number;
+  numVertices: number;
+  vertexAttributeOffsets: Uint32Array;
+  vertexAttributeTextures: (WebGLTexture | null)[] = [];
+
+  constructor(source: MultiscaleSkeletonFragmentSource, x: PackedSkeletonGeometry) {
+    super(source);
+    this.vertexAttributes = x.vertexAttributes;
+    const indices = (this.indices = x.indices);
+    this.numVertices = x.numVertices;
+    this.vertexAttributeOffsets = x.vertexAttributeOffsets;
+    this.numIndices = indices.length;
+  }
+
+  copyToGPU(gl: GL) {
+    super.copyToGPU(gl);
+    uploadSkeletonChunkToGPU(gl, this);
+  }
+
+  freeGPUMemory(gl: GL) {
+    super.freeGPUMemory(gl);
+    freeSkeletonChunkGPUMemory(gl, this);
+  }
+}
+
+@registerSharedObjectOwner(MULTISCALE_SKELETON_FRAGMENT_SOURCE_RPC_ID)
+export class MultiscaleSkeletonFragmentSource extends ChunkSource {
+  declare chunks: Map<string, MultiscaleSkeletonFragmentChunk>;
+  get key() {
+    return this.meshSource.key;
+  }
+  constructor(
+    chunkManager: ChunkManager,
+    public meshSource: MultiscaleSkeletonSource,
+  ) {
+    super(chunkManager);
+  }
+  get attributeTextureFormats() {
+    return this.meshSource.attributeTextureFormats;
+  }
+  getChunk(x: PackedSkeletonGeometry) {
+    return new MultiscaleSkeletonFragmentChunk(this, x);
+  }
+}
+
+export class MultiscaleSkeletonSource extends ChunkSource {
+  private attributeTextureFormats_?: TextureFormat[];
+  fragmentSource = this.registerDisposer(
+    new MultiscaleSkeletonFragmentSource(this.chunkManager, this),
+  );
+  declare chunks: Map<string, MultiscaleSkeletonManifestChunk>;
+
+  get attributeTextureFormats() {
+    let attributeTextureFormats = this.attributeTextureFormats_;
+    if (attributeTextureFormats === undefined) {
+      attributeTextureFormats = this.attributeTextureFormats_ =
+        getAttributeTextureFormats(this.vertexAttributes);
+    }
+    return attributeTextureFormats;
+  }
+
+  get vertexAttributes(): Map<string, VertexAttributeInfo> {
+    return emptyVertexAttributes;
+  }
+
+  initializeCounterpart(rpc: RPC, options: any) {
+    this.fragmentSource.initializeCounterpart(this.chunkManager.rpc!, {});
+    options.fragmentSource = this.fragmentSource.addCounterpartRef();
+    super.initializeCounterpart(rpc, options);
+  }
+
+  getChunk(x: any) {
+    return new MultiscaleSkeletonManifestChunk(this, x);
+  }
+
+  getFragmentKey(objectKey: string, level: number) {
+    return `${objectKey}/${level}`;
+  }
+
+  /**
+   * Reports this source's per-level chunk spacing so the "Resolution
+   * (skeleton grid 2D/3D)" widgets can show/drive a picker even when
+   * pass-1 (`MultiscaleSpatiallyIndexedSkeletonSource`) isn't active —
+   * see `SpatiallyIndexedSkeletonSource.getSpatialSkeletonGridSizes`,
+   * which this mirrors. Default `undefined`: subclasses (e.g.
+   * zarr-vectors) override using their own static per-level metadata,
+   * which — unlike a per-object manifest chunk's `levelSpacings` — is
+   * known before any object is ever resolved.
+   */
+  getSpatialSkeletonGridSizes(
+    liveScale?: Float64Array,
+  ): { x: number; y: number; z: number }[] | undefined {
+    liveScale;
+    return undefined;
+  }
+}
+
+export class MultiscaleSkeletonLayer
+  extends RefCounted
+  implements SkeletonShaderContext
+{
+  layerChunkProgressInfo = new LayerChunkProgressInfo();
+  redrawNeeded = new NullarySignal();
+  private sharedObject: SegmentationLayerSharedObject;
+  backend: ChunkRenderLayerFrontend;
+  vertexAttributes: VertexAttributeRenderInfo[];
+  segmentColorAttributeIndex: number | undefined = undefined;
+  readonly skeletonShaderParameters =
+    new WatchableValue<SkeletonShaderParameters>({
+      dynamicSegmentAppearance: false,
+      hasSegmentStatedColors: false,
+      hasSegmentDefaultColor: false,
+      hoverHighlight: false,
+      spatialChunkCulling: false,
+    });
+  fallbackShaderParameters = new WatchableValue(
+    getFallbackBuilderState(parseShaderUiControls(DEFAULT_FRAGMENT_MAIN)),
+  );
+
+  get visibility() {
+    return this.sharedObject.visibility;
+  }
+
+  constructor(
+    public chunkManager: ChunkManager,
+    public source: MultiscaleSkeletonSource,
+    public displayState: SpatiallyIndexedSkeletonLayerDisplayState,
+  ) {
+    super();
+
+    registerRedrawWhenSegmentationDisplayState3DChanged(displayState, this);
+    this.displayState.shaderError.value = undefined;
+    const { skeletonRenderingOptions: renderingOptions } = displayState;
+    this.registerDisposer(
+      renderingOptions.shader.changed.add(() => {
+        this.displayState.shaderError.value = undefined;
+        this.redrawNeeded.dispatch();
+      }),
+    );
+    const sharedObject = (this.sharedObject = this.registerDisposer(
+      new SegmentationLayerSharedObject(
+        chunkManager,
+        displayState,
+        this.layerChunkProgressInfo,
+      ),
+    ));
+    sharedObject.RPC_TYPE_ID = MULTISCALE_SKELETON_LAYER_RPC_ID;
+    const rpc = chunkManager.rpc!;
+    // Shared with pass-1's identically named control ("Resolution
+    // (skeleton grid 3D)"). An object-keyed source has no natural screen
+    // footprint, so it selects a level by comparing this real-world
+    // meters target directly against each object's per-level meters
+    // spacings (`MultiscaleSkeletonManifestChunk.levelSpacings`) — the
+    // same basis that calibrates this widget's axis.
+    const skeletonGridResolutionTarget3dWatchable = this.registerDisposer(
+      SharedWatchableValue.makeFromExisting(
+        rpc,
+        displayState.spatialSkeletonGridResolutionTarget3d!,
+      ),
+    );
+    sharedObject.initializeCounterpartWithChunkManager({
+      source: source.addCounterpartRef(),
+      skeletonGridResolutionTarget3d:
+        skeletonGridResolutionTarget3dWatchable.rpcId,
+    });
+    // `RenderLayer.backend` (not just the `sharedObject` field above) is
+    // what `VisibleRenderLayerTracker`'s per-panel attach logic
+    // (`src/layer/index.ts`) reads to decide whether to send the
+    // "rendered_view.addLayer" RPC that populates the backend's
+    // `attachments` map — without this, `attach()` is never called on
+    // `MultiscaleSkeletonRenderLayerBackend` and no fragment chunks are
+    // ever requested. Matches `SpatiallyIndexedSkeletonLayer`'s identical
+    // `this.backend = sharedObject` assignment.
+    this.backend = sharedObject;
+
+    const vertexAttributes = (this.vertexAttributes = [
+      vertexPositionAttribute,
+    ]);
+
+    for (const [name, info] of source.vertexAttributes) {
+      vertexAttributes.push({
+        name,
+        dataType: info.dataType,
+        numComponents: info.numComponents,
+        webglDataType: getWebglDataType(info.dataType),
+        glslDataType: getShaderType(info.dataType, info.numComponents),
+      });
+    }
+  }
+
+  get gl() {
+    return this.chunkManager.chunkQueueManager.gl;
+  }
+
+  /**
+   * Resolves which fragment chunk (if any) should be drawn for one object
+   * right now. Recomputed fresh every call from current chunk `state`
+   * only — the no-blink mechanism: there is no cross-frame "pending
+   * swap" bookkeeping, so a level transitioning to `GPU_MEMORY` between
+   * frames is picked up on the very next draw.
+   */
+  private resolveFragmentChunkToDraw(
+    manifestChunk: MultiscaleSkeletonManifestChunk,
+    objectKey: string,
+  ): MultiscaleSkeletonFragmentChunk | undefined {
+    const { presentLevels, levelSpacings } = manifestChunk;
+    if (presentLevels === null || levelSpacings === null) {
+      return undefined;
+    }
+    const targetSpacingMeters =
+      this.displayState.spatialSkeletonGridResolutionTarget3d!.value;
+    // `levelSpacings` is already in real-world meters (see
+    // `MultiscaleSkeletonManifestChunk.levelSpacings`), so compare it
+    // directly against the meters target — no display-space conversion.
+    const target = pickTargetLevelByScreenSize(
+      levelSpacings,
+      targetSpacingMeters,
+    );
+    const targetActualLevel = pickFinestPresentLevelAtOrBelow(
+      presentLevels,
+      target,
+    );
+    if (targetActualLevel === undefined) return undefined;
+    const fragmentChunks = this.source.fragmentSource.chunks;
+    const level = pickReadyLevelToDraw(
+      presentLevels,
+      targetActualLevel,
+      (l) =>
+        fragmentChunks.get(this.source.getFragmentKey(objectKey, l))
+          ?.state === ChunkState.GPU_MEMORY,
+    );
+    if (level === undefined) return undefined;
+    return fragmentChunks.get(this.source.getFragmentKey(objectKey, level));
+  }
+
+  /**
+   * Populates the shared "Resolution (skeleton grid 3D)" widget's
+   * histogram so it reflects pass-2 state too — one bar per distinct
+   * target spacing among the currently visible/selected objects,
+   * present-count 1 if that object's target level's fragment chunk is
+   * `GPU_MEMORY`-resident, missing-count 1 otherwise. Mirrors pass-1's
+   * `updateGridRenderScaleHistogram`, adapted from "chunks in view" (a
+   * spatial-grid concept) to "selected objects' resolved target level"
+   * (the object-keyed equivalent).
+   */
+  private updateObjectKeyedRenderScaleHistogram(
+    histogram: RenderScaleHistogram,
+    frameNumber: number,
+  ) {
+    histogram.begin(frameNumber);
+    const { source, displayState } = this;
+    const manifests = source.chunks;
+    const fragmentChunks = source.fragmentSource.chunks;
+    const targetSpacingMeters =
+      displayState.spatialSkeletonGridResolutionTarget3d!.value;
+    const perSpacing = new Map<number, { present: number; missing: number }>();
+    forEachVisibleSegment(displayState.segmentationGroupState.value, (objectId) => {
+      const key = getObjectKey(objectId);
+      const manifestChunk = manifests.get(key);
+      if (manifestChunk === undefined) return;
+      const { presentLevels, levelSpacings } = manifestChunk;
+      if (presentLevels === null || levelSpacings === null) return;
+      // `levelSpacings` is already in real-world meters — the same basis
+      // as the widget axis and the placeholder bars below — so the target
+      // level and its spacing map straight onto the axis with no
+      // conversion, and each object's real bar lands exactly on the
+      // matching placeholder position.
+      const target = pickTargetLevelByScreenSize(
+        levelSpacings,
+        targetSpacingMeters,
+      );
+      const targetActualLevel = pickFinestPresentLevelAtOrBelow(
+        presentLevels,
+        target,
+      );
+      if (targetActualLevel === undefined) return;
+      const spacingMeters = levelSpacings[targetActualLevel];
+      let entry = perSpacing.get(spacingMeters);
+      if (entry === undefined) {
+        entry = { present: 0, missing: 0 };
+        perSpacing.set(spacingMeters, entry);
+      }
+      const ready =
+        fragmentChunks.get(source.getFragmentKey(key, targetActualLevel))
+          ?.state === ChunkState.GPU_MEMORY;
+      if (ready) {
+        entry.present++;
+      } else {
+        entry.missing++;
+      }
+    });
+    for (const [spacing, { present, missing }] of perSpacing) {
+      histogram.add(spacing, spacing, present, missing);
+    }
+    // Keep every pyramid level visible in the widget by adding a
+    // render-only placeholder bar for any level no visible object
+    // currently resolved to — same convention as pass-1's
+    // `updateGridRenderScaleHistogram`, reusing the same
+    // `spatialSkeletonGridLevels` list (populated for pass-2 too, via
+    // `ZarrVectorsMultiscaleObjectKeyedSkeletonSource
+    // .getSpatialSkeletonGridSizes`).
+    const spacingOf = (size: { x: number; y: number; z: number }) =>
+      Math.max(Math.min(size.x, size.y, size.z), 1e-6);
+    for (const level of displayState.spatialSkeletonGridLevels?.value ?? []) {
+      const spacing = spacingOf(level.size);
+      if (!histogram.spatialScales.has(spacing)) {
+        histogram.add(spacing, spacing, 0, 1, true);
+      }
+    }
+  }
+
+  draw(
+    renderContext: SliceViewPanelRenderContext | PerspectiveViewRenderContext,
+    layer: RenderLayer,
+    renderHelper: RenderHelper,
+    renderOptions: ViewSpecificSkeletonRenderingOptions,
+    attachment: VisibleLayerInfo<
+      LayerView,
+      ThreeDimensionalRenderLayerAttachmentState
+    >,
+  ) {
+    const lineWidth = renderOptions.lineWidth.value;
+    const { gl, displayState, source } = this;
+    if (displayState.objectAlpha.value <= 0.0) {
+      // Skip drawing.
+      return;
+    }
+    const modelMatrix = update3dRenderLayerAttachment(
+      displayState.transform.value,
+      renderContext.projectionParameters.displayDimensionRenderInfo,
+      attachment,
+    );
+    if (modelMatrix === undefined) return;
+    const pointDiameter = getSkeletonNodeDiameter(
+      renderOptions.mode.value,
+      lineWidth,
+    );
+
+    const edgeShaderResult = renderHelper.edgeShaderGetter(
+      renderContext.emitter,
+    );
+    const nodeShaderResult = renderHelper.nodeShaderGetter(
+      renderContext.emitter,
+    );
+    const { shader: edgeShader, parameters: edgeShaderParameters } =
+      edgeShaderResult;
+    const { shader: nodeShader, parameters: nodeShaderParameters } =
+      nodeShaderResult;
+    if (edgeShader === null || nodeShader === null) {
+      // Shader error, skip drawing.
+      return;
+    }
+
+    const { shaderControlState } = this.displayState.skeletonRenderingOptions;
+
+    edgeShader.bind();
+    renderHelper.beginLayer(gl, edgeShader, renderContext, modelMatrix);
+    renderHelper.setPickInstanceStride(gl, edgeShader, 0);
+    setControlsInShader(
+      gl,
+      edgeShader,
+      shaderControlState,
+      edgeShaderParameters.parseResult.controls,
+    );
+    gl.uniform1f(edgeShader.uniform("uLineWidth"), lineWidth!);
+
+    nodeShader.bind();
+    renderHelper.beginLayer(gl, nodeShader, renderContext, modelMatrix);
+    gl.uniform1f(nodeShader.uniform("uNodeDiameter"), pointDiameter);
+    renderHelper.setPickInstanceStride(gl, nodeShader, 0);
+    setControlsInShader(
+      gl,
+      nodeShader,
+      shaderControlState,
+      nodeShaderParameters.parseResult.controls,
+    );
+
+    const manifests = source.chunks;
+
+    const histogram = displayState.spatialSkeletonGridRenderScaleHistogram3d;
+    if (histogram !== undefined) {
+      const frameNumber =
+        this.chunkManager.chunkQueueManager.frameNumberCounter.frameNumber;
+      this.updateObjectKeyedRenderScaleHistogram(histogram, frameNumber);
+    }
+
+    forEachVisibleSegmentToDraw(
+      displayState,
+      layer,
+      renderContext.emitColor,
+      renderContext.emitPickID ? renderContext.pickIDs : undefined,
+      (objectId, color, pickIndex) => {
+        const key = getObjectKey(objectId);
+        const manifestChunk = manifests.get(key);
+        if (manifestChunk === undefined) return;
+        const fragmentChunk = this.resolveFragmentChunkToDraw(
+          manifestChunk,
+          key,
+        );
+        if (fragmentChunk === undefined) return;
+        if (color !== undefined) {
+          edgeShader.bind();
+          renderHelper.setColor(gl, edgeShader, color);
+          nodeShader.bind();
+          renderHelper.setColor(gl, nodeShader, color);
+        }
+        if (pickIndex !== undefined) {
+          edgeShader.bind();
+          renderHelper.setPickID(gl, edgeShader, pickIndex);
+          nodeShader.bind();
+          renderHelper.setPickID(gl, nodeShader, pickIndex);
+        }
+        renderHelper.drawSkeletons(
+          gl,
+          edgeShader,
+          nodeShader,
+          fragmentChunk,
+          renderContext.projectionParameters,
+          renderOptions.mode.value,
+        );
+      },
+    );
+    renderHelper.endLayer(gl, edgeShader, nodeShader);
+  }
+
+  /**
+   * Stricter than `draw()`'s graceful degradation — non-blocking
+   * bookkeeping only (screenshots/loading UI), requires the exact
+   * screen-size-computed target level (not just some ready fallback) to
+   * be resident before reporting ready.
+   */
+  isReady(
+    renderContext: PerspectiveViewReadyRenderContext | SliceViewPanelReadyRenderContext,
+    attachment: VisibleLayerInfo<
+      LayerView,
+      ThreeDimensionalRenderLayerAttachmentState
+    >,
+  ) {
+    const { source, displayState } = this;
+    if (displayState.objectAlpha.value <= 0.0) {
+      return true;
+    }
+    const modelMatrix = update3dRenderLayerAttachment(
+      displayState.transform.value,
+      renderContext.projectionParameters.displayDimensionRenderInfo,
+      attachment,
+    );
+    if (modelMatrix === undefined) return false;
+    const manifests = source.chunks;
+    const targetSpacingMeters =
+      displayState.spatialSkeletonGridResolutionTarget3d!.value;
+    let ready = true;
+
+    forEachVisibleSegment(
+      displayState.segmentationGroupState.value,
+      (objectId) => {
+        const key = getObjectKey(objectId);
+        const manifestChunk = manifests.get(key);
+        if (manifestChunk === undefined) {
+          ready = false;
+          return;
+        }
+        const { presentLevels, levelSpacings } = manifestChunk;
+        if (presentLevels === null || levelSpacings === null) {
+          ready = false;
+          return;
+        }
+        // `levelSpacings` already in real-world meters — compare directly.
+        const target = pickTargetLevelByScreenSize(
+          levelSpacings,
+          targetSpacingMeters,
+        );
+        const targetActualLevel = pickFinestPresentLevelAtOrBelow(
+          presentLevels,
+          target,
+        );
+        if (targetActualLevel === undefined) {
+          ready = false;
+          return;
+        }
+        const fragmentChunk = source.fragmentSource.chunks.get(
+          source.getFragmentKey(key, targetActualLevel),
+        );
+        if (
+          fragmentChunk === undefined ||
+          fragmentChunk.state !== ChunkState.GPU_MEMORY
+        ) {
+          ready = false;
+        }
+      },
+    );
+    return ready;
+  }
+}
+
+export class PerspectiveViewMultiscaleSkeletonLayer extends PerspectiveViewRenderLayer {
+  private renderHelper: RenderHelper;
+  private renderOptions: ViewSpecificSkeletonRenderingOptions;
+  constructor(public base: MultiscaleSkeletonLayer) {
+    super();
+    this.renderHelper = this.registerDisposer(new RenderHelper(base, false));
+    this.renderOptions = base.displayState.skeletonRenderingOptions.params3d;
+
+    this.layerChunkProgressInfo = base.layerChunkProgressInfo;
+    this.backend = base.backend;
+    this.registerDisposer(base);
+    this.registerDisposer(base.redrawNeeded.add(this.redrawNeeded.dispatch));
+    const { renderOptions } = this;
+    this.registerDisposer(
+      renderOptions.mode.changed.add(this.redrawNeeded.dispatch),
+    );
+    this.registerDisposer(
+      renderOptions.lineWidth.changed.add(this.redrawNeeded.dispatch),
+    );
+    this.registerDisposer(base.visibility.add(this.visibility));
+    const histogram3d =
+      base.displayState.spatialSkeletonGridRenderScaleHistogram3d;
+    if (histogram3d !== undefined) {
+      this.registerDisposer(histogram3d.visibility.add(this.visibility));
+    }
+  }
+  get gl() {
+    return this.base.gl;
+  }
+
+  get isTransparent() {
+    return this.base.displayState.objectAlpha.value < 1.0;
+  }
+
+  draw(
+    renderContext: PerspectiveViewRenderContext,
+    attachment: VisibleLayerInfo<
+      PerspectivePanel,
+      ThreeDimensionalRenderLayerAttachmentState
+    >,
+  ) {
+    if (!renderContext.emitColor && renderContext.alreadyEmittedPickID) {
+      // No need for a separate pick ID pass.
+      return;
+    }
+    this.base.draw(
+      renderContext,
+      this,
+      this.renderHelper,
+      this.renderOptions,
+      attachment,
+    );
+  }
+
+  isReady(
+    renderContext: PerspectiveViewReadyRenderContext,
+    attachment: VisibleLayerInfo<
+      PerspectivePanel,
+      ThreeDimensionalRenderLayerAttachmentState
+    >,
+  ) {
+    return this.base.isReady(renderContext, attachment);
+  }
+}
+
+export class SliceViewPanelMultiscaleSkeletonLayer extends SliceViewPanelRenderLayer {
+  private renderHelper: RenderHelper;
+  private renderOptions: ViewSpecificSkeletonRenderingOptions;
+  constructor(public base: MultiscaleSkeletonLayer) {
+    super();
+    this.renderHelper = this.registerDisposer(new RenderHelper(base, true));
+    this.renderOptions = base.displayState.skeletonRenderingOptions.params2d;
+    this.layerChunkProgressInfo = base.layerChunkProgressInfo;
+    this.backend = base.backend;
+    this.registerDisposer(base);
+    const { renderOptions } = this;
+    this.registerDisposer(
+      renderOptions.mode.changed.add(this.redrawNeeded.dispatch),
+    );
+    this.registerDisposer(
+      renderOptions.lineWidth.changed.add(this.redrawNeeded.dispatch),
+    );
+    this.registerDisposer(base.redrawNeeded.add(this.redrawNeeded.dispatch));
+    this.registerDisposer(base.visibility.add(this.visibility));
+    const histogram3d =
+      base.displayState.spatialSkeletonGridRenderScaleHistogram3d;
+    if (histogram3d !== undefined) {
+      this.registerDisposer(histogram3d.visibility.add(this.visibility));
+    }
+  }
+  get gl() {
+    return this.base.gl;
+  }
+
+  draw(
+    renderContext: SliceViewPanelRenderContext,
+    attachment: VisibleLayerInfo<
+      SliceViewPanel,
+      ThreeDimensionalRenderLayerAttachmentState
+    >,
+  ) {
+    this.base.draw(
+      renderContext,
+      this,
+      this.renderHelper,
+      this.renderOptions,
+      attachment,
+    );
+  }
+
+  isReady(
+    renderContext: SliceViewPanelReadyRenderContext,
+    attachment: VisibleLayerInfo<
+      SliceViewPanel,
+      ThreeDimensionalRenderLayerAttachmentState
+    >,
+  ) {
+    return this.base.isReady(renderContext, attachment);
   }
 }

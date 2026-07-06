@@ -22,7 +22,7 @@ import {
   ChunkSource,
   withChunkManager,
 } from "#src/chunk_manager/backend.js";
-import { ChunkState } from "#src/chunk_manager/base.js";
+import { ChunkPriorityTier, ChunkState } from "#src/chunk_manager/base.js";
 import { decodeVertexPositionsAndIndices } from "#src/mesh/backend.js";
 import {
   type DisplayDimensionRenderInfo,
@@ -41,6 +41,8 @@ import {
 import type { SharedWatchableValue } from "#src/shared_watchable_value.js";
 import type { SpatialSkeletonSourceState } from "#src/skeleton/api.js";
 import {
+  MULTISCALE_SKELETON_FRAGMENT_SOURCE_RPC_ID,
+  MULTISCALE_SKELETON_LAYER_RPC_ID,
   SKELETON_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
@@ -52,9 +54,19 @@ import {
   type SkeletonChunkData,
 } from "#src/skeleton/chunk_serialization.js";
 import {
+  pickFinestPresentLevelAtOrBelow,
+  pickTargetLevelByScreenSize,
+} from "#src/skeleton/multiscale_object_selection.js";
+import {
   getSpatiallyIndexedSkeletonGridIndex,
   selectSpatiallyIndexedSkeletonEntriesByGridWithFallback,
 } from "#src/skeleton/source_selection.js";
+import {
+  computePhysicalUnitsPerScreenPixelAtPoint,
+  getChunkSpacing,
+  getMetersPerUnit,
+  quantizeSpacingForArbitration,
+} from "#src/skeleton/screen_size.js";
 import {
   BASE_PRIORITY,
   deserializeTransformedSources,
@@ -94,70 +106,6 @@ const tempArbitrationChunkCenterWorld = vec3.create();
 const tempArbitrationCandidateChunkPos = vec3.create();
 const tempArbitrationLocalPoint = vec3.create();
 
-function getChunkSpacing(size: Float32Array): number {
-  return Math.max(Math.min(size[0], size[1], size[2]), 1e-6);
-}
-
-function computePhysicalUnitsPerScreenPixelAtPoint(
-  modelViewProjection: Float32Array,
-  viewportWidth: number,
-  viewportHeight: number,
-  worldPoint: Float32Array,
-  displayDimensionScales?: Float64Array,
-): number {
-  const m = modelViewProjection;
-  const m00 = m[0],
-    m10 = m[1];
-  const m01 = m[4],
-    m11 = m[5];
-  const m02 = m[8],
-    m12 = m[9];
-  const m30 = m[3],
-    m31 = m[7],
-    m32 = m[11],
-    m33 = m[15];
-  const w =
-    m30 * worldPoint[0] + m31 * worldPoint[1] + m32 * worldPoint[2] + m33;
-  if (!Number.isFinite(w) || w <= 0) return Number.POSITIVE_INFINITY;
-
-  const sx =
-    displayDimensionScales !== undefined &&
-    displayDimensionScales.length > 0 &&
-    Number.isFinite(displayDimensionScales[0]) &&
-    displayDimensionScales[0] > 0
-      ? displayDimensionScales[0]
-      : 1;
-  const sy =
-    displayDimensionScales !== undefined &&
-    displayDimensionScales.length > 1 &&
-    Number.isFinite(displayDimensionScales[1]) &&
-    displayDimensionScales[1] > 0
-      ? displayDimensionScales[1]
-      : sx;
-  const sz =
-    displayDimensionScales !== undefined &&
-    displayDimensionScales.length > 2 &&
-    Number.isFinite(displayDimensionScales[2]) &&
-    displayDimensionScales[2] > 0
-      ? displayDimensionScales[2]
-      : sy;
-
-  const xScale = Math.sqrt(
-    ((m00 / sx) * viewportWidth) ** 2 + ((m10 / sx) * viewportHeight) ** 2,
-  );
-  const yScale = Math.sqrt(
-    ((m01 / sy) * viewportWidth) ** 2 + ((m11 / sy) * viewportHeight) ** 2,
-  );
-  const zScale = Math.sqrt(
-    ((m02 / sz) * viewportWidth) ** 2 + ((m12 / sz) * viewportHeight) ** 2,
-  );
-  const scaleFactor = Math.max(xScale, yScale, zScale);
-  if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) {
-    return Number.POSITIVE_INFINITY;
-  }
-  return w / scaleFactor;
-}
-
 function getChunkGridPositionForWorldPoint(
   tsource: TransformedSource<
     SpatiallyIndexedSkeletonRenderLayerBackend,
@@ -188,30 +136,6 @@ function getChunkGridPositionForWorldPoint(
   return true;
 }
 
-function getMetersPerUnit(projectionParameters: {
-  displayDimensionRenderInfo?: { displayDimensionScales?: Float64Array };
-}): number {
-  const ddScales =
-    projectionParameters.displayDimensionRenderInfo?.displayDimensionScales;
-  if (ddScales === undefined || ddScales.length === 0) {
-    return 1;
-  }
-  let metersPerUnit = Infinity;
-  for (let i = 0; i < ddScales.length; ++i) {
-    const s = ddScales[i];
-    if (Number.isFinite(s) && s > 0) {
-      metersPerUnit = Math.min(metersPerUnit, s);
-    }
-  }
-  return Number.isFinite(metersPerUnit) ? metersPerUnit : 1;
-}
-
-function quantizeSpacingForArbitration(spacing: number): number {
-  const clamped = Math.max(spacing, 1e-12);
-  const log2Spacing = Math.log2(clamped);
-  const quantizedLog = Math.round(log2Spacing * 4) / 4;
-  return 2 ** quantizedLog;
-}
 
 export function getSpatiallyIndexedSkeletonChunkPriority(
   localCenter: Float32Array,
@@ -411,6 +335,323 @@ export class SkeletonLayer extends withSegmentationLayerBackendState(
         basePriority + SKELETON_CHUNK_PRIORITY,
       );
     });
+  }
+}
+
+const MULTISCALE_SKELETON_MANIFEST_CHUNK_PRIORITY = 100;
+const MULTISCALE_SKELETON_FRAGMENT_CHUNK_PRIORITY = 50;
+
+/**
+ * Chunk describing which pyramid levels a single object is present at
+ * (`presentLevels[level]`, index 0 = finest) and the per-level chunk
+ * spacing shared by every object in the store (`levelSpacings`, copied
+ * from the concrete data source's static per-level metadata). Mirrors
+ * `MultiscaleManifestChunk` in `src/mesh/backend.ts`, adapted from an
+ * octree+lodScales manifest to a flat per-level presence list, since a
+ * skeleton/streamline object has no natural spatial octree of its own.
+ *
+ * Level selection is driven by a real-world resolution target
+ * (`skeletonGridResolutionTarget3d`, shared with pass-1's identically
+ * named control), not by this object's on-screen footprint — so unlike
+ * precomputed meshes' manifests, no bounding box is tracked here.
+ *
+ * `levelSpacings[level]` is in REAL-WORLD METERS — the concrete source is
+ * responsible for converting its native per-level chunk shape to meters
+ * using the store's declared coordinate-space scale, so both the backend
+ * priority computation and the frontend draw/histogram can compare it
+ * directly against `skeletonGridResolutionTarget3d` (also meters) with no
+ * further scale conversion. This deliberately does NOT go through
+ * `getMetersPerUnit(projectionParameters)` at the use sites: that display-
+ * space scalar can disagree with the store-space scale that calibrates
+ * the "Resolution (skeleton grid 3D)" widget axis, which previously made
+ * every level's bar collapse onto the same axis position.
+ */
+export class MultiscaleSkeletonManifestChunk extends Chunk {
+  objectId: bigint = 0n;
+  resolvedOid: number | undefined;
+  presentLevels: boolean[] | null = null;
+  levelSpacings: Float32Array | null = null;
+
+  // We can't save a reference to objectId, because it may be a temporary
+  // object.
+  initializeManifestChunk(key: string, objectId: bigint) {
+    super.initialize(key);
+    this.objectId = objectId;
+  }
+
+  freeSystemMemory() {
+    this.presentLevels = null;
+    this.levelSpacings = null;
+  }
+
+  serialize(msg: any, transfers: any[]) {
+    super.serialize(msg, transfers);
+    msg.presentLevels = this.presentLevels;
+    msg.levelSpacings = this.levelSpacings;
+  }
+
+  downloadSucceeded() {
+    // Cheap fixed estimate — the actual geometry lives in fragment chunks,
+    // not here (mirrors mesh's `ManifestChunk`/`MultiscaleManifestChunk`).
+    this.systemMemoryBytes = 100;
+    this.gpuMemoryBytes = 0;
+    super.downloadSucceeded();
+    if (this.priorityTier < ChunkPriorityTier.RECENT) {
+      this.source!.chunkManager.scheduleUpdateChunkPriorities();
+    }
+  }
+
+  toString() {
+    return this.objectId.toString();
+  }
+}
+
+/**
+ * Chunk holding one object's aggregated skeleton geometry at ONE pyramid
+ * level — the whole-object equivalent of a single-level `SkeletonChunk`,
+ * keyed by `${objectKey}/${level}` instead of just `${objectKey}`.
+ */
+export class MultiscaleSkeletonFragmentChunk
+  extends Chunk
+  implements SkeletonChunkData
+{
+  level = 0;
+  manifestChunk: MultiscaleSkeletonManifestChunk | null = null;
+  vertexPositions: Float32Array | null = null;
+  vertexAttributes: TypedNumberArray[] | null = null;
+  indices: Uint32Array | null = null;
+
+  freeSystemMemory() {
+    freeSkeletonChunkSystemMemory(this);
+    this.manifestChunk = null;
+  }
+
+  serialize(msg: any, transfers: any[]) {
+    super.serialize(msg, transfers);
+    msg.level = this.level;
+    serializeSkeletonChunkData(this, msg, transfers);
+    freeSkeletonChunkSystemMemory(this);
+  }
+
+  downloadSucceeded() {
+    this.systemMemoryBytes = this.gpuMemoryBytes =
+      this.indices!.byteLength + getVertexAttributeBytes(this);
+    super.downloadSucceeded();
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export interface MultiscaleSkeletonSource {
+  // TODO: Move this declaration to class definition below and declare abstract once
+  // TypeScript supports mixins with abstract classes.
+  downloadFragment(
+    chunk: MultiscaleSkeletonFragmentChunk,
+    signal: AbortSignal,
+  ): Promise<void>;
+}
+
+/**
+ * Object-keyed, multi-resolution skeleton source: a two-tier chunk model
+ * (manifest chunk describing per-level presence/extent, fragment chunks
+ * holding one level's aggregated geometry) mirroring
+ * `MultiscaleMeshSource`/`MultiscaleFragmentSource` in `src/mesh/backend.ts`.
+ * Data-source-agnostic — concrete subclasses (e.g. zarr-vectors) implement
+ * `downloadFragment`/manifest-chunk `download`.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
+export class MultiscaleSkeletonSource extends ChunkSource {
+  declare chunks: Map<string, MultiscaleSkeletonManifestChunk>;
+  fragmentSource: MultiscaleSkeletonFragmentSource;
+
+  constructor(rpc: RPC, options: any) {
+    super(rpc, options);
+    const fragmentSource = (this.fragmentSource = this.registerDisposer(
+      rpc.getRef<MultiscaleSkeletonFragmentSource>(options.fragmentSource),
+    ));
+    fragmentSource.meshSource = this;
+  }
+
+  getChunk(objectId: bigint) {
+    const key = getObjectKey(objectId);
+    let chunk = this.chunks.get(key);
+    if (chunk === undefined) {
+      chunk = this.getNewChunk_(MultiscaleSkeletonManifestChunk);
+      chunk.initializeManifestChunk(key, objectId);
+      this.addChunk(chunk);
+    }
+    return chunk;
+  }
+
+  getFragmentChunk(
+    manifestChunk: MultiscaleSkeletonManifestChunk,
+    level: number,
+  ) {
+    const key = `${manifestChunk.key}/${level}`;
+    const fragmentSource = this.fragmentSource;
+    let chunk = fragmentSource.chunks.get(
+      key,
+    ) as MultiscaleSkeletonFragmentChunk;
+    if (chunk === undefined) {
+      chunk = fragmentSource.getNewChunk_(MultiscaleSkeletonFragmentChunk);
+      chunk.initialize(key);
+      chunk.level = level;
+      chunk.manifestChunk = manifestChunk;
+      fragmentSource.addChunk(chunk);
+    }
+    return chunk;
+  }
+}
+
+@registerSharedObject(MULTISCALE_SKELETON_FRAGMENT_SOURCE_RPC_ID)
+export class MultiscaleSkeletonFragmentSource extends ChunkSource {
+  declare chunks: Map<string, MultiscaleSkeletonFragmentChunk>;
+  meshSource: MultiscaleSkeletonSource | null = null;
+  download(chunk: MultiscaleSkeletonFragmentChunk, signal: AbortSignal) {
+    return this.meshSource!.downloadFragment(chunk, signal);
+  }
+}
+
+@registerSharedObject(MULTISCALE_SKELETON_LAYER_RPC_ID)
+export class MultiscaleSkeletonRenderLayerBackend extends withSegmentationLayerBackendState(
+  withSharedVisibility(withChunkManager(RenderLayerBackend)),
+) {
+  source: MultiscaleSkeletonSource;
+  /**
+   * Real-world (meters) target resolution, shared with pass-1's
+   * identically named `skeletonGridResolutionTarget3d` control. Compared
+   * directly against each manifest chunk's `levelSpacings` (also in
+   * meters) to pick the target level — no camera/display-space dependency
+   * (an object-keyed source has no natural screen footprint, and working
+   * in real-world units keeps the target consistent with the widget
+   * axis/slider and with pass-1).
+   */
+  skeletonGridResolutionTarget3d: SharedWatchableValue<number>;
+
+  constructor(rpc: RPC, options: any) {
+    super(rpc, options);
+    this.source = this.registerDisposer(
+      rpc.getRef<MultiscaleSkeletonSource>(options.source),
+    );
+    this.skeletonGridResolutionTarget3d = rpc.get(
+      options.skeletonGridResolutionTarget3d,
+    );
+    this.registerDisposer(
+      this.skeletonGridResolutionTarget3d.changed.add(() =>
+        this.chunkManager.scheduleUpdateChunkPriorities(),
+      ),
+    );
+    this.registerDisposer(
+      this.chunkManager.recomputeChunkPriorities.add(() => {
+        this.updateChunkPriorities();
+      }),
+    );
+  }
+
+  attach(attachment: RenderLayerBackendAttachment<RenderedViewBackend>) {
+    const scheduleUpdateChunkPriorities = () =>
+      this.chunkManager.scheduleUpdateChunkPriorities();
+    const { view } = attachment;
+    attachment.registerDisposer(
+      view.projectionParameters.changed.add(scheduleUpdateChunkPriorities),
+    );
+    attachment.registerDisposer(
+      view.visibility.changed.add(scheduleUpdateChunkPriorities),
+    );
+    attachment.registerDisposer(scheduleUpdateChunkPriorities);
+    scheduleUpdateChunkPriorities();
+  }
+
+  private updateChunkPriorities() {
+    const maxVisibility = this.visibility.value;
+    if (maxVisibility === Number.NEGATIVE_INFINITY) {
+      return;
+    }
+    const manifestChunks = new Array<MultiscaleSkeletonManifestChunk>();
+    this.chunkManager.registerLayer(this);
+    {
+      const priorityTier = getPriorityTier(maxVisibility);
+      const basePriority = getBasePriority(maxVisibility);
+      const { source, chunkManager } = this;
+      forEachVisibleSegment(this, (objectId) => {
+        const manifestChunk = source.getChunk(objectId);
+        ++this.numVisibleChunksNeeded;
+        chunkManager.requestChunk(
+          manifestChunk,
+          priorityTier,
+          basePriority + MULTISCALE_SKELETON_MANIFEST_CHUNK_PRIORITY,
+        );
+        const state = manifestChunk.state;
+        if (
+          state === ChunkState.SYSTEM_MEMORY_WORKER ||
+          state === ChunkState.SYSTEM_MEMORY ||
+          state === ChunkState.GPU_MEMORY
+        ) {
+          ++this.numVisibleChunksAvailable;
+          if (manifestChunk.presentLevels !== null) {
+            manifestChunks.push(manifestChunk);
+          }
+        }
+      });
+    }
+    if (manifestChunks.length === 0) return;
+    // `skeletonGridResolutionTarget3d` is a real-world (meters) target,
+    // independent of camera position, and `levelSpacings` is already in
+    // real-world meters (the concrete source populates it from the
+    // store's declared scale — see `MultiscaleSkeletonManifestChunk
+    // .levelSpacings`), so the target level is the same for every attached
+    // view and depends on no camera/display state. Compute it once per
+    // manifest chunk.
+    const targetSpacingMeters = this.skeletonGridResolutionTarget3d.value;
+    const { source, chunkManager } = this;
+    for (const manifestChunk of manifestChunks) {
+      const presentLevels = manifestChunk.presentLevels!;
+      const { levelSpacings } = manifestChunk;
+      if (levelSpacings === null) continue;
+      const target = pickTargetLevelByScreenSize(
+        levelSpacings,
+        targetSpacingMeters,
+      );
+      const targetActualLevel = pickFinestPresentLevelAtOrBelow(
+        presentLevels,
+        target,
+      );
+      if (targetActualLevel === undefined) continue;
+      let coarsestPresentLevel = targetActualLevel;
+      for (let level = presentLevels.length - 1; level >= 0; --level) {
+        if (presentLevels[level]) {
+          coarsestPresentLevel = level;
+          break;
+        }
+      }
+      for (const { view } of this.attachments.values()) {
+        const visibility = view.visibility.value;
+        if (visibility === Number.NEGATIVE_INFINITY) {
+          continue;
+        }
+        const priorityTier = getPriorityTier(visibility);
+        const basePriority = getBasePriority(visibility);
+        for (
+          let level = targetActualLevel;
+          level <= coarsestPresentLevel;
+          ++level
+        ) {
+          if (!presentLevels[level]) continue;
+          const fragmentChunk = source.getFragmentChunk(manifestChunk, level);
+          ++this.numVisibleChunksNeeded;
+          chunkManager.requestChunk(
+            fragmentChunk,
+            priorityTier,
+            basePriority +
+              MULTISCALE_SKELETON_FRAGMENT_CHUNK_PRIORITY -
+              coarsestPresentLevel +
+              level,
+          );
+          if (fragmentChunk.state === ChunkState.GPU_MEMORY) {
+            ++this.numVisibleChunksAvailable;
+          }
+        }
+      }
+    }
   }
 }
 

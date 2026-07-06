@@ -45,6 +45,7 @@ import type { SingleMeshSource } from "#src/single_mesh/frontend.js";
 import type {
   SkeletonSource,
   SpatiallyIndexedSkeletonSource,
+  MultiscaleSkeletonSource,
   MultiscaleSpatiallyIndexedSkeletonSource,
 } from "#src/skeleton/frontend.js";
 import type { MultiscaleVolumeChunkSource } from "#src/sliceview/volume/frontend.js";
@@ -134,7 +135,8 @@ export interface DataSubsource {
     | MultiscaleMeshSource
     | SkeletonSource
     | SpatiallyIndexedSkeletonSource
-    | MultiscaleSpatiallyIndexedSkeletonSource;
+    | MultiscaleSpatiallyIndexedSkeletonSource
+    | MultiscaleSkeletonSource;
   annotation?: MultiscaleAnnotationSource;
   staticAnnotations?: AnnotationSource;
   local?: LocalDataSource;

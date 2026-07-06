@@ -46,10 +46,12 @@ import type {
 import {
   ZarrVectorsAnnotationSourceParameters,
   ZarrVectorsAnnotationSpatialIndexSourceParameters,
+  ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters,
   ZarrVectorsObjectKeyedSkeletonSourceParameters,
   ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
 } from "#src/datasource/zarr-vectors/base.js";
 import {
+  ZarrVectorsMultiscaleObjectKeyedSkeletonSource,
   ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource,
   ZarrVectorsObjectKeyedSkeletonSource,
 } from "#src/datasource/zarr-vectors/skeleton_frontend.js";
@@ -1093,6 +1095,15 @@ interface SkeletonMetadata {
   /** Parameters for the per-segment (pass-2) chunk source. */
   pass2Params: ZarrVectorsObjectKeyedSkeletonSourceParameters;
   /**
+   * Parameters for the multi-resolution per-segment (pass-2) chunk
+   * source — built alongside `pass2Params` only for genuinely
+   * multi-level 3D stores (`rank === 3` and more than one pyramid
+   * level). When present, `getSkeletonDataSource` uses this instead of
+   * `pass2Params` for the `"skeleton"` subsource; single-level/non-3D
+   * stores keep using the plain single-level source unchanged.
+   */
+  pass2MultiParams?: ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters;
+  /**
    * Per-object attributes assembled into a neuroglancer
    * `SegmentPropertyMap`.  `undefined` when the store has no
    * `object_attributes/` at level 0.  Exposed by
@@ -1344,6 +1355,9 @@ async function buildSkeletonMetadata(
         parameters: ZarrVectorsSpatiallyIndexedSkeletonSourceParameters;
       }>
     | undefined;
+  let pass2MultiParams:
+    | ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters
+    | undefined;
   let spatialGrid:
     | {
         perLevelChunkShape: Float32Array[];
@@ -1373,42 +1387,56 @@ async function buildSkeletonMetadata(
     // per-level chunk_shape override and arrays_present list.  Reuses
     // kvstore caching: the same files are read again below by the
     // chunk-source download path with zero net traffic.
-    const perLevelMeta: { chunkShape: Float32Array; hasFragmentSegmentIds: boolean }[] =
-      await Promise.all(
-        levelPaths.map(async (levelPath) => {
-          const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
-            pipelineUrlJoin(storeUrl, levelPath),
-          );
-          try {
-            const levelJson = await getJsonResource(
-              sharedKvStoreContext,
-              joinBaseUrlAndPath(levelUrl, "zarr.json"),
-              `zarr-vectors level ${JSON.stringify(levelPath)} metadata`,
-              options,
-            );
-            const lvlAttrs = levelJson?.attributes?.zarr_vectors_level ?? {};
-            const override = lvlAttrs?.chunk_shape;
-            const chunkShape =
-              Array.isArray(override) && override.length === rank
-                ? (() => {
-                    const arr = new Float32Array(rank);
-                    for (let i = 0; i < rank; ++i) arr[i] = Number(override[i]);
-                    return arr;
-                  })()
-                : new Float32Array(rootChunkShapeF32);
-            const arraysPresent: string[] = Array.isArray(lvlAttrs?.arrays_present)
-              ? lvlAttrs.arrays_present
-              : [];
-            // When arrays_present is not stamped (older stores), assume present.
-            const hasFragmentSegmentIds =
-              arraysPresent.length === 0 || arraysPresent.includes("fragment_attributes");
-            return { chunkShape, hasFragmentSegmentIds };
-          } catch {
-            // fall through to defaults
-          }
-          return { chunkShape: new Float32Array(rootChunkShapeF32), hasFragmentSegmentIds: true };
-        }),
-      );
+    const perLevelMeta: {
+      chunkShape: Float32Array;
+      hasFragmentSegmentIds: boolean;
+      verticesRangeAddressable: boolean;
+    }[] = await Promise.all(
+      levelPaths.map(async (levelPath) => {
+        const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
+          pipelineUrlJoin(storeUrl, levelPath),
+        );
+        // The `vertices_layout` capability is stamped on the `vertices`
+        // array's own metadata (see zarr-vectors-py `create_vertices_array`),
+        // so read it alongside the level metadata. `"raw_v1"` means the
+        // `vertices` chunk blobs are uncompressed and byte-range-addressable
+        // per fragment (`rowIndex * rank * 4`), enabling pass-2 scoped reads.
+        const [levelJson, verticesJson] = await Promise.all([
+          getJsonResource(
+            sharedKvStoreContext,
+            joinBaseUrlAndPath(levelUrl, "zarr.json"),
+            `zarr-vectors level ${JSON.stringify(levelPath)} metadata`,
+            options,
+          ).catch(() => undefined),
+          getJsonResource(
+            sharedKvStoreContext,
+            joinBaseUrlAndPath(levelUrl, "vertices/zarr.json"),
+            `zarr-vectors level ${JSON.stringify(levelPath)} vertices metadata`,
+            options,
+          ).catch(() => undefined),
+        ]);
+        const lvlAttrs = levelJson?.attributes?.zarr_vectors_level ?? {};
+        const override = lvlAttrs?.chunk_shape;
+        const chunkShape =
+          Array.isArray(override) && override.length === rank
+            ? (() => {
+                const arr = new Float32Array(rank);
+                for (let i = 0; i < rank; ++i) arr[i] = Number(override[i]);
+                return arr;
+              })()
+            : new Float32Array(rootChunkShapeF32);
+        const arraysPresent: string[] = Array.isArray(lvlAttrs?.arrays_present)
+          ? lvlAttrs.arrays_present
+          : [];
+        // When arrays_present is not stamped (older stores), assume present.
+        const hasFragmentSegmentIds =
+          arraysPresent.length === 0 ||
+          arraysPresent.includes("fragment_attributes");
+        const verticesRangeAddressable =
+          verticesJson?.attributes?.vertices_layout === "raw_v1";
+        return { chunkShape, hasFragmentSegmentIds, verticesRangeAddressable };
+      }),
+    );
     const perLevelChunkShape = perLevelMeta.map((m) => m.chunkShape);
 
     // Per-level parameter blobs.  Each level gets its own chunkShape
@@ -1443,6 +1471,33 @@ async function buildSkeletonMetadata(
     }
 
     pass1Levels = levels;
+
+    // Multi-resolution pass-2 (object-keyed) wiring — only for genuinely
+    // multi-level stores; a single-level 3D store has nothing to pick a
+    // level between, so it keeps using the plain `pass2Params` below.
+    // Reuses `perLevelMeta`/`levelPaths` (already fetched above for
+    // pass-1) — zero extra network round-trips.
+    if (levelPaths.length > 1) {
+      const multiParams =
+        new ZarrVectorsMultiscaleObjectKeyedSkeletonSourceParameters();
+      multiParams.levels = levelPaths.map((levelPath, k) => ({
+        baseUrl: kvstoreEnsureDirectoryPipelineUrl(
+          pipelineUrlJoin(storeUrl, levelPath),
+        ),
+        hasFragmentSegmentIds: perLevelMeta[k].hasFragmentSegmentIds,
+        chunkShape: Array.from(perLevelMeta[k].chunkShape),
+        verticesRangeAddressable: perLevelMeta[k].verticesRangeAddressable,
+      }));
+      multiParams.rank = rank;
+      multiParams.attributeNames = attributeNames;
+      multiParams.attributeDtypes = attributeDtypes;
+      multiParams.linksConvention = linksConvention;
+      multiParams.geometryKind = geometryKind;
+      multiParams.linkDtype = linkDtype;
+      multiParams.metersPerUnit = Array.from(coordinateSpace.scales);
+      pass2MultiParams = multiParams;
+    }
+
     spatialGrid = {
       perLevelChunkShape,
       lowerBounds: lowerBoundsF32,
@@ -1452,6 +1507,9 @@ async function buildSkeletonMetadata(
     // the fragment_attributes/segment_id fetch.  Overrides the default-true
     // placeholder set above.
     pass2Params.hasFragmentSegmentIds = perLevelMeta[0].hasFragmentSegmentIds;
+    // Single-level pass-2: gate scoped range reads on level 0's layout.
+    pass2Params.verticesRangeAddressable =
+      perLevelMeta[0].verticesRangeAddressable;
   }
 
   // Discover per-object attributes at level 0 and build the
@@ -1479,6 +1537,7 @@ async function buildSkeletonMetadata(
     coordinateSpace,
     translation: extractNgffTranslation(rootAttrs.multiscales, rank),
     pass2Params,
+    pass2MultiParams,
     pass1Levels,
     spatialGrid,
     segmentPropertyMap,
@@ -1541,17 +1600,31 @@ function getSkeletonDataSource(
   // standard subsource toggle lets the user enable it when they want the
   // visible-segments-set to drive a second render layer drawn on top of
   // pass 1.  Matches catmaid's default-flag convention.
+  //
+  // Multi-level 3D stores get the multi-resolution source (picks a
+  // pyramid level per selected segment by on-screen size, same as pass-1);
+  // single-level/non-3D stores fall back to the plain single-level source,
+  // completely unchanged.
   subsources.push({
     id: "skeleton",
     default: false,
     subsource: {
-      mesh: sharedKvStoreContext.chunkManager.getChunkSource(
-        ZarrVectorsObjectKeyedSkeletonSource,
-        {
-          sharedKvStoreContext,
-          parameters: metadata.pass2Params,
-        },
-      ),
+      mesh:
+        metadata.pass2MultiParams !== undefined
+          ? sharedKvStoreContext.chunkManager.getChunkSource(
+              ZarrVectorsMultiscaleObjectKeyedSkeletonSource,
+              {
+                sharedKvStoreContext,
+                parameters: metadata.pass2MultiParams,
+              },
+            )
+          : sharedKvStoreContext.chunkManager.getChunkSource(
+              ZarrVectorsObjectKeyedSkeletonSource,
+              {
+                sharedKvStoreContext,
+                parameters: metadata.pass2Params,
+              },
+            ),
     },
   });
 

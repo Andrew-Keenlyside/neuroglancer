@@ -31,7 +31,9 @@ import type {
 } from "#src/datasource/zarr-vectors/skeleton_chunk.js";
 import {
   downloadSkeletonChunk,
+  downloadSkeletonChunkScoped,
   type AttributeDtype,
+  type KvStoreReadRange,
   type LinkDtype,
 } from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
 
@@ -178,11 +180,39 @@ export interface DownloadSegmentSkeletonOptions {
    * ``linkWidth !== 2`` are ignored — they're for meshes / metanode
    * pyramids, not streamlines.
    *
-   * Pass-2 callers (the segment-keyed backend) should fetch this table
-   * once per level via {@link readCrossChunkLinks} and share it across
-   * objects.
+   * Prefer {@link queryCrossChunkLinksForChunks} for ``implicit_sequential``
+   * (streamline/polyline) stores — a real dataset's whole-level table can
+   * be tens of millions of records / multiple gigabytes, and decoding it
+   * just to resolve one object's handful of cross-chunk edges can OOM the
+   * tab. This field remains for callers that already have a cheap
+   * pre-fetched table (e.g. graphs/skeletons, or tests).
    */
   readonly crossChunkLinks?: CrossChunkLinksTable;
+  /**
+   * Scoped alternative to {@link crossChunkLinks}: given the list of
+   * chunk-coordinate keys the object's manifest actually touches (known
+   * only after the manifest walk completes), returns a table containing
+   * just the records incident on those chunks — via
+   * {@link readCrossChunkLinksForChunk} per chunk, sharing one
+   * shard-discovery/byte cache across the whole query and across every
+   * object download for the level. Checked only when
+   * {@link crossChunkLinks} is not supplied.
+   */
+  readonly queryCrossChunkLinksForChunks?: (
+    chunkCoordsList: readonly (readonly number[])[],
+    signal: AbortSignal,
+  ) => Promise<CrossChunkLinksTable | undefined>;
+  /**
+   * Optional byte-range reader. When supplied (and `linksConvention ===
+   * "implicit_sequential"`), each chunk is fetched via
+   * {@link downloadSkeletonChunkScoped} — reading only the selected
+   * object's fragments' vertices/attributes from the (uncompressed,
+   * `raw`-encoded) `vertices`/`vertex_attributes` arrays, instead of the
+   * whole chunk. The backend should only pass this when the level's
+   * kvstore supports offset reads; a missing/failed range read for a
+   * given block falls back to the whole-chunk {@link downloadSkeletonChunk}.
+   */
+  readonly kvStoreReadRange?: KvStoreReadRange;
   /** Whether to fetch `fragment_attributes/segment_id` per chunk. */
   readonly hasFragmentSegmentIds?: boolean;
 }
@@ -229,10 +259,19 @@ export interface OrderedManifestBlock {
 
 /**
  * Pure helper for the ``implicit_sequential`` inter-fragment bridge
- * path.  Walks the manifest-ordered blocks pairwise; for **every**
- * consecutive pair emits one edge bridging fragment k's last vertex
- * with fragment k+1's first vertex (both translated to the merged-
- * output vertex index space).
+ * *fallback* path — used only when no cross_chunk_links-derived edges
+ * were available (see the call site in `downloadSegmentSkeleton`).
+ * Walks the manifest-ordered blocks pairwise; for **every** consecutive
+ * pair emits one edge bridging fragment k's last vertex with fragment
+ * k+1's first vertex (both translated to the merged-output vertex index
+ * space).
+ *
+ * Correct only when manifest order matches true path order. Guaranteed
+ * for a store's source (finest) level, written directly by the ingest
+ * pipeline in walk order — NOT guaranteed for a coarsened level: the
+ * zarr-vectors-tools pyramid coarsener's per-object manifests are sorted
+ * by chunk coordinate, not path order, so this function can bridge two
+ * physically distant blocks that happen to be adjacent post-sort.
  *
  * Bridges connect *consecutive fragments*, not just *cross-chunk*
  * transitions.  Streamlines are partitioned by zarr-vectors' bin grid
@@ -330,6 +369,8 @@ export async function downloadSegmentSkeleton(
     linksConvention,
     geometryKind,
     crossChunkLinks,
+    queryCrossChunkLinksForChunks,
+    kvStoreReadRange,
     hasFragmentSegmentIds,
   } = options;
   const manifest = await readObjectManifest(oid, manifestReader, signal);
@@ -353,14 +394,18 @@ export async function downloadSegmentSkeleton(
   // path (graphs / skeletons with explicit links).  Keyed by chunk so
   // an arbitrary cross-chunk record can find the relevant remap.
   const ownedChunks = new Map<string, OwnedChunkInfo>();
+  // Distinct chunk-coords this object's manifest touches, in first-seen
+  // order — fed to `queryCrossChunkLinksForChunks` once the walk below
+  // completes, so the caller can scope its cross_chunk_links query to
+  // just these chunks instead of decoding a whole level.
+  const ownedChunkCoordsList: number[][] = [];
+  const seenChunkKeys = new Set<string>();
   // Per-block bookkeeping, in manifest order.  Drives the
-  // implicit_sequential cross-chunk path: consecutive blocks in
-  // different chunks emit one bridging edge (last vertex of fragment k →
-  // first vertex of fragment k+1).  See zarr-vectors-py
-  // ``polylines.py:325``: the on-disk cross_chunk_links table only
-  // records ``((cc_a, 0), (cc_b, 0))`` placeholders for streamlines, so
-  // it carries no fragment-specific endpoint info — we have to
-  // reconstruct edges from manifest order.
+  // implicit_sequential cross-chunk *fallback* path (see
+  // `deriveImplicitSequentialCrossChunkEdges`'s docstring): consecutive
+  // blocks in different chunks emit one bridging edge (last vertex of
+  // fragment k → first vertex of fragment k+1). Only used when no
+  // real cross_chunk_links data is available.
   interface OrderedBlock extends OwnedChunkInfo {
     readonly chunkKey: string;
     /** Chunk-local index of the first vertex of this block's single
@@ -377,23 +422,41 @@ export async function downloadSegmentSkeleton(
 
   for (const block of manifest) {
     const chunkKey = block.chunkCoords.join(".");
-    const skel = await downloadSkeletonChunk(
-      {
-        chunkKey,
-        rank,
-        linkDtype,
-        attributeNames,
-        attributeDtypes,
-        linksConvention,
-        geometryKind,
-        hasFragmentSegmentIds,
-        kvStoreRead: manifestReader.kvStoreRead,
-      },
-      signal,
-    );
+    // Resolve owned fragments first — the scoped reader needs them to
+    // range-read only this object's vertices instead of the whole chunk.
+    const fragmentIds = resolveFragmentRef(block.fragmentRef);
+    const wholeChunkOptions = {
+      chunkKey,
+      rank,
+      linkDtype,
+      attributeNames,
+      attributeDtypes,
+      linksConvention,
+      geometryKind,
+      hasFragmentSegmentIds,
+      kvStoreRead: manifestReader.kvStoreRead,
+    };
+    let skel: SkeletonChunk | undefined;
+    if (
+      kvStoreReadRange !== undefined &&
+      linksConvention === "implicit_sequential"
+    ) {
+      try {
+        skel = await downloadSkeletonChunkScoped(
+          { ...wholeChunkOptions, kvStoreReadRange, restrictToFragments: fragmentIds },
+          signal,
+        );
+      } catch {
+        // A range read that came back the wrong length (a store that
+        // silently ignored the request) throws — fall back to the whole-
+        // chunk read for this block so rendering still succeeds.
+        skel = await downloadSkeletonChunk(wholeChunkOptions, signal);
+      }
+    } else {
+      skel = await downloadSkeletonChunk(wholeChunkOptions, signal);
+    }
     if (skel === undefined) continue;
 
-    const fragmentIds = resolveFragmentRef(block.fragmentRef);
     const filtered = filterChunkByFragments(skel, fragmentIds);
     if (filtered.positions.length === 0) continue;
 
@@ -420,6 +483,10 @@ export async function downloadSegmentSkeleton(
     // either way; the manifest-driven path uses `orderedBlocks` (which
     // does preserve all visits).
     ownedChunks.set(chunkKey, info);
+    if (!seenChunkKeys.has(chunkKey)) {
+      seenChunkKeys.add(chunkKey);
+      ownedChunkCoordsList.push(block.chunkCoords);
+    }
     orderedBlocks.push({
       ...info,
       chunkKey,
@@ -455,27 +522,51 @@ export async function downloadSegmentSkeleton(
 
   // Inter-fragment bridge reconstruction.  Two strategies:
   //
-  //  - implicit_sequential (polylines / streamlines): walk
-  //    `orderedBlocks` pairwise; emit one edge per consecutive pair,
-  //    connecting fragment k's last vertex to fragment k+1's first
-  //    vertex.  Bridges are needed for both chunk-to-chunk transitions
-  //    AND for bin-to-bin transitions within one chunk — zarr-vectors
-  //    partitions streamlines by `bin_shape`, so one streamline can
-  //    produce multiple same-chunk fragments.  The on-disk
-  //    cross_chunk_links blob for these stores carries no usable
-  //    endpoint info (its `vi` values are literal `0` placeholders;
-  //    see zarr-vectors-py polylines.py:325).
+  //  - Preferred, whenever the on-disk cross_chunk_links blob exists and
+  //    yields edges: the blob-based filter on `ownedChunks`
+  //    (`collectOwnedCrossChunkEdges`), using real chunk-local vertex
+  //    indices for each endpoint. This is what `explicit` /
+  //    `implicit_sequential_with_branches` (graphs, skeletons) always
+  //    used; `implicit_sequential` (polylines/streamlines) now prefers
+  //    it too — the current writer (zarr-vectors-py's
+  //    `types/polylines.py`) stores real endpoints for cross-chunk
+  //    transitions, not placeholders (an earlier revision of this
+  //    comment claimed otherwise, based on stale information).
   //
-  //  - explicit / implicit_sequential_with_branches (graphs, skeletons):
-  //    the on-disk cross_chunk_links blob carries real chunk-local
-  //    vertex indices for each endpoint.  Use the blob-based filter on
-  //    `ownedChunks`.
+  //  - Fallback, only when no usable blob-based edges were found (older
+  //    writer, or a store that genuinely never recorded real endpoints
+  //    for this convention): walk `orderedBlocks` pairwise; emit one
+  //    edge per consecutive pair, connecting fragment k's last vertex to
+  //    fragment k+1's first vertex. This is `implicit_sequential`-only —
+  //    `deriveImplicitSequentialCrossChunkEdges` assumes manifest order
+  //    equals path order, which the source-level writer guarantees but a
+  //    multi-resolution pyramid's coarsened levels do NOT: the coarsener
+  //    (`zarr_vectors_tools`'s `_reduce_object_index_shard`, shared by
+  //    the polyline and skeleton coarseners) sorts each object's
+  //    per-level manifest blocks by chunk coordinate, not path order, so
+  //    this reconstruction can bridge two blocks that are adjacent in
+  //    the (re-sorted) manifest but nowhere near each other on the
+  //    actual path — producing a long spurious "ghost" edge. Prefer the
+  //    blob-based path above whenever possible; this fallback exists for
+  //    compatibility with stores lacking real link data at all.
   let crossChunkEdges: Uint32Array | undefined;
-  if (linksConvention === "implicit_sequential") {
-    const edges = deriveImplicitSequentialCrossChunkEdges(orderedBlocks);
+  let resolvedCrossChunkLinks = crossChunkLinks;
+  if (
+    resolvedCrossChunkLinks === undefined &&
+    queryCrossChunkLinksForChunks !== undefined &&
+    ownedChunkCoordsList.length > 0
+  ) {
+    resolvedCrossChunkLinks = await queryCrossChunkLinksForChunks(
+      ownedChunkCoordsList,
+      signal,
+    );
+  }
+  if (resolvedCrossChunkLinks !== undefined && ownedChunks.size > 0) {
+    const edges = collectOwnedCrossChunkEdges(resolvedCrossChunkLinks, ownedChunks);
     if (edges.length > 0) crossChunkEdges = edges;
-  } else if (crossChunkLinks !== undefined && ownedChunks.size > 0) {
-    const edges = collectOwnedCrossChunkEdges(crossChunkLinks, ownedChunks);
+  }
+  if (crossChunkEdges === undefined && linksConvention === "implicit_sequential") {
+    const edges = deriveImplicitSequentialCrossChunkEdges(orderedBlocks);
     if (edges.length > 0) crossChunkEdges = edges;
   }
 
