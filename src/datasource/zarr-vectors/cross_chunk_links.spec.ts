@@ -13,6 +13,7 @@ import {
   decodeVlenBytesSingleItem,
   readCrossChunkLinks,
   readCrossChunkLinksForChunk,
+  readCrossChunkLinksForOwnedChunks,
   type CrossChunkLinksListResult,
 } from "#src/datasource/zarr-vectors/cross_chunk_links.js";
 
@@ -721,5 +722,111 @@ describe("BoundedByteCache", () => {
     expect(cache.get("a")).toBeDefined();
     expect(cache.get("b")).toBeUndefined();
     expect(cache.get("c")).toBeDefined();
+  });
+});
+
+describe("readCrossChunkLinksForOwnedChunks (go-direct)", () => {
+  const K2_META = {
+    attributes: {
+      zv_array: "cross_chunk_links_k",
+      level_delta: 0,
+      K: 2,
+      sid_ndim: 3,
+      link_width: 2,
+      shard_shape: [1, 1, 1, 1, 1, 1],
+      chunk_origin: [0, 0, 0],
+    },
+    codecs: [
+      {
+        name: "sharding_indexed",
+        configuration: {
+          chunk_shape: [1, 1, 1, 1, 1, 1],
+          codecs: [{ name: "vlen-bytes" }, { name: "zstd" }],
+          index_codecs: [{ name: "bytes" }, { name: "crc32c" }],
+          index_location: "end",
+        },
+      },
+    ],
+  };
+
+  // The end-to-end fixture's populated cell is at grid (0,0,0, 1,0,0) =
+  // chunks [(0,0,0), (1,0,0)], holding two records.
+  const SHARD_PATH = "cross_chunk_links/0/k2/c/0/0/0/1/0/0";
+
+  function makeStore() {
+    const reads: string[] = [];
+    const listPrefixes: string[] = [];
+    const shard = buildMinimalShard(hexBytes(ZSTD_CELL_HEX));
+    const kvStoreRead = async (subpath: string) => {
+      reads.push(subpath);
+      if (subpath === "cross_chunk_links/0/zarr.json") {
+        return jsonBytes({
+          attributes: { link_width: 2, sid_ndim: 3, layout: "sharded_v1" },
+        });
+      }
+      if (subpath === "cross_chunk_links/0/k1/zarr.json") return undefined;
+      if (subpath === "cross_chunk_links/0/k2/zarr.json") {
+        return jsonBytes(K2_META);
+      }
+      if (subpath === SHARD_PATH) return shard;
+      return undefined;
+    };
+    const kvStoreList = async (prefix: string): Promise<CrossChunkLinksListResult> => {
+      listPrefixes.push(prefix); // must never be called by go-direct
+      return { directories: [], files: [] };
+    };
+    return { kvStoreRead, kvStoreList, reads, listPrefixes };
+  }
+
+  it("reads the owned pair's cell directly, with NO directory listing", async () => {
+    const { kvStoreRead, kvStoreList, listPrefixes } = makeStore();
+    const table = await readCrossChunkLinksForOwnedChunks(
+      { kvStoreRead, kvStoreList },
+      [
+        [0, 0, 0],
+        [1, 0, 0],
+      ],
+      createCrossChunkLinksCaches(),
+      new AbortController().signal,
+    );
+    expect(table).toBeDefined();
+    expect(table!.records).toHaveLength(2);
+    expect(table!.records[0].endpoints[0]).toEqual({
+      chunkCoords: [0, 0, 0],
+      vertexIndex: 7,
+    });
+    // Go-direct computes the shard coordinate from the owned pair — it must
+    // never walk the chunk-key directory tree.
+    expect(listPrefixes).toEqual([]);
+  });
+
+  it("skips cells whose partner chunk is not owned (no read, empty result)", async () => {
+    const { kvStoreRead, kvStoreList, reads } = makeStore();
+    // Only (0,0,0) owned: with K=2 there is no owned-owned pair, so no
+    // candidate cell -> no shard read at all.
+    const table = await readCrossChunkLinksForOwnedChunks(
+      { kvStoreRead, kvStoreList },
+      [[0, 0, 0]],
+      createCrossChunkLinksCaches(),
+      new AbortController().signal,
+    );
+    expect(table!.records).toEqual([]);
+    expect(reads).not.toContain(SHARD_PATH);
+  });
+
+  it("caches the header across queries (no repeated zarr.json / k1 404)", async () => {
+    const { kvStoreRead, kvStoreList, reads } = makeStore();
+    const caches = createCrossChunkLinksCaches();
+    const owned = [
+      [0, 0, 0],
+      [1, 0, 0],
+    ];
+    const signal = new AbortController().signal;
+    await readCrossChunkLinksForOwnedChunks({ kvStoreRead, kvStoreList }, owned, caches, signal);
+    await readCrossChunkLinksForOwnedChunks({ kvStoreRead, kvStoreList }, owned, caches, signal);
+    // group + k1 (404) + k2 zarr.json each fetched exactly once across both queries.
+    expect(reads.filter((r) => r === "cross_chunk_links/0/zarr.json")).toHaveLength(1);
+    expect(reads.filter((r) => r === "cross_chunk_links/0/k1/zarr.json")).toHaveLength(1);
+    expect(reads.filter((r) => r === "cross_chunk_links/0/k2/zarr.json")).toHaveLength(1);
   });
 });

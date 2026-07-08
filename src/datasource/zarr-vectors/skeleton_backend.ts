@@ -39,6 +39,7 @@ import {
   createCrossChunkLinksCaches,
   readCrossChunkLinks,
   readCrossChunkLinksForChunk,
+  readCrossChunkLinksForOwnedChunks,
   type CrossChunkLinksCaches,
   type CrossChunkLinksTable,
 } from "#src/datasource/zarr-vectors/cross_chunk_links.js";
@@ -745,8 +746,17 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
    */
   private crossChunkLinksCaches_: CrossChunkLinksCaches | false | undefined;
 
-  private async getCrossChunkLinksForChunk(
-    targetChunkCoords: readonly number[],
+  /**
+   * Passed to `downloadSegmentSkeleton` as `queryCrossChunkLinksForChunks`
+   * for `implicit_sequential` downloads: reads ONLY the cross-chunk-link
+   * records whose endpoints are all among the object's owned chunks, via
+   * {@link readCrossChunkLinksForOwnedChunks} — direct shard addressing
+   * from the owned-only candidate cells, no per-chunk partner scan and no
+   * directory-listing shard discovery. `collectOwnedCrossChunkEdges` then
+   * filters to the object's owned vertices.
+   */
+  private async queryCrossChunkLinksForChunks(
+    chunkCoordsList: readonly (readonly number[])[],
     kvStoreRead: (
       subpath: string,
       signal: AbortSignal,
@@ -761,9 +771,9 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
     if (this.crossChunkLinksCaches_ === undefined) {
       this.crossChunkLinksCaches_ = createCrossChunkLinksCaches();
     }
-    const table = await readCrossChunkLinksForChunk(
+    const table = await readCrossChunkLinksForOwnedChunks(
       { kvStoreRead, kvStoreList },
-      targetChunkCoords,
+      chunkCoordsList,
       this.crossChunkLinksCaches_,
       signal,
     );
@@ -771,53 +781,6 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       this.crossChunkLinksCaches_ = false;
     }
     return table;
-  }
-
-  /**
-   * Scoped alternative to {@link getCrossChunkLinks}, passed to
-   * `downloadSegmentSkeleton` as `queryCrossChunkLinksForChunks` for
-   * `implicit_sequential` downloads. Queries each of the object's owned
-   * chunks individually (sharing {@link crossChunkLinksCaches_} across
-   * both this call and every other object's downloads for the level)
-   * and merges the results — never decodes more than the records
-   * incident on chunks this specific object actually touches.
-   *
-   * A record whose both endpoints are among the queried chunks is
-   * returned once per matching side and so may appear twice in the
-   * merged table; `collectOwnedCrossChunkEdges` just emits the
-   * (identical) edge twice in that case, which is harmless — cheaper
-   * than deduplicating given how few cross-chunk records one object
-   * has.
-   */
-  private async queryCrossChunkLinksForChunks(
-    chunkCoordsList: readonly (readonly number[])[],
-    kvStoreRead: (
-      subpath: string,
-      signal: AbortSignal,
-    ) => Promise<Uint8Array | undefined>,
-    kvStoreList: (
-      prefix: string,
-      signal: AbortSignal,
-    ) => Promise<{ directories: string[]; files: string[] }>,
-    signal: AbortSignal,
-  ): Promise<CrossChunkLinksTable | undefined> {
-    const records: CrossChunkLinksTable["records"] = [];
-    let linkWidth: number | undefined;
-    let sidNdim: number | undefined;
-    for (const chunkCoords of chunkCoordsList) {
-      const table = await this.getCrossChunkLinksForChunk(
-        chunkCoords,
-        kvStoreRead,
-        kvStoreList,
-        signal,
-      );
-      if (table === undefined) continue;
-      linkWidth = table.linkWidth;
-      sidNdim = table.sidNdim;
-      for (const record of table.records) records.push(record);
-    }
-    if (linkWidth === undefined) return undefined;
-    return { linkWidth, sidNdim: sidNdim!, records };
   }
 
   /**
@@ -1085,43 +1048,11 @@ export class ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend extends WithP
     | undefined
   )[] = [];
 
-  private async getCrossChunkLinksForChunkAtLevel(
-    level: number,
-    targetChunkCoords: readonly number[],
-    kvStoreRead: (
-      subpath: string,
-      signal: AbortSignal,
-    ) => Promise<Uint8Array | undefined>,
-    kvStoreList: (
-      prefix: string,
-      signal: AbortSignal,
-    ) => Promise<{ directories: string[]; files: string[] }>,
-    signal: AbortSignal,
-  ): Promise<CrossChunkLinksTable | undefined> {
-    let caches = this.crossChunkLinksCachesByLevel_[level];
-    if (caches === false) return undefined;
-    if (caches === undefined) {
-      caches = createCrossChunkLinksCaches();
-      this.crossChunkLinksCachesByLevel_[level] = caches;
-    }
-    const table = await readCrossChunkLinksForChunk(
-      { kvStoreRead, kvStoreList },
-      targetChunkCoords,
-      caches,
-      signal,
-    );
-    if (table === undefined) {
-      this.crossChunkLinksCachesByLevel_[level] = false;
-    }
-    return table;
-  }
-
   /**
-   * Scoped alternative to {@link getCrossChunkLinksForLevel}, passed to
-   * `downloadSegmentSkeleton` as `queryCrossChunkLinksForChunks` for
-   * `implicit_sequential` fragment downloads — see
+   * Passed to `downloadSegmentSkeleton` as `queryCrossChunkLinksForChunks`
+   * for `implicit_sequential` fragment downloads — see
    * {@link ZarrVectorsObjectKeyedSkeletonSourceBackend
-   * .queryCrossChunkLinksForChunks}'s docstring (identical merge
+   * .queryCrossChunkLinksForChunks}'s docstring (identical go-direct
    * strategy, just parameterized by level).
    */
   private async queryCrossChunkLinksForChunksAtLevel(
@@ -1137,24 +1068,26 @@ export class ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend extends WithP
     ) => Promise<{ directories: string[]; files: string[] }>,
     signal: AbortSignal,
   ): Promise<CrossChunkLinksTable | undefined> {
-    const records: CrossChunkLinksTable["records"] = [];
-    let linkWidth: number | undefined;
-    let sidNdim: number | undefined;
-    for (const chunkCoords of chunkCoordsList) {
-      const table = await this.getCrossChunkLinksForChunkAtLevel(
-        level,
-        chunkCoords,
-        kvStoreRead,
-        kvStoreList,
-        signal,
-      );
-      if (table === undefined) continue;
-      linkWidth = table.linkWidth;
-      sidNdim = table.sidNdim;
-      for (const record of table.records) records.push(record);
+    // Go-direct: read only the object's owned-owned cells (no per-chunk
+    // partner scan, no directory-listing shard discovery). See
+    // `readCrossChunkLinksForOwnedChunks`.
+    let caches = this.crossChunkLinksCachesByLevel_[level];
+    if (caches === false) return undefined;
+    if (caches === undefined) {
+      caches = createCrossChunkLinksCaches();
+      this.crossChunkLinksCachesByLevel_[level] = caches;
     }
-    if (linkWidth === undefined) return undefined;
-    return { linkWidth, sidNdim: sidNdim!, records };
+    const table = await readCrossChunkLinksForOwnedChunks(
+      { kvStoreRead, kvStoreList },
+      chunkCoordsList,
+      caches,
+      signal,
+    );
+    if (table === undefined) {
+      // No cross_chunk_links group at this level — skip future queries.
+      this.crossChunkLinksCachesByLevel_[level] = false;
+    }
+    return table;
   }
 
   private async resolveObjectIndex(
