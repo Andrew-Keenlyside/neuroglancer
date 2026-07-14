@@ -512,8 +512,20 @@ float getSegmentLookupAlpha(uint64_t segmentId) {
 vec4 getSegmentAppearance(highp uvec2 segmentValue) {
   uint64_t segmentId = getSegmentAppearanceId(segmentValue);
   // Color (incl. saturation + selected highlight) from the segment-color
-  // user shader; visibility-driven alpha from the skeleton renderer.
-  return vec4(segmentColorUserShader(segmentId).rgb, getSegmentLookupAlpha(segmentId));
+  // user shader.
+  vec4 userColor = segmentColorUserShader(segmentId);
+  // Visibility-driven alpha from the skeleton renderer (on/off opacity,
+  // excluded segments).
+  float visibilityAlpha = getSegmentLookupAlpha(segmentId);
+  // The segment-color shader returns alpha < 0 as "no explicit alpha" (the
+  // getMappedIdColor hash default is \`vec4(rgb, -1.0)\`); in that case use the
+  // visibility alpha alone.  When the user returns an explicit alpha from a
+  // \`vec4 segmentColor(...)\` (e.g. \`0.0\` to drop, based on a property or
+  // \`tag()\`), combine it with visibility — an alpha of 0 makes emitRGB/
+  // emitDefault \`discard\` the fragment, dropping that streamline entirely.
+  float alpha =
+      userColor.a < 0.0 ? visibilityAlpha : userColor.a * visibilityAlpha;
+  return vec4(userColor.rgb, alpha);
 }
 // Whether \`segmentId\` is in the layer's pinned "Segment IDs" list
 // (segmentationGroupState.selectedSegments) — stable name for user shader
