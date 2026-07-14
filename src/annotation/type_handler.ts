@@ -42,12 +42,14 @@ import {
   parameterizedEmitterDependentShaderGetter,
   shaderCodeWithLineDirective,
 } from "#src/webgl/dynamic_shader.js";
+import { copyHistogramToCPU } from "#src/webgl/empirical_cdf.js";
 import {
   defineInvlerpShaderFunction,
   enableLerpShaderFunction,
 } from "#src/webgl/lerp.js";
 import type { ShaderModule, ShaderProgram } from "#src/webgl/shader.js";
 import { ShaderBuilder } from "#src/webgl/shader.js";
+import { glsl_string } from "#src/webgl/shader_lib.js";
 import type {
   ShaderControlsBuilderState,
   ShaderControlState,
@@ -443,7 +445,7 @@ float getMaxSubspaceClipCoefficient(float modelPointA[${this.rank}],  float mode
 }
 
 `);
-        addControlsToBuilder(parameters, builder);
+        addControlsToBuilder(parameters, builder, /*fragment=*/ false);
         builder.addVertexCode(`
 const bool PROJECTION_VIEW = ${!this.targetIsSliceView};
 bool ng_discardValue;
@@ -558,6 +560,7 @@ void userMain();
           renderHandler.defineShaderNoOpSetters(builder);
         }
         defineShader(builder);
+        builder.addVertexCode(glsl_string);
         builder.addVertexCode(
           "\n#define main userMain\n" +
             shaderCodeWithLineDirective(parameters.parseResult.code) +
@@ -634,7 +637,7 @@ if (ng_discardValue) {
       gl,
       shader,
       this.shaderControlState,
-      parameters.parseResult.controls,
+      parameters.parseResult,
     );
     gl.uniform3fv(shader.uniform("uSubspaceMatrix"), context.subspaceMatrix);
     gl.uniform1fv(shader.uniform("uModelClipBounds"), context.modelClipBounds);
@@ -774,21 +777,12 @@ gl_PointSize = 1.0;
         }
         gl.drawArrays(WebGL2RenderingContext.POINTS, 0, context.count);
         if (DEBUG_HISTOGRAMS) {
-          const tempBuffer = new Float32Array(256 * 4);
-          gl.readPixels(
-            0,
-            0,
-            256,
-            1,
-            WebGL2RenderingContext.RGBA,
-            WebGL2RenderingContext.FLOAT,
-            tempBuffer,
+          const histogram = copyHistogramToCPU(gl);
+          console.log(
+            "histogram property:",
+            propertyIdentifier,
+            histogram.join(" "),
           );
-          const tempBuffer2 = new Float32Array(256);
-          for (let j = 0; j < 256; ++j) {
-            tempBuffer2[j] = tempBuffer[j * 4];
-          }
-          console.log("histogram", tempBuffer2.join(" "));
         }
         binder.disable();
         break;

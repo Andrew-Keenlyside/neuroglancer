@@ -374,6 +374,9 @@ export class UserLayer extends RefCounted {
   get isReady() {
     return this.loadingCounter === 0;
   }
+  isReadyWatchable: WatchableValueInterface<boolean> = new WatchableValue(
+    false,
+  );
 
   tabs = this.registerDisposer(new TabSpecification());
   panels = new UserLayerSidePanelsState(this);
@@ -389,6 +392,11 @@ export class UserLayer extends RefCounted {
 
   constructor(public managedLayer: Borrowed<ManagedUserLayer>) {
     super();
+    this.registerDisposer(
+      this.readyStateChanged.add(() => {
+        this.isReadyWatchable.value = this.isReady;
+      }),
+    );
     this.toolBinder = this.registerDisposer(
       new LayerToolBinder(this, this.manager.root.toolBinder),
     );

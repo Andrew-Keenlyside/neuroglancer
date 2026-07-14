@@ -15,10 +15,26 @@
  */
 
 import { expect, describe, it } from "vitest";
+import {
+  PreprocessedSegmentPropertyMap,
+  SegmentPropertyMap,
+} from "#src/segmentation_display_state/property_map.js";
+import {
+  constantWatchableValue,
+  WatchableValue,
+} from "#src/trackable_value.js";
 import { DataType } from "#src/util/data_type.js";
 import { vec3, vec4 } from "#src/util/geom.js";
 import { defaultDataTypeRange } from "#src/util/lerp.js";
+import { glsl_string } from "#src/webgl/shader_lib.js";
+import { preprocessStrings } from "#src/webgl/shader_source_string_preprocessing.js";
+import { fragmentShaderTest } from "#src/webgl/shader_testing.js";
 import {
+  addControlsToBuilder,
+  getFallbackBuilderState,
+  setControlsInShader,
+  ShaderControlState,
+  type ShaderDataContext,
   TrackableTransferFunctionParameters,
   parseShaderUiControls,
   parseTransferFunctionParameters,
@@ -29,6 +45,8 @@ import {
   ControlPoint,
   SortedControlPoints,
 } from "#src/widget/transfer_function.js";
+
+const emptyParsePreprocessing = { stringLiteralIds: new Map<string, number>() };
 
 describe("stripComments", () => {
   it("handles code without comments", () => {
@@ -76,6 +94,46 @@ void main() {
   });
 });
 
+describe("preprocessStrings", () => {
+  it("replaces unique string literals with unique non-zero string_t ids", () => {
+    const code = `
+void main() {
+  if (mode == "beta") {
+    emitRGB(vec3(1.0));
+  }
+  if (mode == "alpha") {
+    emitRGB(vec3(0.0));
+  }
+  if (mode == "beta") {
+    emitRGB(vec3(0.5));
+  }
+}
+`;
+    const result = preprocessStrings(code);
+    expect(result.stringLiteralIds.size).toBe(2);
+    const betaId = result.stringLiteralIds.get("beta");
+    const alphaId = result.stringLiteralIds.get("alpha");
+    expect(betaId).toBeDefined();
+    expect(alphaId).toBeDefined();
+    expect(betaId).not.toBe(0);
+    expect(alphaId).not.toBe(0);
+    expect(betaId).not.toBe(alphaId);
+    expect(result.code).toBe(`
+void main() {
+  if (mode == string_t(${betaId}u)) {
+    emitRGB(vec3(1.0));
+  }
+  if (mode == string_t(${alphaId}u)) {
+    emitRGB(vec3(0.0));
+  }
+  if (mode == string_t(${betaId}u)) {
+    emitRGB(vec3(0.5));
+  }
+}
+`);
+  });
+});
+
 describe("parseShaderUiControls", () => {
   it("handles no controls", () => {
     const code = `
@@ -85,7 +143,8 @@ void main() {
 `;
     expect(parseShaderUiControls(code)).toEqual({
       source: code,
-      code,
+      code: code,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map(),
     });
@@ -107,6 +166,7 @@ void main() {
     expect(parseShaderUiControls(code)).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -142,11 +202,37 @@ void main() {
     expect(parseShaderUiControls(code)).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         ["myCheckbox", { type: "checkbox", valueType: "bool", default: false }],
         ["myCheckbox2", { type: "checkbox", valueType: "bool", default: true }],
       ]),
+    });
+  });
+
+  it("reports only the invalid options error for empty select options", () => {
+    const code = `
+#uicontrol string_t choice select(options=[])
+void main() {
+}
+`;
+    const newCode = `
+
+void main() {
+}
+`;
+    expect(parseShaderUiControls(code)).toEqual({
+      source: code,
+      code: newCode,
+      preprocessing: emptyParsePreprocessing,
+      errors: [
+        {
+          line: 1,
+          message: "Expected options argument to contain at least one option",
+        },
+      ],
+      controls: new Map(),
     });
   });
 
@@ -166,6 +252,7 @@ void main() {
     expect(parseShaderUiControls(code)).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -199,6 +286,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -236,6 +324,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -273,6 +362,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -310,6 +400,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -347,6 +438,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -384,6 +476,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -425,6 +518,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -467,6 +561,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -509,6 +604,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -551,6 +647,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -589,6 +686,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -626,6 +724,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -663,6 +762,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -700,6 +800,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -740,6 +841,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -780,6 +882,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -828,6 +931,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -874,6 +978,7 @@ void main() {
     ).toEqual({
       source: code,
       code: newCode,
+      preprocessing: emptyParsePreprocessing,
       errors: [],
       controls: new Map([
         [
@@ -1007,6 +1112,680 @@ void main() {
       defaultColor: undefined,
       window: undefined,
       controlPoints: undefined,
+    });
+  });
+});
+
+describe("ShaderControlState property controls", () => {
+  const makeSegmentPropertyMap = () =>
+    new PreprocessedSegmentPropertyMap(
+      new SegmentPropertyMap({
+        inlineProperties: {
+          ids: new BigUint64Array([1n]),
+          properties: [
+            {
+              id: "tags",
+              type: "tags",
+              tags: ["red", "blue"],
+              tagDescriptions: ["red", "blue"],
+              values: ["\u0000"],
+            },
+            {
+              id: "score",
+              type: "number",
+              dataType: DataType.UINT8,
+              values: new Uint8Array([1]),
+              description: "score",
+              bounds: [0, 1],
+            },
+            {
+              id: "name",
+              type: "string",
+              values: ["alpha"],
+            },
+          ],
+        },
+      }),
+    );
+
+  const getSelectedPropertyValue = (shaderControlState: ShaderControlState) =>
+    shaderControlState.state.get("selected")!.trackable.value;
+
+  it("tracks annotation property invlerp controls as referenced properties", () => {
+    const code = `
+#uicontrol invlerp normalized(property="score")
+void main() {
+}
+`;
+    const fragmentMain = new WatchableValue(code);
+    const dataContext = new WatchableValue<ShaderDataContext | null>({
+      properties: new Map([["score", DataType.UINT8]]),
+    });
+    const shaderControlState = new ShaderControlState(
+      fragmentMain,
+      dataContext,
+    );
+    try {
+      expect(
+        shaderControlState.builderState.value.referencedProperties,
+      ).toEqual(["score"]);
+      expect(shaderControlState.builderState.value.segmentProperties).toEqual(
+        [],
+      );
+    } finally {
+      shaderControlState.dispose();
+    }
+  });
+
+  it("tracks segment property invlerp controls as segment properties", () => {
+    const code = `
+#uicontrol invlerp normalized(property="score")
+void main() {
+}
+`;
+    const fragmentMain = new WatchableValue(code);
+    const segmentPropertyMap = makeSegmentPropertyMap();
+    const dataContext = new WatchableValue<ShaderDataContext | null>({
+      properties: new Map([["score", DataType.UINT8]]),
+      values: new Map([["score", new Uint8Array([1])]]),
+      shaderName: () => "numerical0",
+      segmentPropertyMap,
+    });
+    const shaderControlState = new ShaderControlState(
+      fragmentMain,
+      dataContext,
+    );
+    try {
+      expect(
+        shaderControlState.builderState.value.referencedProperties,
+      ).toEqual([]);
+      expect(shaderControlState.builderState.value.segmentProperties).toEqual([
+        { type: "numerical", id: "score" },
+      ]);
+    } finally {
+      shaderControlState.dispose();
+    }
+  });
+
+  it("defaults to first property when created", () => {
+    const unfilteredCode = `
+#uicontrol property selected
+void main() {
+}
+`;
+    const fragmentMain = new WatchableValue(unfilteredCode);
+    const dataContext = new WatchableValue<ShaderDataContext | null>({
+      segmentPropertyMap: makeSegmentPropertyMap(),
+    });
+    const shaderControlState = new ShaderControlState(
+      fragmentMain,
+      dataContext,
+    );
+    try {
+      expect(getSelectedPropertyValue(shaderControlState)).toEqual({
+        type: "tag",
+        id: "red",
+      });
+      expect(shaderControlState.builderState.value.segmentProperties).toEqual([
+        { type: "tag", id: "red" },
+      ]);
+    } finally {
+      shaderControlState.dispose();
+    }
+  });
+
+  it("defaults to first property allowed by type filter when created", () => {
+    const numericalFilteredCode = `
+#uicontrol property selected(type="number")
+void main() {
+}
+`;
+    const fragmentMain = new WatchableValue(numericalFilteredCode);
+    const dataContext = new WatchableValue<ShaderDataContext | null>({
+      segmentPropertyMap: makeSegmentPropertyMap(),
+    });
+    const shaderControlState = new ShaderControlState(
+      fragmentMain,
+      dataContext,
+    );
+    try {
+      expect(getSelectedPropertyValue(shaderControlState)).toEqual({
+        type: "numerical",
+        id: "score",
+      });
+      expect(shaderControlState.builderState.value.segmentProperties).toEqual([
+        { type: "numerical", id: "score" },
+      ]);
+    } finally {
+      shaderControlState.dispose();
+    }
+  });
+
+  it("preserves selected tag when adding and removing property type filter", () => {
+    const unfilteredCode = `
+#uicontrol property selected
+void main() {
+}
+`;
+    const tagFilteredCode = `
+#uicontrol property selected(type="tag")
+void main() {
+}
+`;
+    const fragmentMain = new WatchableValue(unfilteredCode);
+    const dataContext = new WatchableValue<ShaderDataContext | null>({
+      segmentPropertyMap: makeSegmentPropertyMap(),
+    });
+    const shaderControlState = new ShaderControlState(
+      fragmentMain,
+      dataContext,
+    );
+    try {
+      shaderControlState.state.get("selected")!.trackable.value = {
+        type: "tag",
+        id: "red",
+      };
+      expect(getSelectedPropertyValue(shaderControlState)).toEqual({
+        type: "tag",
+        id: "red",
+      });
+
+      fragmentMain.value = tagFilteredCode;
+      expect(getSelectedPropertyValue(shaderControlState)).toEqual({
+        type: "tag",
+        id: "red",
+      });
+      expect(shaderControlState.builderState.value.segmentProperties).toEqual([
+        { type: "tag", id: "red" },
+      ]);
+
+      fragmentMain.value = unfilteredCode;
+      expect(getSelectedPropertyValue(shaderControlState)).toEqual({
+        type: "tag",
+        id: "red",
+      });
+      expect(shaderControlState.builderState.value.segmentProperties).toEqual([
+        { type: "tag", id: "red" },
+      ]);
+    } finally {
+      shaderControlState.dispose();
+    }
+  });
+
+  it("defaults to first valid property when preserved value is filtered out", () => {
+    const unfilteredCode = `
+#uicontrol property selected
+void main() {
+}
+`;
+    const tagFilteredCode = `
+#uicontrol property selected(type="tag")
+void main() {
+}
+`;
+    const fragmentMain = new WatchableValue(unfilteredCode);
+    const dataContext = new WatchableValue<ShaderDataContext | null>({
+      segmentPropertyMap: makeSegmentPropertyMap(),
+    });
+    const shaderControlState = new ShaderControlState(
+      fragmentMain,
+      dataContext,
+    );
+    try {
+      shaderControlState.state.get("selected")!.trackable.value = {
+        type: "numerical",
+        id: "score",
+      };
+
+      fragmentMain.value = tagFilteredCode;
+      expect(getSelectedPropertyValue(shaderControlState)).toEqual({
+        type: "tag",
+        id: "red",
+      });
+      expect(shaderControlState.builderState.value.segmentProperties).toEqual([
+        { type: "tag", id: "red" },
+      ]);
+    } finally {
+      shaderControlState.dispose();
+    }
+  });
+});
+
+describe("parseShaderUiControls select", () => {
+  it("handles basic select control", () => {
+    const code = `
+#uicontrol string_t myMode select(options=["one", "two", "three"])
+void main() {
+}
+`;
+    const newCode = `
+
+void main() {
+}
+`;
+    expect(parseShaderUiControls(code)).toEqual({
+      source: code,
+      code: newCode,
+      preprocessing: emptyParsePreprocessing,
+      errors: [],
+      controls: new Map([
+        [
+          "myMode",
+          {
+            type: "select",
+            valueType: "string_t",
+            options: [{ value: "one" }, { value: "two" }, { value: "three" }],
+            default: "one",
+          },
+        ],
+      ]),
+    });
+  });
+
+  it("handles explicit default option", () => {
+    const code = `
+#uicontrol string_t myMode select(options=["a", "b", "c"], default="c")
+void main() {
+}
+`;
+    const newCode = `
+
+void main() {
+}
+`;
+    expect(parseShaderUiControls(code)).toEqual({
+      source: code,
+      code: newCode,
+      preprocessing: emptyParsePreprocessing,
+      errors: [],
+      controls: new Map([
+        [
+          "myMode",
+          {
+            type: "select",
+            valueType: "string_t",
+            options: [{ value: "a" }, { value: "b" }, { value: "c" }],
+            default: "c",
+          },
+        ],
+      ]),
+    });
+  });
+
+  it("errors on wrong type", () => {
+    const code = `
+#uicontrol vec3 myMode select(options=["x", "y"])
+void main() {
+}
+`;
+    const result = parseShaderUiControls(code);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0].message).toContain(
+      "type must be one of string_t, int, uint, or float",
+    );
+  });
+
+  it("errors when options is missing", () => {
+    const code = `
+#uicontrol string_t myMode select()
+void main() {
+}
+`;
+    const result = parseShaderUiControls(code);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0].message).toContain("options must be specified");
+  });
+
+  it("errors when options is an empty array", () => {
+    const code = `
+#uicontrol string_t myMode select(options=[])
+void main() {
+}
+`;
+    const result = parseShaderUiControls(code);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0].message).toContain("contain at least one option");
+  });
+
+  it("errors when options have duplicate values", () => {
+    const code = `
+#uicontrol string_t myMode select(options={"First": "x", "Second": "x"})
+void main() {
+}
+`;
+    const result = parseShaderUiControls(code);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0].message).toContain('Duplicate option value: "x"');
+  });
+
+  it("errors when options is not an array or object", () => {
+    const code = `
+#uicontrol string_t myMode select(options="bad")
+void main() {
+}
+`;
+    const result = parseShaderUiControls(code);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0].message).toContain(
+      "array of string_t values or an object mapping labels to string_t values",
+    );
+  });
+
+  it("errors when default is not one of the options", () => {
+    const code = `
+#uicontrol string_t myMode select(options=["x", "y"], default="z")
+void main() {
+}
+`;
+    const result = parseShaderUiControls(code);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0].message).toContain(
+      'default value "z" must match one of the options',
+    );
+  });
+
+  it("errors when default is not a string", () => {
+    const code = `
+#uicontrol string_t myMode select(options=["x", "y"], default=1)
+void main() {
+}
+`;
+    const result = parseShaderUiControls(code);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0].message).toContain(
+      "Invalid default value: Expected string",
+    );
+  });
+
+  it("handles labeled select options from an object mapping", () => {
+    const code = `
+#uicontrol string_t myMode select(options={"Alpha mode": "alpha", "Beta mode": "beta"}, default="beta")
+void main() {
+}
+`;
+    const newCode = `
+
+void main() {
+}
+`;
+    expect(parseShaderUiControls(code)).toEqual({
+      source: code,
+      code: newCode,
+      preprocessing: emptyParsePreprocessing,
+      errors: [],
+      controls: new Map([
+        [
+          "myMode",
+          {
+            type: "select",
+            valueType: "string_t",
+            options: [
+              { label: "Alpha mode", value: "alpha" },
+              { label: "Beta mode", value: "beta" },
+            ],
+            default: "beta",
+          },
+        ],
+      ]),
+    });
+  });
+
+  it("handles uint select options", () => {
+    const code = `
+#uicontrol uint myMode select(options={"One": 1, "Two": 2}, default=2)
+void main() {
+}
+`;
+    const newCode = `
+
+void main() {
+}
+`;
+    expect(parseShaderUiControls(code)).toEqual({
+      source: code,
+      code: newCode,
+      preprocessing: emptyParsePreprocessing,
+      errors: [],
+      controls: new Map([
+        [
+          "myMode",
+          {
+            type: "select",
+            valueType: "uint",
+            options: [
+              { label: "One", value: 1 },
+              { label: "Two", value: 2 },
+            ],
+            default: 2,
+          },
+        ],
+      ]),
+    });
+  });
+
+  it("maps select values to preprocessed shader string ids", () => {
+    const code = `
+#uicontrol string_t myMode select(options=["alpha", "beta"])
+void main() {
+  outputValue = myMode == "beta" ? 1u : 0u;
+}
+`;
+    fragmentShaderTest({}, { outputValue: "uint" }, (tester) => {
+      const shaderControlState = new ShaderControlState(
+        constantWatchableValue(code),
+      );
+      try {
+        const parseResult = shaderControlState.parseResult.value;
+        addControlsToBuilder(
+          getFallbackBuilderState(parseResult),
+          tester.builder,
+        );
+        tester.builder.addFragmentCode(glsl_string);
+        tester.builder.setFragmentMainFunction(parseResult.code);
+        tester.build();
+        tester.shader.bind();
+        shaderControlState.restoreState({ myMode: "beta" });
+        setControlsInShader(
+          tester.gl,
+          tester.shader,
+          shaderControlState,
+          parseResult,
+        );
+        tester.execute();
+        expect(tester.values.outputValue).toEqual(1);
+      } finally {
+        shaderControlState.dispose();
+      }
+    });
+  });
+
+  it("uses the second select option as the default with preprocessed strings", () => {
+    const code = `
+#uicontrol string_t myMode select(options=["alpha", "beta"], default="beta")
+void main() {
+  outputValue = myMode == "beta" ? 1u : 0u;
+}
+`;
+    fragmentShaderTest({}, { outputValue: "uint" }, (tester) => {
+      const shaderControlState = new ShaderControlState(
+        constantWatchableValue(code),
+      );
+      try {
+        const parseResult = shaderControlState.parseResult.value;
+        addControlsToBuilder(
+          getFallbackBuilderState(parseResult),
+          tester.builder,
+        );
+        tester.builder.addFragmentCode(glsl_string);
+        tester.builder.setFragmentMainFunction(parseResult.code);
+        tester.build();
+        tester.shader.bind();
+        setControlsInShader(
+          tester.gl,
+          tester.shader,
+          shaderControlState,
+          parseResult,
+        );
+        tester.execute();
+        expect(tester.values.outputValue).toEqual(1);
+      } finally {
+        shaderControlState.dispose();
+      }
+    });
+  });
+
+  it("sets a select uniform to 0 when the shader has no mapped string", () => {
+    const code = `
+#uicontrol string_t myMode select(options=["alpha", "beta"])
+void main() {
+  outputValue = myMode == "gamma" ? 0u : myMode.value == 0u ? 1u : 0u;
+}
+`;
+    fragmentShaderTest({}, { outputValue: "uint" }, (tester) => {
+      const shaderControlState = new ShaderControlState(
+        constantWatchableValue(code),
+      );
+      try {
+        const parseResult = shaderControlState.parseResult.value;
+        addControlsToBuilder(
+          getFallbackBuilderState(parseResult),
+          tester.builder,
+        );
+        tester.builder.addFragmentCode(glsl_string);
+        tester.builder.setFragmentMainFunction(parseResult.code);
+        tester.build();
+        tester.shader.bind();
+        shaderControlState.restoreState({ myMode: "beta" });
+        setControlsInShader(
+          tester.gl,
+          tester.shader,
+          shaderControlState,
+          parseResult,
+        );
+        tester.execute();
+        expect(tester.values.outputValue).toEqual(1);
+      } finally {
+        shaderControlState.dispose();
+      }
+    });
+  });
+
+  it("uploads uint select values directly", () => {
+    const code = `
+#uicontrol uint myMode select(options={"One": 1, "Two": 2})
+void main() {
+  outputValue = myMode == 2u ? 1u : 0u;
+}
+`;
+    fragmentShaderTest({}, { outputValue: "uint" }, (tester) => {
+      const shaderControlState = new ShaderControlState(
+        constantWatchableValue(code),
+      );
+      try {
+        const parseResult = shaderControlState.parseResult.value;
+        addControlsToBuilder(
+          getFallbackBuilderState(parseResult),
+          tester.builder,
+        );
+        tester.builder.setFragmentMainFunction(parseResult.code);
+        tester.build();
+        tester.shader.bind();
+        shaderControlState.restoreState({ myMode: 2 });
+        setControlsInShader(
+          tester.gl,
+          tester.shader,
+          shaderControlState,
+          parseResult,
+        );
+        tester.execute();
+        expect(tester.values.outputValue).toEqual(1);
+      } finally {
+        shaderControlState.dispose();
+      }
+    });
+  });
+
+  it("ignores optimized-out select uniforms", () => {
+    const code = `
+#uicontrol string_t mode select(options=["large", "small", "default"], default="default")
+#uicontrol string_t modep select(options=["large", "small", "default"], default="default")
+void main() {
+  outputValue = mode == "large" ? 1u : 0u;
+}
+`;
+    fragmentShaderTest({}, { outputValue: "uint" }, (tester) => {
+      const shaderControlState = new ShaderControlState(
+        constantWatchableValue(code),
+      );
+      try {
+        const parseResult = shaderControlState.parseResult.value;
+        addControlsToBuilder(
+          getFallbackBuilderState(parseResult),
+          tester.builder,
+        );
+        tester.builder.addFragmentCode(glsl_string);
+        tester.builder.setFragmentMainFunction(parseResult.code);
+        tester.build();
+        tester.shader.bind();
+        shaderControlState.restoreState({ mode: "large", modep: "small" });
+        expect(() => {
+          setControlsInShader(
+            tester.gl,
+            tester.shader,
+            shaderControlState,
+            parseResult,
+          );
+        }).not.toThrow();
+        tester.execute();
+        expect(tester.values.outputValue).toEqual(1);
+      } finally {
+        shaderControlState.dispose();
+      }
+    });
+  });
+
+  it("sets invlerp uniforms", () => {
+    const code = `
+#uicontrol invlerp normalized
+void main() {
+  outputValue = normalized() == 1.0 ? 1u : 0u;
+}
+`;
+    fragmentShaderTest({}, { outputValue: "uint" }, (tester) => {
+      const shaderControlState = new ShaderControlState(
+        constantWatchableValue(code),
+        constantWatchableValue({
+          imageData: { dataType: DataType.UINT8, channelRank: 0 },
+        }),
+      );
+      try {
+        const parseResult = shaderControlState.parseResult.value;
+        tester.builder.addFragmentCode(`
+uint getDataValue() {
+  return 42u;
+}
+`);
+        addControlsToBuilder(
+          getFallbackBuilderState(parseResult),
+          tester.builder,
+        );
+        tester.builder.setFragmentMainFunction(parseResult.code);
+        tester.build();
+        tester.shader.bind();
+        shaderControlState.restoreState({ normalized: { range: [0, 42] } });
+        expect(() => {
+          setControlsInShader(
+            tester.gl,
+            tester.shader,
+            shaderControlState,
+            parseResult,
+          );
+        }).not.toThrow();
+        tester.execute();
+        expect(tester.values.outputValue).toEqual(1);
+      } finally {
+        shaderControlState.dispose();
+      }
     });
   });
 });
