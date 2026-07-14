@@ -22,7 +22,7 @@ import {
   ChunkSource,
 } from "#src/chunk_manager/frontend.js";
 import { hashCombine } from "#src/gpu_hash/hash_function.js";
-import type { HashMapUint64, HashSetUint64 } from "#src/gpu_hash/hash_table.js";
+import type { HashSetUint64 } from "#src/gpu_hash/hash_table.js";
 import { GPUHashTable, HashSetShaderManager } from "#src/gpu_hash/shader.js";
 import type {
   LayerView,
@@ -48,10 +48,7 @@ import type {
   ThreeDimensionalRenderLayerAttachmentState,
 } from "#src/renderlayer.js";
 import { update3dRenderLayerAttachment } from "#src/renderlayer.js";
-import {
-  SegmentColorShaderManager,
-  SegmentStatedColorShaderManager,
-} from "#src/segment_color.js";
+import { encodeSegmentPropertyShaderDefinition } from "#src/segment_color.js";
 import {
   forEachVisibleSegment,
   getVisibleSegments,
@@ -120,6 +117,7 @@ import type {
 import { SliceViewPanelRenderLayer } from "#src/sliceview/renderlayer.js";
 import type { WatchableValueInterface } from "#src/trackable_value.js";
 import {
+  AggregateWatchableValue,
   makeCachedLazyDerivedWatchableValue,
   TrackableValue,
   WatchableValue,
@@ -309,12 +307,6 @@ class RenderHelper extends RefCounted {
   private selectedSegmentsShaderManager = new HashSetShaderManager(
     "selectedSegments",
   );
-  private segmentColorShaderManager = new SegmentColorShaderManager(
-    "segmentColorHash",
-  );
-  private segmentStatedColorShaderManager = new SegmentStatedColorShaderManager(
-    "segmentStatedColor",
-  );
   private readonly clearedTextureUnits = new Set<number>();
   private emptySegmentSet = new Uint64Set();
   // `selectedSegments` (the layer's pinned "Segment IDs" list) is a plain
@@ -328,7 +320,6 @@ class RenderHelper extends RefCounted {
   private gpuTemporaryVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuEmptySegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuSelectedSegmentsHashTable: GPUHashTable<HashSetUint64>;
-  private gpuSegmentStatedColorHashTable: GPUHashTable<HashMapUint64>;
   get vertexAttributes(): VertexAttributeRenderInfo[] {
     return this.base.vertexAttributes;
   }
@@ -471,19 +462,12 @@ void spatialChunkCull() {
 
   private defineDynamicSegmentAppearance(
     builder: ShaderBuilder,
-    params: SkeletonShaderParameters,
+    _params: SkeletonShaderParameters,
   ) {
-    let colorExpression = `return ${this.segmentColorShaderManager.prefix}(segmentId);`;
     let alphaExpression = `return isVisible ? uVisibleAlpha : uHiddenAlpha;`;
     let excludedSegmentAlpha = "0.0";
 
     if (DEBUG_EXCLUDED_SEGMENTS) {
-      colorExpression = `
-        if (${this.excludedSegmentsShaderManager.hasFunctionName}(segmentId)) {
-          return vec3(0.0, 0.0, 1.0);
-        }
-        ${colorExpression}
-      `;
       if (!DEBUG_SPATIAL_SKELETON_OVERLAY) alphaExpression = `return 0.0;`;
       excludedSegmentAlpha = "1.0";
     }
@@ -491,58 +475,32 @@ void spatialChunkCull() {
     this.visibleSegmentsShaderManager.defineShader(builder);
     this.excludedSegmentsShaderManager.defineShader(builder);
     this.selectedSegmentsShaderManager.defineShader(builder);
-    this.segmentColorShaderManager.defineShader(builder);
-    if (params.hasSegmentStatedColors) {
-      this.segmentStatedColorShaderManager.defineShader(builder);
-    }
+    // Per-segment color comes from the segmentation layer's shared
+    // segment-color user shader (property-driven): `segmentColorUserShader()`.
+    // It brings its OWN hash/stated/default coloring, saturation and
+    // selected-segment highlight, so we deliberately do NOT also define
+    // zarr's segmentColorShaderManager/segmentStatedColorShaderManager here —
+    // their GLSL prefixes ("segmentColorHash"/"segmentStatedColor") are
+    // identical to the ones the segment-color shader defines internally, and
+    // defining both would duplicate those functions/uniforms. With an empty
+    // user shader this reproduces the previous hash coloring exactly.
+    const segmentColorUserShader =
+      this.base.displayState.segmentationColorUserShader;
+    segmentColorUserShader.defineShader(
+      builder,
+      /*fragment=*/ true,
+      this.base.displayState.segmentColorShaderControlState.builderState.value,
+    );
     builder.addUniform("highp float", "uVisibleAlpha");
     builder.addUniform("highp float", "uHiddenAlpha");
-    builder.addUniform("highp float", "uSaturation");
-    if (params.hasSegmentDefaultColor) {
-      builder.addUniform("highp vec3", "uSegmentDefaultColor");
-    }
-    if (params.hoverHighlight) {
-      builder.addUniform("highp uvec2", "uHoveredSegmentId");
-    }
     // Full uint64 segment id as a uvec2 [lo, hi].  A 1-component uint32
     // segment attribute (CATMAID) is zero-extended into this at the vertex
     // stage; a 2-component (zarr-vectors) attribute fills both halves.
     builder.addVarying("highp uvec2", "vSegmentValue", "flat");
 
-    const statedColorFragment = params.hasSegmentStatedColors
-      ? `
-  vec4 statedColor;
-  if (${this.segmentStatedColorShaderManager.getFunctionName}(segmentId, statedColor)) {
-    return statedColor.rgb;
-  }`
-      : "";
-
-    const defaultColorFragment = params.hasSegmentDefaultColor
-      ? "  return uSegmentDefaultColor;"
-      : `  ${colorExpression}`;
-
-    const hoverAdjustFragment = params.hoverHighlight
-      ? `
-  if (segmentId.value.x == uHoveredSegmentId.x &&
-      segmentId.value.y == uHoveredSegmentId.y) {
-    if (saturation > 0.5) { saturation -= 0.5; }
-    else { saturation += 0.5; }
-  }`
-      : "";
-
     builder.addFragmentCode(`
 uint64_t getSegmentAppearanceId(highp uvec2 segmentValue) {
   return uint64_t(segmentValue);
-}
-vec3 getSegmentBaseColor(uint64_t segmentId) {
-${statedColorFragment}
-${defaultColorFragment}
-}
-vec3 getSegmentLookupColor(uint64_t segmentId) {
-  vec3 baseColor = getSegmentBaseColor(segmentId);
-  float saturation = uSaturation;
-${hoverAdjustFragment}
-  return mix(vec3(1.0, 1.0, 1.0), baseColor, saturation);
 }
 float getSegmentLookupAlpha(uint64_t segmentId) {
   if (${this.excludedSegmentsShaderManager.hasFunctionName}(segmentId)) {
@@ -553,7 +511,9 @@ float getSegmentLookupAlpha(uint64_t segmentId) {
 }
 vec4 getSegmentAppearance(highp uvec2 segmentValue) {
   uint64_t segmentId = getSegmentAppearanceId(segmentValue);
-  return vec4(getSegmentLookupColor(segmentId), getSegmentLookupAlpha(segmentId));
+  // Color (incl. saturation + selected highlight) from the segment-color
+  // user shader; visibility-driven alpha from the skeleton renderer.
+  return vec4(segmentColorUserShader(segmentId).rgb, getSegmentLookupAlpha(segmentId));
 }
 // Whether \`segmentId\` is in the layer's pinned "Segment IDs" list
 // (segmentationGroupState.selectedSegments) — stable name for user shader
@@ -606,47 +566,15 @@ bool isSegmentSelected(uint64_t segmentId) {
     gl.uniform1f(shader.uniform("uVisibleAlpha"), visibleAlpha);
     gl.uniform1f(shader.uniform("uHiddenAlpha"), hiddenAlpha);
 
-    const colorGroupState =
-      this.base.displayState.segmentationColorGroupState.value;
-    this.segmentColorShaderManager.enable(
+    // Bind the shared segment-color user shader (property textures,
+    // saturation, selected-segment highlight, stated/default colors). This
+    // is the counterpart to the `segmentColorUserShader.defineShader(...)`
+    // call in `defineDynamicSegmentAppearance`.
+    this.base.displayState.segmentationColorUserShader.enable(
       gl,
       shader,
-      colorGroupState.segmentColorHash.value,
+      this.base.displayState.segmentColorShaderControlState.builderState.value,
     );
-
-    if (skeletonParams?.hasSegmentDefaultColor) {
-      const segmentDefaultColor = colorGroupState.segmentDefaultColor.value;
-      if (segmentDefaultColor !== undefined) {
-        gl.uniform3fv(
-          shader.uniform("uSegmentDefaultColor"),
-          segmentDefaultColor,
-        );
-      }
-      if (DEBUG_SPATIAL_SKELETON_OVERLAY && excludedGPUTable === undefined) {
-        gl.uniform3f(shader.uniform("uSegmentDefaultColor"), 1.0, 0.0, 0.0);
-      }
-    }
-
-    if (skeletonParams?.hasSegmentStatedColors) {
-      this.segmentStatedColorShaderManager.enable(
-        gl,
-        shader,
-        this.gpuSegmentStatedColorHashTable,
-      );
-    }
-
-    const { saturation, segmentSelectionState } = this.base.displayState;
-    gl.uniform1f(shader.uniform("uSaturation"), saturation.value);
-    if (skeletonParams.hoverHighlight) {
-      const seg = segmentSelectionState.hasSelectedSegment
-        ? segmentSelectionState.selectedSegment
-        : 0n;
-      gl.uniform2ui(
-        shader.uniform("uHoveredSegmentId"),
-        Number(seg & 0xffff_ffffn),
-        Number((seg >> 32n) & 0xffff_ffffn),
-      );
-    }
   }
 
   maybeDisableDynamicSegmentAppearance(
@@ -658,9 +586,7 @@ bool isSegmentSelected(uint64_t segmentId) {
     this.visibleSegmentsShaderManager.disable(gl, shader);
     this.excludedSegmentsShaderManager.disable(gl, shader);
     this.selectedSegmentsShaderManager.disable(gl, shader);
-    if (skeletonParams?.hasSegmentStatedColors) {
-      this.segmentStatedColorShaderManager.disable(gl, shader);
-    }
+    this.base.displayState.segmentationColorUserShader.disable(gl, shader);
   }
 
   constructor(
@@ -689,7 +615,6 @@ bool isSegmentSelected(uint64_t segmentId) {
 
     const segmentationGroupState =
       base.displayState.segmentationGroupState.value;
-    const colorGroupState = base.displayState.segmentationColorGroupState.value;
 
     this.gpuVisibleSegmentsHashTable = this.registerDisposer(
       GPUHashTable.get(
@@ -705,9 +630,6 @@ bool isSegmentSelected(uint64_t segmentId) {
     );
     this.gpuEmptySegmentsHashTable = this.registerDisposer(
       GPUHashTable.get(this.gl, this.emptySegmentSet.hashTable),
-    );
-    this.gpuSegmentStatedColorHashTable = this.registerDisposer(
-      GPUHashTable.get(this.gl, colorGroupState.segmentStatedColors.hashTable),
     );
 
     // Seed the mirror from the current pinned-segments list, then keep it
@@ -730,6 +652,40 @@ bool isSegmentSelected(uint64_t segmentId) {
       GPUHashTable.get(this.gl, this.selectedSegmentsMirror.hashTable),
     );
 
+    // The skeleton shader embeds the segmentation layer's segment-color user
+    // shader (see `defineDynamicSegmentAppearance`), so it must recompile not
+    // only when the skeleton shader changes but also when the segment-color
+    // shader code, its stated/default-color parameters, or the set of
+    // referenced segment properties changes.  Combine all of those into the
+    // shader getter's `parameters` so the memoization key covers them.
+    const dsForShader = this.base.displayState;
+    const buildCombinedParameters = (
+      skeletonBuilderState: WatchableValueInterface<ShaderControlsBuilderState>,
+    ) =>
+      new AggregateWatchableValue(() => ({
+        skeletonBuilderState,
+        segmentColorBuilderState:
+          dsForShader.segmentColorShaderControlState.builderState,
+        segmentColorParameters:
+          dsForShader.segmentationColorUserShader.shaderParameters,
+        segmentColorUsedProperties:
+          dsForShader.segmentationColorUserShader.usedProperties,
+      }));
+    const combinedParameters = this.registerDisposer(
+      buildCombinedParameters(
+        dsForShader.skeletonRenderingOptions.shaderControlState.builderState,
+      ),
+    );
+    const combinedFallbackParameters = this.registerDisposer(
+      buildCombinedParameters(this.base.fallbackShaderParameters),
+    );
+    const encodeCombinedParameters = (p: typeof combinedParameters.value) =>
+      `${p.skeletonBuilderState.key}/${p.segmentColorBuilderState.key}/` +
+      `${JSON.stringify(p.segmentColorParameters)}/` +
+      `${JSON.stringify(
+        p.segmentColorUsedProperties.map(encodeSegmentPropertyShaderDefinition),
+      )}`;
+
     this.edgeShaderGetter = parameterizedEmitterDependentShaderGetter(
       this,
       this.gl,
@@ -738,17 +694,17 @@ bool isSegmentSelected(uint64_t segmentId) {
           type: "skeleton/SkeletonShaderManager/edge",
           vertexAttributes: this.vertexAttributes,
         },
-        fallbackParameters: this.base.fallbackShaderParameters,
-        parameters:
-          this.base.displayState.skeletonRenderingOptions.shaderControlState
-            .builderState,
+        fallbackParameters: combinedFallbackParameters,
+        parameters: combinedParameters,
+        encodeParameters: encodeCombinedParameters,
         extraParameters: this.base.skeletonShaderParameters,
         shaderError: this.base.displayState.shaderError,
         defineShader: (
           builder: ShaderBuilder,
-          shaderBuilderState: ShaderControlsBuilderState,
+          params: typeof combinedParameters.value,
           skeletonParams: SkeletonShaderParameters,
         ) => {
+          const shaderBuilderState = params.skeletonBuilderState;
           this.defineCommonShader(builder, shaderBuilderState, skeletonParams);
           defineLineShader(builder);
           builder.addAttribute("highp uvec2", "aVertexIndex");
@@ -851,17 +807,17 @@ void emitDefault() {
           type: "skeleton/SkeletonShaderManager/node",
           vertexAttributes: this.vertexAttributes,
         },
-        fallbackParameters: this.base.fallbackShaderParameters,
-        parameters:
-          this.base.displayState.skeletonRenderingOptions.shaderControlState
-            .builderState,
+        fallbackParameters: combinedFallbackParameters,
+        parameters: combinedParameters,
+        encodeParameters: encodeCombinedParameters,
         extraParameters: this.base.skeletonShaderParameters,
         shaderError: this.base.displayState.shaderError,
         defineShader: (
           builder: ShaderBuilder,
-          shaderBuilderState: ShaderControlsBuilderState,
+          params: typeof combinedParameters.value,
           skeletonParams: SkeletonShaderParameters,
         ) => {
+          const shaderBuilderState = params.skeletonBuilderState;
           this.defineCommonShader(builder, shaderBuilderState, skeletonParams);
           defineCircleShader(
             builder,
@@ -1470,7 +1426,7 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
       gl,
       edgeShader,
       shaderControlState,
-      edgeShaderParameters.parseResult,
+      edgeShaderParameters.skeletonBuilderState.parseResult,
     );
     gl.uniform1f(edgeShader.uniform("uLineWidth"), lineWidth!);
 
@@ -1482,7 +1438,7 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
       gl,
       nodeShader,
       shaderControlState,
-      nodeShaderParameters.parseResult,
+      nodeShaderParameters.skeletonBuilderState.parseResult,
     );
 
     const skeletons = source.chunks;
@@ -3759,7 +3715,7 @@ export class SpatiallyIndexedSkeletonLayer
       gl,
       edgeShader,
       shaderControlState,
-      edgeShaderParameters.parseResult,
+      edgeShaderParameters.skeletonBuilderState.parseResult,
     );
     renderHelper.setColor(gl, edgeShader, kOneVec4);
     renderHelper.maybeEnableDynamicSegmentAppearance(
@@ -3777,7 +3733,7 @@ export class SpatiallyIndexedSkeletonLayer
       gl,
       nodeShader,
       shaderControlState,
-      nodeShaderParameters.parseResult,
+      nodeShaderParameters.skeletonBuilderState.parseResult,
     );
     renderHelper.setColor(gl, nodeShader, kOneVec4);
     renderHelper.maybeEnableDynamicSegmentAppearance(
@@ -5042,7 +4998,7 @@ export class MultiscaleSkeletonLayer
       gl,
       edgeShader,
       shaderControlState,
-      edgeShaderParameters.parseResult,
+      edgeShaderParameters.skeletonBuilderState.parseResult,
     );
     gl.uniform1f(edgeShader.uniform("uLineWidth"), lineWidth!);
 
@@ -5054,7 +5010,7 @@ export class MultiscaleSkeletonLayer
       gl,
       nodeShader,
       shaderControlState,
-      nodeShaderParameters.parseResult,
+      nodeShaderParameters.skeletonBuilderState.parseResult,
     );
 
     const manifests = source.chunks;
