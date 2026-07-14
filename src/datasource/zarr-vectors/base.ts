@@ -182,13 +182,6 @@ export class ZarrVectorsObjectKeyedSkeletonSourceParameters {
   linkDtype!: ZarrVectorsLinkDtype;
   /** Whether `fragment_attributes/segment_id` exists at level 0. */
   hasFragmentSegmentIds!: boolean;
-  /**
-   * Whether the `vertices` array is uncompressed + byte-range-addressable
-   * per fragment (`vertices_layout: "raw_v1"`); gates scoped range reads.
-   * Defaults false (legacy whole-chunk-compressed) when the frontend
-   * doesn't set it (e.g. non-3D stores).
-   */
-  verticesRangeAddressable = false;
   static RPC_ID = "zarr-vectors/ObjectKeyedSkeletonSource";
 }
 
@@ -205,15 +198,6 @@ export interface ZarrVectorsSkeletonPyramidLevelRef {
    * into a world-space bounding box (`probeObjectAcrossLevels`).
    */
   chunkShape: number[];
-  /**
-   * Whether this level's `vertices` array is stored uncompressed and
-   * byte-range-addressable per fragment (writer stamped
-   * `vertices_layout: "raw_v1"`). When true (and the kvstore supports
-   * offset reads), pass-2 fetches only the selected object's fragment
-   * vertex bytes instead of the whole chunk. When false (legacy
-   * whole-chunk-compressed), the whole-chunk read path is used.
-   */
-  verticesRangeAddressable: boolean;
 }
 
 /**

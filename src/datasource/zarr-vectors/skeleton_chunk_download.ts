@@ -11,9 +11,12 @@
  * them into a `SkeletonChunk` ready for upload to the render layer.
  *
  * This module is deliberately decoupled from neuroglancer's SharedObject
- * / RPC scaffolding so it can be unit-tested with a mock kvstore.  The
- * slice-4 chunk-source backend will provide a real kvstore reader from
- * `SharedKvStoreContext` and forward the result.
+ * / RPC scaffolding so it can be unit-tested with a mock kvstore, AND
+ * from the on-disk container format (native-sharded per-chunk arrays,
+ * see `sharded_array.ts`) — callers supply `readArrayChunk` /
+ * `readArrayChunkScoped`, which know how to resolve one chunk's payload
+ * for a given array name; this module just names the arrays it needs and
+ * decodes their bytes.
  */
 
 import { decodeFragments } from "#src/datasource/zarr-vectors/fragment_index.js";
@@ -46,26 +49,46 @@ export type AttributeDtype =
   | "int16"
   | "int32";
 
+/** Fetch + decode one per-chunk array's whole payload for `chunkCoords`, or `undefined` if absent/empty. */
+export type ReadArrayChunk = (
+  arrayPath: string,
+  chunkCoords: readonly number[],
+  signal: AbortSignal,
+) => Promise<Uint8Array | undefined>;
+
+/**
+ * Fetch a byte sub-range WITHIN one chunk's raw (uncompressed) payload —
+ * `innerByteRange` addresses the decoded element bytes directly (e.g.
+ * `rowIndex * bytesPerElement`). Only valid for arrays whose cells are
+ * uncompressed (`vertices`/`vertex_attributes/<name>` when the writer
+ * stamped `cell_codec: "raw"` — see `sharded_array.ts`); callers should
+ * have already gated on that before passing this in.
+ */
+export type ReadArrayChunkScoped = (
+  arrayPath: string,
+  chunkCoords: readonly number[],
+  innerByteRange: { offset: number; length: number },
+  signal: AbortSignal,
+) => Promise<Uint8Array | undefined>;
+
 /**
  * Inputs the orchestrator needs to download a chunk.
  *
- * The caller is responsible for joining `baseUrl + "<sub-path>"` to form
- * the actual fetch URLs and for any decompression (zstd) before handing
- * raw bytes to the decoder via the `kvStoreRead` callback.
- *
- * `kvStoreRead` returns `undefined` for a missing key (sparse chunk
- * presence) — the orchestrator interprets that as "no data here" and
- * returns an empty `SkeletonChunk` when even the vertex blob is absent.
+ * `readArrayChunk` resolves to `undefined` for a missing/empty chunk
+ * (sparse chunk presence) — the orchestrator interprets that as "no data
+ * here" and returns an empty `SkeletonChunk` when even the vertex array
+ * is absent.
  */
 export interface SkeletonChunkDownloadOptions {
-  /** Spatial chunk key, e.g. `"3.0.2"`. */
-  readonly chunkKey: string;
+  /** Spatial chunk grid coordinates. */
+  readonly chunkCoords: readonly number[];
   /** Rank of the position vectors (== sid_ndim). */
   readonly rank: number;
   /**
-   * On-disk dtype of `links/0/<chunk>` (per `.zattrs.dtype`); used to
-   * reinterpret link bytes correctly.  Not consulted for
-   * `implicit_sequential` stores (which don't have a `links/0` array).
+   * On-disk dtype of `links/0/<chunk>` (per its array's `zarr.json`
+   * `attributes.dtype`); used to reinterpret link bytes correctly. Not
+   * consulted for `implicit_sequential` stores (which don't have a
+   * `links/0` array).
    */
   readonly linkDtype: LinkDtype;
   /** Per-vertex attribute names, in the order the render layer expects. */
@@ -83,16 +106,7 @@ export interface SkeletonChunkDownloadOptions {
    * Defaults to true for backward-compatibility with callers that don't set it.
    */
   readonly hasFragmentSegmentIds?: boolean;
-  /**
-   * Async key-value-store read.  Resolves to a decompressed byte buffer,
-   * or `undefined` if the key is absent (sparse chunk presence).  The
-   * `subpath` is relative to the level group, e.g.
-   * `"vertices/3.0.2/c/0"`.
-   */
-  readonly kvStoreRead: (
-    subpath: string,
-    signal: AbortSignal,
-  ) => Promise<Uint8Array | undefined>;
+  readonly readArrayChunk: ReadArrayChunk;
 }
 
 /** Number of bytes per element of an attribute / link dtype. */
@@ -193,13 +207,14 @@ function reinterpretLinkBytes(
 /**
  * Download and decode one spatial chunk into a `SkeletonChunk`.
  *
- * Reads (relative paths under the level group):
- *   - `vertices/<key>/c/0`         — required for non-empty chunks.
- *   - `vertex_fragments/<key>/c/0` — required for non-empty chunks.
- *   - `links/0/<key>/c/0`          — required unless `linksConvention === "implicit_sequential"`.
- *   - `vertex_attributes/<name>/<key>/c/0` — one per declared attribute name.
+ * Reads (via `options.readArrayChunk`):
+ *   - `vertices`               — required for non-empty chunks.
+ *   - `vertex_fragments`       — required for non-empty chunks.
+ *   - `links/0`                — required unless `linksConvention === "implicit_sequential"`.
+ *   - `vertex_attributes/<name>` — one per declared attribute name.
+ *   - `fragment_attributes/segment_id` — when `hasFragmentSegmentIds`.
  *
- * Returns `undefined` when the chunk's `vertices/` blob is absent (the
+ * Returns `undefined` when the chunk's `vertices` payload is absent (the
  * canonical "this chunk has no data" signal).  Throws on any partially-
  * present chunk (vertices but missing fragments, or fragments but
  * missing edges in the explicit-edge cases).
@@ -209,14 +224,14 @@ export async function downloadSkeletonChunk(
   signal: AbortSignal,
 ): Promise<SkeletonChunk | undefined> {
   const {
-    chunkKey,
+    chunkCoords,
     rank,
     linkDtype,
     attributeNames,
     attributeDtypes,
     linksConvention,
     geometryKind,
-    kvStoreRead,
+    readArrayChunk,
   } = options;
   if (attributeNames.length !== attributeDtypes.length) {
     throw new Error(
@@ -226,14 +241,14 @@ export async function downloadSkeletonChunk(
   }
 
   // 1. Vertices — required.
-  const vertexBytes = await kvStoreRead(`vertices/${chunkKey}/c/0`, signal);
+  const vertexBytes = await readArrayChunk("vertices", chunkCoords, signal);
   if (vertexBytes === undefined || vertexBytes.byteLength === 0) {
     return undefined;
   }
   const bytesPerVertex = rank * 4; // float32
   if (vertexBytes.byteLength % bytesPerVertex !== 0) {
     throw new Error(
-      `zarr-vectors vertices/${chunkKey}: ${vertexBytes.byteLength} bytes ` +
+      `zarr-vectors vertices/${chunkCoords.join(".")}: ${vertexBytes.byteLength} bytes ` +
         `not a multiple of ${bytesPerVertex} (rank=${rank} * float32)`,
     );
   }
@@ -245,25 +260,26 @@ export async function downloadSkeletonChunk(
   ) as Float32Array;
 
   // 2. Fragment index — required.
-  const fragmentBytes = await kvStoreRead(
-    `vertex_fragments/${chunkKey}/c/0`,
+  const fragmentBytes = await readArrayChunk(
+    "vertex_fragments",
+    chunkCoords,
     signal,
   );
   if (fragmentBytes === undefined) {
     throw new Error(
-      `zarr-vectors chunk ${chunkKey} has vertices but vertex_fragments is missing`,
+      `zarr-vectors chunk ${chunkCoords.join(".")} has vertices but vertex_fragments is missing`,
     );
   }
   const fragmentIndex = decodeFragments(fragmentBytes);
 
-  // 3. Explicit edges (links/0/<key>/c/0) — required for explicit /
+  // 3. Explicit edges (links/0/<chunk>) — required for explicit /
   // implicit_sequential_with_branches, absent for pure implicit_sequential.
   let explicitEdges: Uint32Array | undefined;
   if (
     linksConvention === "explicit" ||
     linksConvention === "implicit_sequential_with_branches"
   ) {
-    const linkBytes = await kvStoreRead(`links/0/${chunkKey}/c/0`, signal);
+    const linkBytes = await readArrayChunk("links/0", chunkCoords, signal);
     if (linkBytes === undefined || linkBytes.byteLength === 0) {
       // implicit_sequential_with_branches with no explicit branches in
       // this chunk is legitimate (a leaf-only sub-skeleton).
@@ -273,7 +289,7 @@ export async function downloadSkeletonChunk(
       const totalElements = linkBytes.byteLength / elementSize;
       if (totalElements % 2 !== 0) {
         throw new Error(
-          `zarr-vectors links/0/${chunkKey}: ${totalElements} elements is ` +
+          `zarr-vectors links/0/${chunkCoords.join(".")}: ${totalElements} elements is ` +
             `not a multiple of link_width=2`,
         );
       }
@@ -288,8 +304,7 @@ export async function downloadSkeletonChunk(
   // this in practice:
   //
   //   - The writer's pyramid coarsening doesn't propagate
-  //     `vertex_attributes/<name>/` to higher levels (see
-  //     `zarr-vectors-py multiresolution/coarsen.py`); coarser levels
+  //     `vertex_attributes/<name>` to higher levels; coarser levels
   //     have vertices but no attribute arrays.
   //   - Future writers may emit attributes sparsely (per-chunk
   //     opt-in).
@@ -309,13 +324,14 @@ export async function downloadSkeletonChunk(
   const numFragments = fragmentIndex.numFragments;
   const segFragBytesPromise: Promise<Uint8Array | undefined> =
     (options.hasFragmentSegmentIds ?? true)
-      ? kvStoreRead(`fragment_attributes/segment_id/${chunkKey}/c/0`, signal)
+      ? readArrayChunk("fragment_attributes/segment_id", chunkCoords, signal)
       : Promise.resolve(undefined);
   const [vertexAttributes, segFragBytes] = await Promise.all([
     Promise.all(
       attributeNames.map(async (name, i) => {
-        const bytes = await kvStoreRead(
-          `vertex_attributes/${name}/${chunkKey}/c/0`,
+        const bytes = await readArrayChunk(
+          `vertex_attributes/${name}`,
+          chunkCoords,
           signal,
         );
         if (bytes === undefined) {
@@ -333,8 +349,8 @@ export async function downloadSkeletonChunk(
 
   // 5. Per-fragment segment_id → synthesised per-vertex "segment" column.
   // The writer stores one uint64 flywire id per fragment under
-  // `fragment_attributes/segment_id/<key>/c/0`.  We expand it to a
-  // per-vertex column of the FULL uint64, stored interleaved as two uint32
+  // `fragment_attributes/segment_id`.  We expand it to a per-vertex
+  // column of the FULL uint64, stored interleaved as two uint32
   // components `[lo, hi, lo, hi, …]` (a `uvec2` on the GPU).  The render
   // layer hashes the full id with the same `segmentColorHash` as the flat
   // segmentation, so dense fragments colour identically to that segment's
@@ -390,27 +406,13 @@ export async function downloadSkeletonChunk(
 }
 
 /**
- * A byte-range key-value read: resolves to exactly the requested
- * `[offset, offset+length)` bytes of `subpath`, or `undefined` if the
- * key is absent.  Distinct from {@link SkeletonChunkDownloadOptions.kvStoreRead}
- * (which reads + decompresses a whole value): a range read is only valid
- * for the store's uncompressed `raw`-encoded arrays (`vertices`,
- * `vertex_attributes`) and MUST NOT auto-decompress (a mid-array byte
- * slice is not a standalone compressed frame).
- */
-export type KvStoreReadRange = (
-  subpath: string,
-  byteRange: { offset: number; length: number },
-  signal: AbortSignal,
-) => Promise<Uint8Array | undefined>;
-
-/**
  * Fragment-scoped counterpart of {@link downloadSkeletonChunk}: decode a
  * chunk but fetch, over the network, ONLY the vertices (and per-vertex
  * attributes) of the fragments named by `restrictToFragments`, via
- * byte-range reads keyed off the (small, whole-read) `vertex_fragments`
- * index — instead of downloading the whole chunk's vertex blob just to
- * discard everything but one selected object's fragments.
+ * `readArrayChunkScoped` byte-range reads keyed off the (small, whole-
+ * read) `vertex_fragments` index — instead of downloading the whole
+ * chunk's vertex payload just to discard everything but one selected
+ * object's fragments.
  *
  * This is the pass-2 (object-keyed) path: a selected streamline owns only
  * a handful of a chunk's (often thousands of) fragments, so the whole-
@@ -440,19 +442,19 @@ export type KvStoreReadRange = (
 export async function downloadSkeletonChunkScoped(
   options: SkeletonChunkDownloadOptions & {
     readonly restrictToFragments: Uint32Array;
-    readonly kvStoreReadRange: KvStoreReadRange;
+    readonly readArrayChunkScoped: ReadArrayChunkScoped;
   },
   signal: AbortSignal,
 ): Promise<SkeletonChunk | undefined> {
   const {
-    chunkKey,
+    chunkCoords,
     rank,
     attributeNames,
     attributeDtypes,
     linksConvention,
     geometryKind,
-    kvStoreRead,
-    kvStoreReadRange,
+    readArrayChunk,
+    readArrayChunkScoped,
     restrictToFragments,
   } = options;
   if (attributeNames.length !== attributeDtypes.length) {
@@ -471,8 +473,9 @@ export async function downloadSkeletonChunkScoped(
   // 1. Fragment index — read whole (small); needed to size the chunk and
   // locate each owned fragment's contiguous vertex range. Its absence is
   // the canonical "chunk has no data" signal (mirrors downloadSkeletonChunk).
-  const fragmentBytes = await kvStoreRead(
-    `vertex_fragments/${chunkKey}/c/0`,
+  const fragmentBytes = await readArrayChunk(
+    "vertex_fragments",
+    chunkCoords,
     signal,
   );
   if (fragmentBytes === undefined) return undefined;
@@ -526,8 +529,9 @@ export async function downloadSkeletonChunkScoped(
     const spanVertices = maxIdx - minIdx + 1;
     const offset = minIdx * bytesPerVertex;
     const length = spanVertices * bytesPerVertex;
-    const spanBytes = await kvStoreReadRange(
-      `vertices/${chunkKey}/c/0`,
+    const spanBytes = await readArrayChunkScoped(
+      "vertices",
+      chunkCoords,
       { offset, length },
       signal,
     );
@@ -537,7 +541,7 @@ export async function downloadSkeletonChunkScoped(
     // rather than silently dropping this block's geometry.
     if (spanBytes === undefined || spanBytes.byteLength !== length) {
       throw new Error(
-        `zarr-vectors vertices/${chunkKey}: scoped range read returned ` +
+        `zarr-vectors vertices/${chunkCoords.join(".")}: scoped range read returned ` +
           `${spanBytes === undefined ? "no data" : `${spanBytes.byteLength} bytes`}, ` +
           `expected ${length}`,
       );
@@ -563,8 +567,9 @@ export async function downloadSkeletonChunkScoped(
       );
       if (maxIdx >= 0) {
         const spanElements = maxIdx - minIdx + 1;
-        const spanBytes = await kvStoreReadRange(
-          `vertex_attributes/${name}/${chunkKey}/c/0`,
+        const spanBytes = await readArrayChunkScoped(
+          `vertex_attributes/${name}`,
+          chunkCoords,
           { offset: minIdx * elementSize, length: spanElements * elementSize },
           signal,
         );
@@ -587,10 +592,7 @@ export async function downloadSkeletonChunkScoped(
   // one small uint64 per fragment); identical expansion to downloadSkeletonChunk.
   const numFragments = fragmentIndex.numFragments;
   const segFragBytes = (options.hasFragmentSegmentIds ?? true)
-    ? await kvStoreRead(
-        `fragment_attributes/segment_id/${chunkKey}/c/0`,
-        signal,
-      )
+    ? await readArrayChunk("fragment_attributes/segment_id", chunkCoords, signal)
     : undefined;
   let fragSegIds: BigUint64Array | undefined;
   if (segFragBytes !== undefined && segFragBytes.byteLength >= numFragments * 8) {
@@ -634,12 +636,12 @@ export async function downloadSkeletonChunkScoped(
 
 /**
  * One request for a ghost vertex.  `hostLocalVertex` identifies the
- * endpoint in the current chunk; `neighborChunkKey` + `neighborLocalVertex`
+ * endpoint in the current chunk; `neighborChunkCoords` + `neighborLocalVertex`
  * identify the source vertex in a different chunk to copy into the host.
  */
 export interface GhostVertexRequest {
   readonly hostLocalVertex: number;
-  readonly neighborChunkKey: string;
+  readonly neighborChunkCoords: readonly number[];
   readonly neighborLocalVertex: number;
   /**
    * True when the neighbor's vertex precedes the host in the
@@ -652,9 +654,9 @@ export interface GhostVertexRequest {
 }
 
 /**
- * Slice a single float32×rank vertex out of a `vertices/<key>/c/0` byte
- * blob.  Returns `undefined` when the requested index is out of range —
- * caller drops the ghost in that case (avoids dangling references on
+ * Slice a single float32×rank vertex out of a chunk's whole `vertices`
+ * payload.  Returns `undefined` when the requested index is out of range
+ * — caller drops the ghost in that case (avoids dangling references on
  * sparse / writer-inconsistent stores).
  */
 function sliceVertexFromBytes(
@@ -677,9 +679,10 @@ function sliceVertexFromBytes(
 }
 
 /**
- * Slice a single attribute element from a `vertex_attributes/<name>/<key>/c/0`
- * byte blob, packaged as a length-1 typed-array of the declared dtype.
- * Returns `undefined` when the requested index is out of range.
+ * Slice a single attribute element from a chunk's whole
+ * `vertex_attributes/<name>` payload, packaged as a length-1 typed-array
+ * of the declared dtype. Returns `undefined` when the requested index is
+ * out of range.
  */
 function sliceAttributeFromBytes(
   bytes: Uint8Array,
@@ -700,15 +703,15 @@ function sliceAttributeFromBytes(
 
 /**
  * Fetch + slice one ghost vertex per request, grouping by
- * `neighborChunkKey` so each unique neighbor's `vertices/` and per-
- * attribute files are fetched exactly once.  Subsequent fetches for the
- * same key are served from the kvstore cache (and when the neighbor
- * loads as its own render chunk, every byte is already cached — the
- * "prefetch" reorders work rather than adding net traffic).
+ * `neighborChunkCoords` so each unique neighbor's `vertices` and per-
+ * attribute payloads are fetched exactly once.  Subsequent fetches for
+ * the same key are served from the kvstore/shard-index cache (and when
+ * the neighbor loads as its own render chunk, every byte is already
+ * cached — the "prefetch" reorders work rather than adding net traffic).
  *
- * Requests whose neighbor's `vertices/` blob is absent are silently
+ * Requests whose neighbor's `vertices` payload is absent are silently
  * dropped (sparse chunk presence; we never emit a dangling reference).
- * Requests whose `vertex_attributes/<name>/` blob is absent get a
+ * Requests whose `vertex_attributes/<name>` payload is absent get a
  * zero-filled value for that attribute — same rule the per-chunk
  * download applies for pyramid levels that don't propagate attributes.
  */
@@ -718,17 +721,18 @@ export async function fetchGhostVertices(
     readonly rank: number;
     readonly attributeNames: readonly string[];
     readonly attributeDtypes: readonly AttributeDtype[];
-    readonly kvStoreRead: SkeletonChunkDownloadOptions["kvStoreRead"];
+    readonly readArrayChunk: ReadArrayChunk;
   },
   signal: AbortSignal,
 ): Promise<GhostVertexRecord[]> {
-  const { rank, attributeNames, attributeDtypes, kvStoreRead } = options;
+  const { rank, attributeNames, attributeDtypes, readArrayChunk } = options;
   if (requests.length === 0) return [];
 
-  // 1. Group by neighbor chunk key — one fetch per unique key per file.
-  const uniqueKeys = Array.from(
-    new Set(requests.map((r) => r.neighborChunkKey)),
-  );
+  // 1. Group by neighbor chunk coords — one fetch per unique key per array.
+  const byKeyString = new Map<string, readonly number[]>();
+  for (const r of requests) {
+    byKeyString.set(r.neighborChunkCoords.join(","), r.neighborChunkCoords);
+  }
 
   // 2. Fetch positions + each attribute for each unique key in parallel.
   type NeighborBlobs = {
@@ -737,14 +741,14 @@ export async function fetchGhostVertices(
   };
   const byKey = new Map<string, NeighborBlobs>();
   await Promise.all(
-    uniqueKeys.map(async (key) => {
+    Array.from(byKeyString.entries()).map(async ([keyString, coords]) => {
       const [positions, ...attrs] = await Promise.all([
-        kvStoreRead(`vertices/${key}/c/0`, signal),
+        readArrayChunk("vertices", coords, signal),
         ...attributeNames.map((name) =>
-          kvStoreRead(`vertex_attributes/${name}/${key}/c/0`, signal),
+          readArrayChunk(`vertex_attributes/${name}`, coords, signal),
         ),
       ]);
-      byKey.set(key, { positions, attrs });
+      byKey.set(keyString, { positions, attrs });
     }),
   );
 
@@ -753,7 +757,7 @@ export async function fetchGhostVertices(
   // out of range — these would otherwise create dangling bridge edges.
   const out: GhostVertexRecord[] = [];
   for (const req of requests) {
-    const blobs = byKey.get(req.neighborChunkKey);
+    const blobs = byKey.get(req.neighborChunkCoords.join(","));
     if (blobs === undefined || blobs.positions === undefined) continue;
     const position = sliceVertexFromBytes(
       blobs.positions,
@@ -775,7 +779,7 @@ export async function fetchGhostVertices(
       if (sliced === undefined) {
         // Zero-fill missing attribute — mirrors `downloadSkeletonChunk`
         // behavior for chunk-local attributes (pyramid levels without
-        // `vertex_attributes/<name>/`).
+        // `vertex_attributes/<name>`).
         attributes.push(
           reinterpretBytes(
             new Uint8Array(BYTES_PER_ELEMENT[attributeDtypes[i]]),

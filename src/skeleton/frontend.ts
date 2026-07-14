@@ -267,6 +267,8 @@ interface PackedSkeletonGeometry {
   vertexAttributeOffsets: Uint32Array;
   nodeIds?: Int32Array;
   nodeSourceStates?: Array<SpatialSkeletonSourceState | undefined>;
+  /** See `SkeletonChunkData.numRealVertices` in chunk_serialization.ts. */
+  numRealVertices?: number;
 }
 
 type SpatiallyIndexedSkeletonPickData =
@@ -303,6 +305,9 @@ class RenderHelper extends RefCounted {
   private excludedSegmentsShaderManager = new HashSetShaderManager(
     "excludedSegments",
   );
+  private selectedSegmentsShaderManager = new HashSetShaderManager(
+    "selectedSegments",
+  );
   private segmentColorShaderManager = new SegmentColorShaderManager(
     "segmentColorHash",
   );
@@ -311,9 +316,17 @@ class RenderHelper extends RefCounted {
   );
   private readonly clearedTextureUnits = new Set<number>();
   private emptySegmentSet = new Uint64Set();
+  // `selectedSegments` (the layer's pinned "Segment IDs" list) is a plain
+  // CPU-side `Uint64OrderedSet`, unlike `visibleSegments`/`Uint64Set` — it
+  // has no `.hashTable` of its own for GPU membership testing. Mirror its
+  // contents into a local, non-RPC-connected `Uint64Set` (same pattern as
+  // `emptySegmentSet`) purely so its `.hashTable` can be uploaded via
+  // `GPUHashTable`, exposing selection state to shaders.
+  private selectedSegmentsMirror = new Uint64Set();
   private gpuVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuTemporaryVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuEmptySegmentsHashTable: GPUHashTable<HashSetUint64>;
+  private gpuSelectedSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuSegmentStatedColorHashTable: GPUHashTable<HashMapUint64>;
   get vertexAttributes(): VertexAttributeRenderInfo[] {
     return this.base.vertexAttributes;
@@ -340,9 +353,19 @@ class RenderHelper extends RefCounted {
     if (skeletonParams.spatialChunkCulling) {
       builder.addUniform("highp vec3", "uChunkOrigin");
       builder.addUniform("highp vec3", "uChunkBound");
+      builder.addUniform("highp uint", "uGhostVertexStartIndex");
       builder.addVarying("highp vec3", "vCullPos");
+      // Ghost vertices (see `SkeletonChunkData.numRealVertices`) are
+      // deliberately positioned outside this chunk's own bounds — that's
+      // the whole point of a cross-chunk bridge edge, which needs to
+      // reach a neighbor's real position without that neighbor's GPU
+      // buffers bound. Skip the box-discard test for any edge/node
+      // touching a ghost, or every such bridge gets truncated right at
+      // the boundary it exists to cross.
+      builder.addVarying("highp float", "vSkipCull", "flat");
       builder.addFragmentCode(`
 void spatialChunkCull() {
+  if (vSkipCull > 0.5) return;
   if (any(lessThan(vCullPos, uChunkOrigin)) ||
       any(greaterThanEqual(vCullPos, uChunkBound))) discard;
 }
@@ -463,6 +486,7 @@ void spatialChunkCull() {
 
     this.visibleSegmentsShaderManager.defineShader(builder);
     this.excludedSegmentsShaderManager.defineShader(builder);
+    this.selectedSegmentsShaderManager.defineShader(builder);
     this.segmentColorShaderManager.defineShader(builder);
     if (params.hasSegmentStatedColors) {
       this.segmentStatedColorShaderManager.defineShader(builder);
@@ -527,6 +551,12 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
   uint64_t segmentId = getSegmentAppearanceId(segmentValue);
   return vec4(getSegmentLookupColor(segmentId), getSegmentLookupAlpha(segmentId));
 }
+// Whether \`segmentId\` is in the layer's pinned "Segment IDs" list
+// (segmentationGroupState.selectedSegments) — stable name for user shader
+// code to call, independent of the underlying hash-set-manager prefix.
+bool isSegmentSelected(uint64_t segmentId) {
+  return ${this.selectedSegmentsShaderManager.hasFunctionName}(segmentId);
+}
 `);
   }
 
@@ -550,6 +580,11 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
       gl,
       shader,
       excludedGPUTable ?? this.gpuEmptySegmentsHashTable,
+    );
+    this.selectedSegmentsShaderManager.enable(
+      gl,
+      shader,
+      this.gpuSelectedSegmentsHashTable,
     );
     // 3D (perspective) uses objectAlpha/hiddenObjectAlpha; 2D (slice) uses
     // the cross-section sliders selectedAlpha ("Opacity (on)") /
@@ -618,6 +653,7 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
     if (!skeletonParams?.dynamicSegmentAppearance) return;
     this.visibleSegmentsShaderManager.disable(gl, shader);
     this.excludedSegmentsShaderManager.disable(gl, shader);
+    this.selectedSegmentsShaderManager.disable(gl, shader);
     if (skeletonParams?.hasSegmentStatedColors) {
       this.segmentStatedColorShaderManager.disable(gl, shader);
     }
@@ -670,6 +706,26 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
       GPUHashTable.get(this.gl, colorGroupState.segmentStatedColors.hashTable),
     );
 
+    // Seed the mirror from the current pinned-segments list, then keep it
+    // in sync as segments are added/removed/cleared.
+    for (const id of segmentationGroupState.selectedSegments) {
+      this.selectedSegmentsMirror.add(id);
+    }
+    this.registerDisposer(
+      segmentationGroupState.selectedSegments.changed.add((x, add) => {
+        if (x === null) {
+          this.selectedSegmentsMirror.clear();
+        } else if (add) {
+          this.selectedSegmentsMirror.add(x);
+        } else {
+          this.selectedSegmentsMirror.delete(x);
+        }
+      }),
+    );
+    this.gpuSelectedSegmentsHashTable = this.registerDisposer(
+      GPUHashTable.get(this.gl, this.selectedSegmentsMirror.hashTable),
+    );
+
     this.edgeShaderGetter = parameterizedEmitterDependentShaderGetter(
       this,
       this.gl,
@@ -703,7 +759,9 @@ highp uint lineEndpointIndex = getLineEndpointIndex();
 highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexIndex.y * lineEndpointIndex;
 `;
           if (skeletonParams.spatialChunkCulling) {
-            vertexMain += `vCullPos = mix(vertexA, vertexB, float(lineEndpointIndex));\n`;
+            vertexMain += `vCullPos = mix(vertexA, vertexB, float(lineEndpointIndex));
+vSkipCull = (aVertexIndex.x >= uGhostVertexStartIndex || aVertexIndex.y >= uGhostVertexStartIndex) ? 1.0 : 0.0;
+`;
           }
           if (
             skeletonParams.dynamicSegmentAppearance &&
@@ -824,7 +882,9 @@ vPickID = uPickID + pickOffset;
 highp vec3 vertexPosition = readAttribute0(vertexIndex);
 `;
           if (skeletonParams.spatialChunkCulling) {
-            vertexMain += `vCullPos = vertexPosition;\n`;
+            vertexMain += `vCullPos = vertexPosition;
+vSkipCull = (vertexIndex >= uGhostVertexStartIndex) ? 1.0 : 0.0;
+`;
           }
           if (this.selectedNodeAttributeIndex !== undefined) {
             vertexMain += `vSelectedNode = readAttribute${this.selectedNodeAttributeIndex}(vertexIndex);\n`;
@@ -1014,9 +1074,11 @@ void emitDefault() {
     shader: ShaderProgram,
     origin: Float32Array,
     upperBound: Float32Array,
+    ghostVertexStartIndex: number,
   ) {
     gl.uniform3fv(shader.uniform("uChunkOrigin"), origin);
     gl.uniform3fv(shader.uniform("uChunkBound"), upperBound);
+    gl.uniform1ui(shader.uniform("uGhostVertexStartIndex"), ghostVertexStartIndex);
   }
 
   drawSkeletons(
@@ -1719,6 +1781,14 @@ export class SpatiallyIndexedSkeletonChunk
   vertexAttributeTextures: (WebGLTexture | null)[] = [];
   nodeIds: Int32Array;
   nodeSourceStates: Array<SpatialSkeletonSourceState | undefined> = [];
+  /**
+   * Vertex index threshold at/above which a vertex is a synthesised
+   * ghost (see `SkeletonChunkData.numRealVertices`). Defaults to
+   * `numVertices` (no vertex index is ever >= its own count) for
+   * sources that don't set it — i.e. chunk-boundary culling applies to
+   * every vertex/edge unconditionally, the pre-existing behavior.
+   */
+  numRealVertices: number;
 
   constructor(
     source: SpatiallyIndexedSkeletonSource,
@@ -1735,6 +1805,7 @@ export class SpatiallyIndexedSkeletonChunk
     this.nodeSourceStates = Array.isArray(nodeSourceStates)
       ? nodeSourceStates
       : [];
+    this.numRealVertices = chunkData.numRealVertices ?? chunkData.numVertices;
   }
 
   copyToGPU(gl: GL) {
@@ -3766,9 +3837,21 @@ export class SpatiallyIndexedSkeletonLayer
         vec3.mul(chunkOrigin, chunk.chunkGridPosition, chunkLayout.size);
         vec3.add(chunkBound, chunkOrigin, chunkLayout.size);
         edgeShader.bind();
-        renderHelper.setChunkBounds(gl, edgeShader, chunkOrigin, chunkBound);
+        renderHelper.setChunkBounds(
+          gl,
+          edgeShader,
+          chunkOrigin,
+          chunkBound,
+          chunk.numRealVertices,
+        );
         nodeShader.bind();
-        renderHelper.setChunkBounds(gl, nodeShader, chunkOrigin, chunkBound);
+        renderHelper.setChunkBounds(
+          gl,
+          nodeShader,
+          chunkOrigin,
+          chunkBound,
+          chunk.numRealVertices,
+        );
       }
       if (renderContext.emitPickID) {
         let edgePickId = 0;

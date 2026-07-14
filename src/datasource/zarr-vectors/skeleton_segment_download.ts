@@ -33,8 +33,9 @@ import {
   downloadSkeletonChunk,
   downloadSkeletonChunkScoped,
   type AttributeDtype,
-  type KvStoreReadRange,
   type LinkDtype,
+  type ReadArrayChunk,
+  type ReadArrayChunkScoped,
 } from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
 
 /**
@@ -202,17 +203,20 @@ export interface DownloadSegmentSkeletonOptions {
     chunkCoordsList: readonly (readonly number[])[],
     signal: AbortSignal,
   ) => Promise<CrossChunkLinksTable | undefined>;
+  /** Fetch + decode one per-chunk array's whole payload — see `sharded_array.ts`. */
+  readonly readArrayChunk: ReadArrayChunk;
   /**
-   * Optional byte-range reader. When supplied (and `linksConvention ===
-   * "implicit_sequential"`), each chunk is fetched via
+   * Optional byte-range-scoped reader. When supplied (and `linksConvention
+   * === "implicit_sequential"`), each chunk is fetched via
    * {@link downloadSkeletonChunkScoped} — reading only the selected
    * object's fragments' vertices/attributes from the (uncompressed,
-   * `raw`-encoded) `vertices`/`vertex_attributes` arrays, instead of the
-   * whole chunk. The backend should only pass this when the level's
-   * kvstore supports offset reads; a missing/failed range read for a
-   * given block falls back to the whole-chunk {@link downloadSkeletonChunk}.
+   * `cell_codec: "raw"`) `vertices`/`vertex_attributes` arrays, instead of
+   * the whole chunk. The backend should only pass this when the level's
+   * kvstore supports offset reads AND those arrays are raw; a missing/
+   * failed range read for a given block falls back to the whole-chunk
+   * {@link downloadSkeletonChunk}.
    */
-  readonly kvStoreReadRange?: KvStoreReadRange;
+  readonly readArrayChunkScoped?: ReadArrayChunkScoped;
   /** Whether to fetch `fragment_attributes/segment_id` per chunk. */
   readonly hasFragmentSegmentIds?: boolean;
 }
@@ -370,7 +374,8 @@ export async function downloadSegmentSkeleton(
     geometryKind,
     crossChunkLinks,
     queryCrossChunkLinksForChunks,
-    kvStoreReadRange,
+    readArrayChunk,
+    readArrayChunkScoped,
     hasFragmentSegmentIds,
   } = options;
   const manifest = await readObjectManifest(oid, manifestReader, signal);
@@ -426,7 +431,7 @@ export async function downloadSegmentSkeleton(
     // range-read only this object's vertices instead of the whole chunk.
     const fragmentIds = resolveFragmentRef(block.fragmentRef);
     const wholeChunkOptions = {
-      chunkKey,
+      chunkCoords: block.chunkCoords,
       rank,
       linkDtype,
       attributeNames,
@@ -434,16 +439,20 @@ export async function downloadSegmentSkeleton(
       linksConvention,
       geometryKind,
       hasFragmentSegmentIds,
-      kvStoreRead: manifestReader.kvStoreRead,
+      readArrayChunk,
     };
     let skel: SkeletonChunk | undefined;
     if (
-      kvStoreReadRange !== undefined &&
+      readArrayChunkScoped !== undefined &&
       linksConvention === "implicit_sequential"
     ) {
       try {
         skel = await downloadSkeletonChunkScoped(
-          { ...wholeChunkOptions, kvStoreReadRange, restrictToFragments: fragmentIds },
+          {
+            ...wholeChunkOptions,
+            readArrayChunkScoped,
+            restrictToFragments: fragmentIds,
+          },
           signal,
         );
       } catch {

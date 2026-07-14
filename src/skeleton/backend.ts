@@ -694,6 +694,7 @@ export class SpatiallyIndexedSkeletonChunk
   requestOwners = SpatiallyIndexedSkeletonChunkRequestOwner.NONE;
   nodeIds: Int32Array | undefined;
   nodeSourceStates: Array<SpatialSkeletonSourceState | undefined> | undefined;
+  numRealVertices: number | undefined;
 
   freeSystemMemory() {
     freeSkeletonChunkSystemMemory(this);

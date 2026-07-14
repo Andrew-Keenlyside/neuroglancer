@@ -6,6 +6,7 @@ Neuroglancer
    :hidden:
    :caption: User Guide
 
+   user-guide/python_guide
    user-guide/navigation
    user-guide/skeleton_editing
 

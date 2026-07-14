@@ -24,6 +24,16 @@ export interface SkeletonChunkData {
   lod?: number;
   nodeIds?: Int32Array;
   nodeSourceStates?: Array<SpatialSkeletonSourceState | undefined>;
+  /**
+   * Vertex index threshold at/above which a vertex is a synthesised
+   * "ghost" (a neighbor chunk's boundary vertex, copied in so a cross-
+   * chunk bridge edge can be drawn without that neighbor's GPU buffers
+   * bound — see `appendGhostVertices` in the zarr-vectors datasource).
+   * `undefined` for sources with no such concept (every vertex is real;
+   * chunk-boundary culling, when enabled, applies to every vertex/edge
+   * unconditionally — the pre-existing behavior).
+   */
+  numRealVertices?: number;
 }
 
 /**
@@ -51,6 +61,9 @@ export function serializeSkeletonChunkData(
 ): void {
   if (data.lod !== undefined) {
     msg.lod = data.lod;
+  }
+  if (data.numRealVertices !== undefined) {
+    msg.numRealVertices = data.numRealVertices;
   }
   const vertexPositions = data.vertexPositions!;
   const indices = data.indices!;

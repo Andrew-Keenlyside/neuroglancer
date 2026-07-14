@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
-import { requestAsyncComputation } from "#src/async_computation/request.js";
 import type { AnnotationGeometryChunkSpecification } from "#src/annotation/base.js";
 import {
   AnnotationGeometryChunkSource,
@@ -26,6 +24,8 @@ import {
   AnnotationType,
   parseAnnotationPropertySpecs,
 } from "#src/annotation/index.js";
+import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
+import { requestAsyncComputation } from "#src/async_computation/request.js";
 import type { ChunkManager } from "#src/chunk_manager/frontend.js";
 import { WithParameters } from "#src/chunk_manager/frontend.js";
 import {
@@ -51,10 +51,16 @@ import {
   ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
 } from "#src/datasource/zarr-vectors/base.js";
 import {
+  decodeFixedLengthUtf32Strings,
+  invertGroupMembershipsToTags,
+  sanitizeTagName,
+} from "#src/datasource/zarr-vectors/group_properties.js";
+import {
   ZarrVectorsMultiscaleObjectKeyedSkeletonSource,
   ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource,
   ZarrVectorsObjectKeyedSkeletonSource,
 } from "#src/datasource/zarr-vectors/skeleton_frontend.js";
+import { decodeVlenBytesChunk } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import type { AutoDetectRegistry } from "#src/kvstore/auto_detect.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
 import type { SharedKvStoreContext } from "#src/kvstore/frontend.js";
@@ -68,6 +74,7 @@ import type {
   InlineSegmentNumericalProperty,
   InlineSegmentProperty,
   InlineSegmentPropertyMap,
+  InlineSegmentTagsProperty,
 } from "#src/segmentation_display_state/property_map.js";
 import {
   normalizeInlineSegmentPropertyMap,
@@ -614,6 +621,53 @@ function reinterpretObjectAttributeBytes(
 }
 
 /**
+ * Reinterpret a raw byte blob as float64 and downcast to float32 —
+ * neuroglancer's `DataType` has no float64 variant, but TRX-derived
+ * per-object columns (numpy default float dtype) commonly are float64.
+ */
+function reinterpretFloat64AsFloat32(
+  bytes: Uint8Array,
+  expectedElements: number,
+): Float32Array {
+  const elementSize = 8;
+  const expectedBytes = expectedElements * elementSize;
+  if (bytes.byteLength !== expectedBytes) {
+    throw new Error(
+      `zarr-vectors object_attributes: expected ${expectedBytes} bytes ` +
+        `(${expectedElements} float64 elements), got ${bytes.byteLength}`,
+    );
+  }
+  const f64 =
+    bytes.byteOffset % elementSize === 0
+      ? new Float64Array(bytes.buffer, bytes.byteOffset, expectedElements)
+      : (() => {
+          const copy = new Uint8Array(bytes.byteLength);
+          copy.set(bytes);
+          return new Float64Array(copy.buffer, 0, expectedElements);
+        })();
+  return Float32Array.from(f64);
+}
+
+/**
+ * Parse a Zarr v3 array's `fill_value` field (special floats are
+ * JSON-string-encoded per spec: `"NaN"`, `"Infinity"`, `"-Infinity"`;
+ * everything else is a plain JSON number) into the numeric sentinel
+ * used to mark an `object_attributes/<name>` row absent.
+ */
+function parseObjectAttributeFillValue(raw: unknown): number {
+  if (raw === "NaN") return NaN;
+  if (raw === "Infinity") return Infinity;
+  if (raw === "-Infinity") return -Infinity;
+  return Number(raw);
+}
+
+/** Whether `v` is the sentinel `fillValue` (NaN-aware). */
+function valueEqualsFillValue(v: number, fillValue: number): boolean {
+  if (Number.isNaN(fillValue)) return Number.isNaN(v);
+  return v === fillValue;
+}
+
+/**
  * Build a `SegmentPropertyMap` from level-0 `object_attributes/`.  Each
  * scalar (num_channels=1) attribute becomes one numerical column in
  * neuroglancer's segment-properties UI; the row order maps directly to
@@ -627,7 +681,11 @@ function reinterpretObjectAttributeBytes(
  * naming convention writers don't currently follow.  Same for dtypes
  * the segment-properties UI can't represent (uint64, float64, ...).
  *
- * `present_mask` arrays are honoured: rows with mask=0 are dropped
+ * Sparse rows are honoured: under the 0.8.1 layout each
+ * `object_attributes/<name>` array persists absent rows in-band as its
+ * own `fill_value` (NaN for floats, dtype-min/max for ints — see
+ * `write_object_attributes` in zarr-vectors-py) rather than via a
+ * sibling `present_mask` array; rows equal to that sentinel are dropped
  * from the segment-properties output so absent objects don't appear
  * with zero-padded values.
  */
@@ -650,7 +708,7 @@ async function buildObjectAttributePropertyMap(
     name: string;
     dataType: DataType;
     values: ReturnType<typeof reinterpretObjectAttributeBytes>;
-    presentMask?: Uint8Array;
+    fillValue: number;
     numObjects: number;
   };
   const specs = await Promise.all(
@@ -666,27 +724,38 @@ async function buildObjectAttributePropertyMap(
         options,
       );
       if (meta === undefined) return undefined;
-      const attrs = meta?.attributes ?? meta;
+      const attrs = meta?.attributes ?? {};
       const dtype = String(attrs?.dtype ?? "");
       const numChannels = Number(attrs?.num_channels ?? 1);
-      const shape = Array.isArray(attrs?.shape) ? attrs.shape : undefined;
+      // `shape` is a standard zarr v3 array field (not a library
+      // convention) — under the 0.8.1 layout `object_attributes/<name>`
+      // is itself the array, not a group wrapping a `data/` child.
+      const shape = Array.isArray(meta?.shape) ? meta.shape : undefined;
       const numObjects = shape !== undefined ? Number(shape[0]) : 0;
       if (numObjects <= 0) return undefined;
-      const entry = OBJECT_ATTR_DTYPE_TABLE[dtype];
-      if (entry === undefined || numChannels !== 1) {
-        // Skip exotic dtypes and multi-channel attributes — see docstring.
+      if (numChannels !== 1) {
+        // Multi-channel attributes aren't representable — see docstring.
         return undefined;
       }
-      // On-disk layout: `object_attributes/<name>/` is a group; the
-      // raw bytes live in a single-chunk zarr v3 array directory
-      // `data/` underneath it (`data/c/0` is the byte-blob; uint8 dtype
-      // at the zarr level, semantic dtype carried in the outer group's
-      // attributes — see `write_object_attributes` in zarr-vectors-py).
-      // We bypass the inner zarr metadata and read `data/c/0` directly:
-      // the byte length is known from `numObjects * elementSize`, and
+      const entry = OBJECT_ATTR_DTYPE_TABLE[dtype];
+      // float64 isn't in the table (no neuroglancer DataType for it, and
+      // it's twice the element size of everything else) but is common for
+      // TRX-derived dps columns (e.g. a "bundle" id stored as float64) —
+      // downcast to float32 for display rather than dropping the column
+      // outright.  Safe for anything actually representable as an id/
+      // category/measurement; genuine float64-precision-dependent values
+      // would already be a poor fit for the segment-properties UI.
+      const isFloat64 = entry === undefined && dtype === "float64";
+      if (entry === undefined && !isFloat64) {
+        // Skip exotic dtypes the segment-properties UI can't represent.
+        return undefined;
+      }
+      // On-disk layout: `object_attributes/<name>` is a single standard
+      // Zarr v3 array (0.8.1) — read its one chunk (`c/0`) directly; the
+      // byte length is known from `numObjects * elementSize`, and
       // chunking is fixed to a single chunk by the writer.
       const dataResponse = await sharedKvStoreContext.kvStoreContext.read(
-        joinBaseUrlAndPath(arrayUrl, "data/c/0"),
+        joinBaseUrlAndPath(arrayUrl, "c/0"),
         options,
       );
       if (dataResponse === undefined) return undefined;
@@ -700,33 +769,21 @@ async function buildObjectAttributePropertyMap(
         rawBytes,
         options.signal ?? new AbortController().signal,
       );
-      const values = reinterpretObjectAttributeBytes(
-        bytes,
-        entry.ctor,
-        entry.elementSize,
-        numObjects,
-      );
-      let presentMask: Uint8Array | undefined;
-      if (attrs?.has_present_mask === true) {
-        const maskResponse = await sharedKvStoreContext.kvStoreContext.read(
-          joinBaseUrlAndPath(arrayUrl, "present_mask/c/0"),
-          options,
-        );
-        if (maskResponse !== undefined) {
-          const rawMaskBytes = new Uint8Array(
-            (await maskResponse.response.arrayBuffer()) as ArrayBuffer,
+      const values = isFloat64
+        ? reinterpretFloat64AsFloat32(bytes, numObjects)
+        : reinterpretObjectAttributeBytes(
+            bytes,
+            entry!.ctor,
+            entry!.elementSize,
+            numObjects,
           );
-          presentMask = await maybeDecompressObjAttr(
-            rawMaskBytes,
-            options.signal ?? new AbortController().signal,
-          );
-        }
-      }
+      const dataType = isFloat64 ? DataType.FLOAT32 : entry!.dataType;
+      const fillValue = parseObjectAttributeFillValue(meta?.fill_value);
       return {
         name,
-        dataType: entry.dataType,
+        dataType,
         values,
-        presentMask,
+        fillValue,
         numObjects,
       };
     }),
@@ -747,25 +804,19 @@ async function buildObjectAttributePropertyMap(
       );
     }
   }
-  // Effective present-mask: AND of all attribute masks (a row is
-  // emitted only if every attribute considers it real).  In the common
-  // case where no attribute carries a mask, every row is kept.
-  let effectiveMask: Uint8Array | undefined;
-  for (const s of present) {
-    if (s.presentMask === undefined) continue;
-    if (effectiveMask === undefined) {
-      effectiveMask = new Uint8Array(s.presentMask);
-    } else {
-      for (let i = 0; i < numObjects; ++i) {
-        effectiveMask[i] = effectiveMask[i] && s.presentMask[i] ? 1 : 0;
-      }
-    }
-  }
+  // Effective presence: a row is emitted only if EVERY attribute has a
+  // real (non-fill-value) value there — the 0.8.1 in-band-sentinel
+  // analog of the old present_mask AND-across-attributes rule.
   const keepIndices: number[] = [];
   for (let i = 0; i < numObjects; ++i) {
-    if (effectiveMask === undefined || effectiveMask[i] === 1) {
-      keepIndices.push(i);
+    let allPresent = true;
+    for (const s of present) {
+      if (valueEqualsFillValue(Number(s.values[i]), s.fillValue)) {
+        allPresent = false;
+        break;
+      }
     }
+    if (allPresent) keepIndices.push(i);
   }
   if (keepIndices.length === 0) return undefined;
 
@@ -801,6 +852,388 @@ async function buildObjectAttributePropertyMap(
       bounds: [min, max],
     };
     properties.push(numerical);
+  }
+
+  const inline: InlineSegmentPropertyMap = normalizeInlineSegmentPropertyMap({
+    ids,
+    properties,
+  });
+  return new SegmentPropertyMap({ inlineProperties: inline });
+}
+
+// ---------------------------------------------------------------
+// Group-derived segment properties (TRX groups/group_attributes -> tags +
+// per-group numerical columns, projected onto member streamlines).
+// ---------------------------------------------------------------
+
+/**
+ * Fetch the level-0 object count from `object_index/manifests`' declared
+ * shape — the dense id space every per-object structure (object_attributes,
+ * group membership) is keyed against.
+ */
+async function readObjectCount(
+  sharedKvStoreContext: SharedKvStoreContext,
+  level0Url: string,
+  options: Partial<ProgressOptions>,
+): Promise<number> {
+  const meta = await getJsonResource(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(level0Url, "object_index/manifests/zarr.json"),
+    "zarr-vectors object_index/manifests metadata",
+    options,
+  ).catch(() => undefined);
+  const shape = meta?.shape;
+  if (!Array.isArray(shape) || typeof shape[0] !== "number") return 0;
+  return shape[0];
+}
+
+interface GroupMemberships {
+  numGroups: number;
+  /** memberOids[g] = member object (streamline) ids for group g. */
+  memberOids: number[][];
+}
+
+/**
+ * Read level-0 `groups`: a single vlen-bytes array, one row per group,
+ * each row the raw little-endian int64 bytes of that group's member
+ * object ids (or, for a contiguous-range group, an empty row plus a
+ * `group_ranges` entry on the array's own metadata — see
+ * `write_groupings` in zarr-vectors-py).  Returns `undefined` when the
+ * store has no `groups` at level 0.
+ */
+async function readGroupMemberships(
+  sharedKvStoreContext: SharedKvStoreContext,
+  level0Url: string,
+  options: Partial<ProgressOptions>,
+): Promise<GroupMemberships | undefined> {
+  const arrayUrl = joinBaseUrlAndPath(level0Url, "groups/");
+  const meta = await getJsonResource(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(arrayUrl, "zarr.json"),
+    "zarr-vectors groups metadata",
+    options,
+  ).catch(() => undefined);
+  if (meta === undefined) return undefined;
+  const numGroups = Number(meta?.attributes?.num_groups ?? 0);
+  if (numGroups <= 0) return undefined;
+  const groupRanges: Record<string, [number, number]> =
+    meta?.attributes?.group_ranges ?? {};
+
+  const dataResponse = await sharedKvStoreContext.kvStoreContext.read(
+    joinBaseUrlAndPath(arrayUrl, "c/0"),
+    options,
+  );
+  if (dataResponse === undefined) return undefined;
+  const rawBytes = new Uint8Array(
+    (await dataResponse.response.arrayBuffer()) as ArrayBuffer,
+  );
+  const bytes = await maybeDecompressObjAttr(
+    rawBytes,
+    options.signal ?? new AbortController().signal,
+  );
+  const blobs = decodeVlenBytesChunk(bytes);
+  if (blobs.length !== numGroups) {
+    throw new Error(
+      `zarr-vectors groups: expected ${numGroups} rows, decoded ${blobs.length}`,
+    );
+  }
+  const memberOids: number[][] = new Array(numGroups);
+  for (let g = 0; g < numGroups; ++g) {
+    const blob = blobs[g];
+    const range = groupRanges[String(g)];
+    if (blob.byteLength === 0 && range !== undefined) {
+      const [start, stop] = range;
+      const arr: number[] = new Array(Math.max(0, stop - start));
+      for (let i = 0; i < arr.length; ++i) arr[i] = start + i;
+      memberOids[g] = arr;
+      continue;
+    }
+    const n = blob.byteLength / 8;
+    if (!Number.isInteger(n)) {
+      throw new Error(
+        `zarr-vectors groups: group ${g} byte length ${blob.byteLength} ` +
+          `not a multiple of 8`,
+      );
+    }
+    const i64 =
+      blob.byteOffset % 8 === 0
+        ? new BigInt64Array(blob.buffer, blob.byteOffset, n)
+        : (() => {
+            const copy = new Uint8Array(blob.byteLength);
+            copy.set(blob);
+            return new BigInt64Array(copy.buffer, 0, n);
+          })();
+    const arr: number[] = new Array(n);
+    for (let i = 0; i < n; ++i) arr[i] = Number(i64[i]);
+    memberOids[g] = arr;
+  }
+  return { numGroups, memberOids };
+}
+
+/**
+ * Read tract/bundle names for `numGroups` groups: prefer the native
+ * `group_attributes/name` (`fixed_length_utf32`) column; fall back to the
+ * writer's `groups`-metadata `group_names_json` escape hatch (used if that
+ * write ever failed — see `_write_group_names` in `trx_parallel.py`).
+ * Returns `undefined` if neither is present or usable.
+ */
+async function readGroupNames(
+  sharedKvStoreContext: SharedKvStoreContext,
+  level0Url: string,
+  numGroups: number,
+  options: Partial<ProgressOptions>,
+): Promise<string[] | undefined> {
+  const arrayUrl = joinBaseUrlAndPath(level0Url, "group_attributes/name/");
+  const meta = await getJsonResource(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(arrayUrl, "zarr.json"),
+    "zarr-vectors group_attributes/name metadata",
+    options,
+  ).catch(() => undefined);
+  const dtypeName = meta?.data_type?.name;
+  if (meta !== undefined && dtypeName === "fixed_length_utf32") {
+    const lengthBytes = Number(
+      meta?.data_type?.configuration?.length_bytes ?? 0,
+    );
+    if (lengthBytes > 0 && lengthBytes % 4 === 0) {
+      const dataResponse = await sharedKvStoreContext.kvStoreContext.read(
+        joinBaseUrlAndPath(arrayUrl, "c/0"),
+        options,
+      );
+      if (dataResponse !== undefined) {
+        const rawBytes = new Uint8Array(
+          (await dataResponse.response.arrayBuffer()) as ArrayBuffer,
+        );
+        const bytes = await maybeDecompressObjAttr(
+          rawBytes,
+          options.signal ?? new AbortController().signal,
+        );
+        return decodeFixedLengthUtf32Strings(bytes, lengthBytes, numGroups);
+      }
+    }
+  }
+  const groupsMeta = await getJsonResource(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(level0Url, "groups/zarr.json"),
+    "zarr-vectors groups metadata",
+    options,
+  ).catch(() => undefined);
+  const namesJson = groupsMeta?.attributes?.group_names_json;
+  if (typeof namesJson === "string") {
+    try {
+      const names = JSON.parse(namesJson);
+      if (Array.isArray(names) && names.length === numGroups) {
+        return names.map(String);
+      }
+    } catch {
+      // fall through — synthesized names below.
+    }
+  }
+  return undefined;
+}
+
+/** List `group_attributes/<name>` subdirectories, excluding `"name"` (the
+ * tract-name column, handled separately by `readGroupNames`). */
+async function listGroupAttributeNames(
+  sharedKvStoreContext: SharedKvStoreContext,
+  level0Url: string,
+  options: Partial<ProgressOptions>,
+): Promise<string[]> {
+  const dirUrl = joinBaseUrlAndPath(level0Url, "group_attributes/");
+  const response = await sharedKvStoreContext.kvStoreContext
+    .list(dirUrl, { responseKeys: "suffix", ...options })
+    .catch(() => undefined);
+  if (response === undefined) return [];
+  return response.directories
+    .map((d: string) => (d.endsWith("/") ? d.slice(0, -1) : d))
+    .filter((d: string) => d.length > 0 && d !== "name")
+    .sort();
+}
+
+interface GroupNumericAttr {
+  name: string;
+  values: ReturnType<typeof reinterpretObjectAttributeBytes> | Float32Array;
+}
+
+/**
+ * Read every numeric `group_attributes/<name>` column (TRX `dpg` values),
+ * one value per group — `group_attributes` has no presence/fill-value
+ * convention (unlike `object_attributes`), so every row is real.
+ */
+async function readGroupNumericAttributes(
+  sharedKvStoreContext: SharedKvStoreContext,
+  level0Url: string,
+  numGroups: number,
+  options: Partial<ProgressOptions>,
+): Promise<GroupNumericAttr[]> {
+  const names = await listGroupAttributeNames(
+    sharedKvStoreContext,
+    level0Url,
+    options,
+  );
+  const specs = await Promise.all(
+    names.map(async (name): Promise<GroupNumericAttr | undefined> => {
+      const arrayUrl = joinBaseUrlAndPath(
+        level0Url,
+        `group_attributes/${name}/`,
+      );
+      const meta = await getJsonResource(
+        sharedKvStoreContext,
+        joinBaseUrlAndPath(arrayUrl, "zarr.json"),
+        `group_attribute ${JSON.stringify(name)} metadata`,
+        options,
+      );
+      if (meta === undefined) return undefined;
+      const attrs = meta?.attributes ?? {};
+      const dtype = String(attrs?.dtype ?? "");
+      const shape = Array.isArray(meta?.shape) ? meta.shape : undefined;
+      const numChannels =
+        shape !== undefined && shape.length > 1 ? Number(shape[1]) : 1;
+      if (
+        shape === undefined ||
+        Number(shape[0]) !== numGroups ||
+        numChannels !== 1
+      ) {
+        // Multi-channel / row-count-mismatched columns aren't representable
+        // as one scalar-per-group value — same restriction as object_attributes.
+        return undefined;
+      }
+      const entry = OBJECT_ATTR_DTYPE_TABLE[dtype];
+      const isFloat64 = entry === undefined && dtype === "float64";
+      if (entry === undefined && !isFloat64) return undefined;
+      const dataResponse = await sharedKvStoreContext.kvStoreContext.read(
+        joinBaseUrlAndPath(arrayUrl, "c/0"),
+        options,
+      );
+      if (dataResponse === undefined) return undefined;
+      const rawBytes = new Uint8Array(
+        (await dataResponse.response.arrayBuffer()) as ArrayBuffer,
+      );
+      const bytes = await maybeDecompressObjAttr(
+        rawBytes,
+        options.signal ?? new AbortController().signal,
+      );
+      const values = isFloat64
+        ? reinterpretFloat64AsFloat32(bytes, numGroups)
+        : reinterpretObjectAttributeBytes(
+            bytes,
+            entry!.ctor,
+            entry!.elementSize,
+            numGroups,
+          );
+      return { name, values };
+    }),
+  );
+  return specs.filter((s): s is GroupNumericAttr => s !== undefined);
+}
+
+/**
+ * Build a `SegmentPropertyMap` from level-0 `groups` + `group_attributes`
+ * (TRX-derived named bundles + their attributes): one categorical `tags`
+ * column (searchable via `#<tract name>` in the segments-list UI, the tag
+ * text itself being the bundle name) plus one numerical column per
+ * `<bundle name>_<attribute name>` pair (a TRX `dpg` value), each holding a
+ * value only for that bundle's member streamlines (`NaN` elsewhere).
+ * Returns `undefined` when the store has no `groups` at level 0.
+ *
+ * Bundles (groups) can overlap, so a streamline belonging to more than one
+ * bundle gets more than one tag (sorted, distinct — the
+ * `InlineSegmentTagsProperty` contract) *and* more than one numerical
+ * property — one per bundle it's a member of — rather than picking a single
+ * winner across bundles.
+ *
+ * Tag text and numerical-property ids use `sanitizeTagName` (spaces ->
+ * underscores) since neuroglancer's `#<tag>` query parser splits on literal
+ * spaces with no quoting; the original, unsanitized name is preserved as
+ * the tag's description for display.
+ */
+async function buildGroupPropertyMap(
+  sharedKvStoreContext: SharedKvStoreContext,
+  level0Url: string,
+  options: Partial<ProgressOptions>,
+): Promise<SegmentPropertyMap | undefined> {
+  const memberships = await readGroupMemberships(
+    sharedKvStoreContext,
+    level0Url,
+    options,
+  );
+  if (memberships === undefined) return undefined;
+  const { numGroups, memberOids } = memberships;
+
+  const numObjects = await readObjectCount(
+    sharedKvStoreContext,
+    level0Url,
+    options,
+  );
+  if (numObjects <= 0) return undefined;
+
+  const [names, numericAttrs] = await Promise.all([
+    readGroupNames(sharedKvStoreContext, level0Url, numGroups, options),
+    readGroupNumericAttributes(sharedKvStoreContext, level0Url, numGroups, options),
+  ]);
+  const tagNames =
+    names ?? Array.from({ length: numGroups }, (_, g) => `group ${g}`);
+  // neuroglancer's `#<tag>` query parser splits on literal spaces with no
+  // quoting, so the searchable tag text must not contain spaces — the
+  // original name (with spaces, if any) is kept as the tag's description.
+  const sanitizedTagNames = tagNames.map(sanitizeTagName);
+
+  const { tagValues } = invertGroupMembershipsToTags(
+    numObjects,
+    numGroups,
+    memberOids,
+  );
+
+  const ids = new BigUint64Array(numObjects);
+  for (let oid = 0; oid < numObjects; ++oid) ids[oid] = BigInt(oid);
+
+  const properties: InlineSegmentProperty[] = [];
+  const tags: InlineSegmentTagsProperty = {
+    id: "group",
+    type: "tags",
+    tags: sanitizedTagNames,
+    tagDescriptions: tagNames,
+    values: tagValues,
+  };
+  properties.push(tags);
+
+  // One numerical property per (bundle, attribute) pair, so overlapping
+  // bundle membership surfaces as multiple properties rather than a single
+  // ambiguous column. Property ids are deduplicated in case two bundles
+  // happen to share a name.
+  const usedPropertyIds = new Set<string>(["group"]);
+  function makePropertyId(base: string, g: number): string {
+    if (!usedPropertyIds.has(base)) {
+      usedPropertyIds.add(base);
+      return base;
+    }
+    const suffixed = `${base}_g${g}`;
+    usedPropertyIds.add(suffixed);
+    return suffixed;
+  }
+  for (const attr of numericAttrs) {
+    for (let g = 0; g < numGroups; ++g) {
+      const members = memberOids[g];
+      if (members.length === 0) continue;
+      const groupValue = Number(attr.values[g]);
+      const projected = new Float32Array(numObjects).fill(NaN);
+      for (const oid of members) {
+        if (oid < 0 || oid >= numObjects) continue;
+        projected[oid] = groupValue;
+      }
+      const bounds: [number, number] = Number.isFinite(groupValue)
+        ? [groupValue, groupValue]
+        : [0, 0];
+      const numerical: InlineSegmentNumericalProperty = {
+        id: makePropertyId(`${sanitizedTagNames[g]}_${attr.name}`, g),
+        type: "number",
+        dataType: DataType.FLOAT32,
+        description: undefined,
+        values: projected as unknown as InlineSegmentNumericalProperty["values"],
+        bounds,
+      };
+      properties.push(numerical);
+    }
   }
 
   const inline: InlineSegmentPropertyMap = normalizeInlineSegmentPropertyMap({
@@ -1111,6 +1544,19 @@ interface SkeletonMetadata {
    */
   segmentPropertyMap?: SegmentPropertyMap;
   /**
+   * TRX-derived `groups`/`group_attributes` assembled into a second
+   * `SegmentPropertyMap` — one `tags` column (group/tract membership,
+   * searchable via `#<name>`, tag text = bundle name) plus one numerical
+   * `<bundle name>_<attribute name>` column per (bundle, numeric group
+   * attribute) pair, each populated only for that bundle's members —
+   * overlapping bundle membership yields multiple numerical properties per
+   * streamline rather than one ambiguous column.  `undefined` when the
+   * store has no `groups` at level 0.  Exposed by `getSkeletonDataSource`
+   * as its own opt-in `"properties-groups"` subsource, independent of
+   * `segmentPropertyMap` — the layer merges every enabled subsource's map.
+   */
+  groupPropertyMap?: SegmentPropertyMap;
+  /**
    * Per-level parameter blobs for the spatially-indexed (pass-1) chunk
    * sources, finest-first.  Together with `spatialGrid` they let the
    * multiscale source build the per-level chunk specs.
@@ -1390,31 +1836,17 @@ async function buildSkeletonMetadata(
     const perLevelMeta: {
       chunkShape: Float32Array;
       hasFragmentSegmentIds: boolean;
-      verticesRangeAddressable: boolean;
     }[] = await Promise.all(
       levelPaths.map(async (levelPath) => {
         const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
           pipelineUrlJoin(storeUrl, levelPath),
         );
-        // The `vertices_layout` capability is stamped on the `vertices`
-        // array's own metadata (see zarr-vectors-py `create_vertices_array`),
-        // so read it alongside the level metadata. `"raw_v1"` means the
-        // `vertices` chunk blobs are uncompressed and byte-range-addressable
-        // per fragment (`rowIndex * rank * 4`), enabling pass-2 scoped reads.
-        const [levelJson, verticesJson] = await Promise.all([
-          getJsonResource(
-            sharedKvStoreContext,
-            joinBaseUrlAndPath(levelUrl, "zarr.json"),
-            `zarr-vectors level ${JSON.stringify(levelPath)} metadata`,
-            options,
-          ).catch(() => undefined),
-          getJsonResource(
-            sharedKvStoreContext,
-            joinBaseUrlAndPath(levelUrl, "vertices/zarr.json"),
-            `zarr-vectors level ${JSON.stringify(levelPath)} vertices metadata`,
-            options,
-          ).catch(() => undefined),
-        ]);
+        const levelJson = await getJsonResource(
+          sharedKvStoreContext,
+          joinBaseUrlAndPath(levelUrl, "zarr.json"),
+          `zarr-vectors level ${JSON.stringify(levelPath)} metadata`,
+          options,
+        ).catch(() => undefined);
         const lvlAttrs = levelJson?.attributes?.zarr_vectors_level ?? {};
         const override = lvlAttrs?.chunk_shape;
         const chunkShape =
@@ -1432,9 +1864,7 @@ async function buildSkeletonMetadata(
         const hasFragmentSegmentIds =
           arraysPresent.length === 0 ||
           arraysPresent.includes("fragment_attributes");
-        const verticesRangeAddressable =
-          verticesJson?.attributes?.vertices_layout === "raw_v1";
-        return { chunkShape, hasFragmentSegmentIds, verticesRangeAddressable };
+        return { chunkShape, hasFragmentSegmentIds };
       }),
     );
     const perLevelChunkShape = perLevelMeta.map((m) => m.chunkShape);
@@ -1486,7 +1916,6 @@ async function buildSkeletonMetadata(
         ),
         hasFragmentSegmentIds: perLevelMeta[k].hasFragmentSegmentIds,
         chunkShape: Array.from(perLevelMeta[k].chunkShape),
-        verticesRangeAddressable: perLevelMeta[k].verticesRangeAddressable,
       }));
       multiParams.rank = rank;
       multiParams.attributeNames = attributeNames;
@@ -1507,20 +1936,18 @@ async function buildSkeletonMetadata(
     // the fragment_attributes/segment_id fetch.  Overrides the default-true
     // placeholder set above.
     pass2Params.hasFragmentSegmentIds = perLevelMeta[0].hasFragmentSegmentIds;
-    // Single-level pass-2: gate scoped range reads on level 0's layout.
-    pass2Params.verticesRangeAddressable =
-      perLevelMeta[0].verticesRangeAddressable;
   }
 
-  // Discover per-object attributes at level 0 and build the
-  // segment-properties map.  Pinned to level 0 because object_ids are
-  // global across the pyramid; coarser levels reuse the level-0 row
-  // assignments via `present_mask` (handled inside the builder).
-  const segmentPropertyMap = await buildObjectAttributePropertyMap(
-    sharedKvStoreContext,
-    level0Url,
-    options,
-  );
+  // Discover per-object attributes AND groups/group_attributes at level 0,
+  // building both segment-property maps concurrently — independent reads,
+  // and independently opt-in subsources (see `groupPropertyMap`'s
+  // docstring).  Pinned to level 0 because object_ids are global across the
+  // pyramid; coarser levels reuse the level-0 row assignments via
+  // `present_mask` (handled inside the builder).
+  const [segmentPropertyMap, groupPropertyMap] = await Promise.all([
+    buildObjectAttributePropertyMap(sharedKvStoreContext, level0Url, options),
+    buildGroupPropertyMap(sharedKvStoreContext, level0Url, options),
+  ]);
 
   // Do NOT apply the NGFF per-level `translation` to skeleton/streamline/
   // polyline/graph vertices.  zarr-vectors writers store vertices in exact
@@ -1541,6 +1968,7 @@ async function buildSkeletonMetadata(
     pass1Levels,
     spatialGrid,
     segmentPropertyMap,
+    groupPropertyMap,
   };
 }
 
@@ -1638,6 +2066,19 @@ function getSkeletonDataSource(
       id: "properties",
       default: false,
       subsource: { segmentPropertyMap: metadata.segmentPropertyMap },
+    });
+  }
+
+  // Group-derived segment properties — a separate opt-in subsource from
+  // `"properties"` (see `groupPropertyMap`'s docstring): different source
+  // data (`groups`/`group_attributes` vs `object_attributes`), but the
+  // layer merges every enabled subsource's map, so there's no need to
+  // combine them into one before returning.
+  if (metadata.groupPropertyMap !== undefined) {
+    subsources.push({
+      id: "properties-groups",
+      default: false,
+      subsource: { segmentPropertyMap: metadata.groupPropertyMap },
     });
   }
 

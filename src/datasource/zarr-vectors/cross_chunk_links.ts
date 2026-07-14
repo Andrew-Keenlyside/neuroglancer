@@ -7,52 +7,102 @@
 
 /**
  * Read and decode the ``cross_chunk_links/<delta>/`` tree emitted by
- * zarr-vectors 0.8 writers under the ``"explicit_links"`` cross-chunk
- * strategy.
+ * zarr-vectors-py 0.8.1 (``main``) writers under the ``"explicit_links"``
+ * cross-chunk strategy.
  *
- * **v0.8 sharded layout** (see
- * ``zarr-vectors-py/docs/spec/object_model/cross_chunk_links.md`` and
- * ``zarr-vectors-py/zarr_vectors/core/arrays.py:write_cross_chunk_links``):
- * cross-chunk records are partitioned by ``K`` (the number of distinct
- * chunks a record touches, ``1 <= K <= link_width``) into a family of
- * ``cross_chunk_links/<delta>/kK/`` arrays.  Each ``kK`` array is a zarr
- * v3 ``sharding_indexed``-coded, variable-length-bytes array whose
- * logical shape is ``(Cx, Cy, Cz)`` repeated ``K`` times; the cell at
- * coordinate ``(chunk_0 - origin) ⧺ … ⧺ (chunk_{K-1} - origin)`` (chunks
- * in lex order) holds a ragged byte blob encoding every record whose
- * sorted-unique-chunks tuple equals that cell's chunks.
+ * **0.8.1 flat-cell-key layout** (see
+ * ``zarr_vectors.core.arrays.write_cross_chunk_link_cells`` /
+ * ``zarr_vectors.spatial.boundary.canonical_sort`` /
+ * ``zarr_vectors.core.paths.format_cell_key``): each cross-chunk record
+ * is a list of ``link_width`` ``(chunk_coords, vertex_idx)`` endpoints.
+ * The record's endpoints are stored under a cell keyed by the dotted
+ * concatenation of the endpoints' chunk coordinates —
+ * ``cross_chunk_links/<delta>/<cell_key>`` where ``cell_key`` has
+ * ``link_width * sid_ndim`` dotted integer components (``L`` chunk-coord
+ * tuples of ``sid_ndim`` ints each, back to back). Each such path is
+ * itself a standard (non-sharded) zarr v3 array — the same "one tiny
+ * ``bytes``+``zstd``-coded array per key" convention used everywhere else
+ * in this format for small per-key blobs (see e.g.
+ * ``vertex_fragments``/``fragment_attributes`` chunk downloads in
+ * ``skeleton_chunk_download.ts``) — at ``<cell_key>/c/0``.
  *
- * Each cell's *decoded* (post inner-codec) payload is:
- * ``[ci_0..ci_{L-1} (L * uint8), vi_0..vi_{L-1} (L * int64 little-endian)]``
- * repeated back-to-back per record, where ``L = link_width``.  ``ci_i``
- * indexes into the cell's K sorted chunks to say which chunk endpoint
- * ``i`` lives in; ``vi_i`` is its local vertex index in that chunk.
+ * For an **undirected** (``store="canonical"``) family the cell key is
+ * the endpoints' chunks in canonical (lexicographic) order. For a
+ * **directed** family the cell key is the *literal input order* — endpoint
+ * 0 is the "owning" side, so e.g. a streamline's predecessor→successor
+ * transition between chunk A and chunk B files under ``A.B``, and the
+ * reverse transition under ``B.A`` (see
+ * ``zarr_vectors.spatial.boundary._cell_placements``).
  *
- * The inner (per-cell) codec chain the writer uses is
- * ``vlen-bytes`` (numcodecs' length-prefixed framing — see
- * https://github.com/zarr-developers/numcodecs/blob/main/src/numcodecs/vlen.pyx)
- * then ``zstd``.  Since each cell's zarr *sub-chunk* holds exactly one
- * array element (inner ``chunk_shape`` is all-``1``s), the vlen-bytes
- * frame always has exactly one item; decoding it recovers the raw
- * record bytes above.
+ * A cell's decompressed payload is an "inline-header ragged blob"
+ * (``zarr_vectors.encoding.ragged.encode_ragged_blob``): an ``int64``
+ * count ``k`` of records, then ``k`` ``int64`` byte-offsets into the data
+ * section that follows, one per record (records are written back-to-back
+ * so offsets increase by exactly ``(1 + link_width) * 8`` bytes each, but
+ * this reader honors the offsets rather than assuming that). Each
+ * record is ``(1 + link_width)`` ``int64`` little-endian values:
+ * ``[perm_idx, vi_0, ..., vi_{link_width-1}]``.
  *
- * The outer shard's on-disk layout (zarr v3 ``sharding_indexed``, see
- * the zarr v3 spec) is: concatenated cell byte blobs, followed by a
- * flat ``(num_cells_in_shard, 2)`` (row-major) index of
- * ``(offset, length)`` ``uint64`` little-endian pairs, followed by a
- * 4-byte ``crc32c`` checksum over the index — with the index block
- * placed at ``index_location`` (``"start"`` or ``"end"``, this writer
- * uses ``"end"``).  A pair of all-``1`` bits (``2^64 - 1``) marks an
- * absent cell.
+ * ``perm_idx`` is the *Lehmer code* of the permutation that maps the
+ * cell's canonical (stored) endpoint order back to the record's original
+ * input order — see ``zarr_vectors.spatial.boundary._lehmer_encode`` /
+ * ``_lehmer_decode`` / ``apply_perm_inverse``. This applies
+ * unconditionally (both directed and undirected families): for a
+ * directed family ``perm_idx`` is always 0 (the identity permutation,
+ * since the writer stores endpoints in their literal input order
+ * already); for an undirected family it recovers the pre-canonicalization
+ * order (needed e.g. for mesh-face winding). Concretely: let ``sorted[i]
+ * = (cellChunks[i], vi_i)``; decode ``sortedIdx = lehmerDecode(perm_idx,
+ * link_width)``; then ``original[sortedIdx[i]] = sorted[i]``.
  *
- * v0.7 stores (single flat blob at ``cross_chunk_links/<delta>/data``)
- * are not supported here — see the "Migration from 0.7" section of the
- * spec page above.
+ * The cell's zstd frame wraps the ragged blob directly — there is no
+ * vlen-bytes framing layer for cross-chunk-link cells (unlike the
+ * sharded per-chunk arrays read in ``skeleton_chunk_download.ts``, which
+ * do use vlen-bytes since they're elements of a ``variable_length_bytes``
+ * sharded array; a CCL cell is a plain scalar ``bytes``-array chunk).
+ *
+ * The group's own ``cross_chunk_links/<delta>/zarr.json`` carries
+ * ``link_width``, ``sid_ndim``, ``directed``, and ``store``
+ * (``"canonical"`` or ``"duplicate"``) attributes, and no per-``K``
+ * sub-arrays (the pre-0.8.1 ``sharded_v1`` kK-array layout this reader
+ * used to support is gone; this reader targets 0.8.1 stores only).
+ *
+ * **Two physical layouts** (discriminated by the ``layout`` attribute on
+ * the family's ``zarr.json``; this reader dispatches PER-FAMILY, so a
+ * single store may mix them across levels):
+ *
+ * 1. ``"flat_cells"`` (default; also the meaning when ``layout`` is
+ *    ABSENT): ``cross_chunk_links/<delta>/`` is a GROUP and each populated
+ *    cell is its own tiny non-sharded ``bytes``+``zstd`` array at
+ *    ``<cell_key>/c/0`` (everything described above). Cells are discovered
+ *    by listing the group (``kvStoreList``).
+ *
+ * 2. ``"packed_sharded"`` (opt-in): ``cross_chunk_links/<delta>/`` is a
+ *    SINGLE native-sharded 1-D ``variable_length_bytes`` Zarr array of
+ *    shape ``(N,)`` (``N`` = number of populated cells), read with the
+ *    same machinery as the per-chunk arrays in ``sharded_array.ts``. Its
+ *    ``zarr.json`` attributes additionally carry ``layout:
+ *    "packed_sharded"`` and ``cell_keys`` — a sorted JSON list of the
+ *    ``<cell_key>`` strings, where flat array index ``i`` holds the cell
+ *    for ``cell_keys[i]`` (so cells are enumerated from ``cell_keys``, no
+ *    ``kvStoreList``). Element ``i``'s DECODED bytes (post vlen-unframe +
+ *    zstd) are the EXACT SAME ragged-int64 blob a flat cell's decoded
+ *    payload holds — only the storage location differs, so every layout-
+ *    independent decoder below is reused unchanged.
  */
 
 import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
 import { requestAsyncComputation } from "#src/async_computation/request.js";
+import {
+  parseShardedArrayMeta,
+  readShardedArrayChunk,
+  type ShardedArrayMeta,
+  type ShardedArrayReadContext,
+  type ShardedArrayReadRange,
+  type ShardIndexCache,
+} from "#src/datasource/zarr-vectors/sharded_array.js";
 import { arraysEqual } from "#src/util/array.js";
+import { asyncMemoize, type AsyncMemoize } from "#src/util/memoize.js";
 
 /** One endpoint of a cross-chunk record. */
 export interface CrossChunkLinkEndpoint {
@@ -89,13 +139,12 @@ export interface CrossChunkLinksListResult {
 export interface CrossChunkLinksReaderOptions {
   /**
    * Reads one byte blob relative to the resolution-level base URL.
-   * Returns ``undefined`` for missing keys.  **Must return raw
+   * Returns ``undefined`` for missing keys. **Must return raw
    * (non-decompressed) bytes** — this module manages zstd
-   * decompression itself at the per-cell granularity; a shard file's
-   * overall bytes are a multi-cell concatenation, not a single zstd
-   * frame, so passing a blob through a magic-byte-sniffing
-   * auto-decompressor (as used for plain vertex/attribute reads
-   * elsewhere in this datasource) would corrupt shard parsing.
+   * decompression itself; a magic-byte-sniffing auto-decompressor (as
+   * used for plain vertex/attribute reads elsewhere in this datasource)
+   * would work here too since each cell is its own independent zstd
+   * frame, but this module doesn't rely on that behavior.
    */
   readonly kvStoreRead: (
     subpath: string,
@@ -103,89 +152,109 @@ export interface CrossChunkLinksReaderOptions {
   ) => Promise<Uint8Array | undefined>;
   /**
    * Lists the immediate children of one directory-like prefix
-   * (relative to the resolution-level base URL).  Required to discover
-   * which shards of a ``kK`` array are populated — sharded arrays have
-   * no way to enumerate written cells other than listing the store.
-   * Omit only in contexts (e.g. tests targeting a single known shard)
-   * that don't need whole-table enumeration.
+   * (relative to the resolution-level base URL). Required to discover
+   * which ``<cell_key>`` entries exist under
+   * ``cross_chunk_links/<delta>/`` — a flat namespace has no way to
+   * enumerate written cells other than listing the store. Omit only in
+   * contexts (e.g. tests, or {@link readCrossChunkLinksForOwnedChunks}'s
+   * go-direct path) that don't need whole-table enumeration.
    */
   readonly kvStoreList?: (
     prefix: string,
     signal: AbortSignal,
   ) => Promise<CrossChunkLinksListResult>;
+  /**
+   * Byte-range reader (rooted like {@link kvStoreRead}, returning RAW
+   * non-decompressed bytes) used ONLY by the ``"packed_sharded"`` layout
+   * to read one element of the native-sharded array via
+   * {@link readShardedArrayChunk}. Omit for ``"flat_cells"`` families
+   * (never consulted there). When a ``"packed_sharded"`` family is
+   * encountered and this is absent, the reader falls back to fetching the
+   * whole shard file via {@link kvStoreRead} and slicing it in-process
+   * (correct but wastes bandwidth — production call sites should thread a
+   * real byte-range reader through).
+   */
+  readonly kvStoreReadRange?: ShardedArrayReadRange;
   /** Level delta; 0 for intra-level, ±N for cross-level pyramids. */
   readonly delta?: number;
 }
 
 /**
  * A whole-level `cross_chunk_links/<delta>/` table can hold tens of
- * millions of records (a real ~100k-streamline store's level 0 has been
- * measured at 21.6M) — decoding all of them into `CrossChunkLinksTable`'s
- * nested-object representation costs roughly 15-20x the packed on-disk
- * size once V8's per-object/per-array overhead is counted (record →
- * endpoints array → endpoint objects → chunkCoords arrays), multiple
- * gigabytes for a real dataset.  Worse, holding that table in a plain
- * field (as callers here do) makes it invisible to neuroglancer's
- * `ChunkState`-tracked GPU/system memory budget — it's never evicted
- * under memory pressure.
+ * millions of records — decoding all of them into `CrossChunkLinksTable`'s
+ * nested-object representation costs many times the packed on-disk size
+ * once V8's per-object/per-array overhead is counted (record → endpoints
+ * array → endpoint objects → chunkCoords arrays). Worse, holding that
+ * table in a plain field (as callers here do) makes it invisible to
+ * neuroglancer's `ChunkState`-tracked GPU/system memory budget — it's
+ * never evicted under memory pressure.
  *
  * `readCrossChunkLinksForChunk` decodes only the records touching one
  * specific chunk (the actual per-`download()` need — see
- * `skeleton_backend.ts`), reusing two caches so repeated chunk queries
+ * `skeleton_backend.ts`), reusing caches so repeated chunk queries
  * amortize the discovery/fetch cost without re-decoding the world:
  *
- * - `shardCoords`: populated-shard-coordinate discovery results, keyed by
- *   `kBase` *and* the queried target chunk (see below for why) — cheap to
- *   keep (arrays of small coordinate tuples, not decoded records) and
- *   avoid re-walking the `kvStoreList` discovery tree for a repeat query
- *   of the same chunk.  Values are `Promise`s, not resolved arrays, so
- *   that concurrent queries for the same key (e.g. every visible chunk's
- *   `download()` firing at once before the first one's walk resolves)
- *   share one discovery walk instead of each independently re-running it.
- * - `shardBytes`: raw (still-compressed) whole-shard byte blobs, bounded
- *   by {@link BoundedByteCache} so a huge dataset's shard bytes don't
- *   accumulate without limit — nearby chunks' queries typically land in
- *   the same or adjacent shards, so caching pays off without needing to
- *   retain every shard ever touched.
+ * - `headers`: resolved group metadata (`link_width`/`sid_ndim`/
+ *   `directed`/`store`), keyed by the `cross_chunk_links/<delta>` base
+ *   path — a per-level constant, fetched once.
+ * - `cellKeys`: the full list of populated `<cell_key>` names under one
+ *   `cross_chunk_links/<delta>/`, keyed by that same base path. The 0.8.1
+ *   layout has no per-chunk discovery query (unlike the pre-0.8.1
+ *   sharded kK layout's shard-coordinate pruning) — one flat listing per
+ *   level, cached, means a repeat query for a *different* target chunk
+ *   at the same level costs zero additional network requests (only a
+ *   client-side filter over the already-fetched key list).
+ * - `cellBytes`: raw (still zstd-compressed) per-cell byte blobs, bounded
+ *   by {@link BoundedByteCache} so a huge dataset's cell bytes don't
+ *   accumulate without limit.
  *
- * Chunk coordinates are NOT guaranteed to be spatially adjacent to be
- * linked — a heavily-decimated coarse pyramid level's boundary-crossing
- * points can be many original samples apart, so a cross-chunk link can
- * legitimately span chunks that aren't neighbors.  That rules out a
- * "only check nearby chunk pairs" shortcut — but a shard's *coordinate
- * range* is exactly known from its position in the discovery tree before
- * ever fetching it, so `listPopulatedShardCoords` prunes subtrees that
- * provably cannot contain a cell touching the target chunk (see
- * `ShardDiscoveryPruneTarget`), mirroring the equivalent shard-range
- * pre-filter zarr-vectors-py's `list_cross_chunk_link_leaves` applies on
- * the write/tooling side.  Because that pruning depends on which chunk is
- * being queried, the discovered shard list is no longer valid for a
- * *different* target chunk sharing the same `kBase` — hence the
- * per-target cache key instead of the simpler `kBase`-only key this cache
- * used before pruning existed.
+ * Values in `headers` and `cellKeys` are {@link AsyncMemoize}s, not bare
+ * `Promise`s, so that concurrent queries for the same level (e.g. every
+ * visible chunk's `download()` firing at once) share one resolve/list
+ * call instead of each independently repeating it — AND so that one
+ * caller's chunk getting cancelled (panned out of view, evicted for a
+ * higher-priority download) doesn't reject the shared in-flight
+ * promise for every OTHER still-active caller awaiting the same entry.
+ * A bare `Promise` cached from whichever caller's `signal` happened to
+ * start the fetch would tie the shared work to THAT caller's
+ * cancellation alone; `asyncMemoize` instead routes it through an
+ * internal `SharedAbortController` that only aborts once EVERY
+ * registered caller has walked away (see `sharded_array.ts`'s
+ * `ShardIndexCache`, which has the identical shape for the same
+ * reason).
  */
 export interface CrossChunkLinksCaches {
+  /** `"cross_chunk_links/<delta>"` -> resolved group metadata. */
+  readonly headers: Map<string, AsyncMemoize<ResolvedCclHeader | undefined>>;
+  /** `"cross_chunk_links/<delta>"` -> every populated `<cell_key>` name at that level. */
+  readonly cellKeys: Map<string, AsyncMemoize<string[]>>;
+  /** `"cross_chunk_links/<delta>/<cell_key>"` -> raw (compressed) cell bytes. */
+  readonly cellBytes: BoundedByteCache;
   /**
-   * `"cross_chunk_links/<delta>"` -> resolved group + per-K metadata.
-   * Per-level constants (group zarr.json, each kK zarr.json, and the k1
-   * 404), resolved once and shared across all chunk/object queries so they
-   * aren't re-fetched (or re-404'd) on every query.
+   * ``"packed_sharded"`` layout only: `"cross_chunk_links/<delta>"` ->
+   * that family's sharded-array {@link ShardIndexCache}, so element reads
+   * that land in the same shard reuse one shard-index fetch. One entry per
+   * family; created lazily on first packed read.
    */
-  readonly headers: Map<string, Promise<ResolvedCclHeader | undefined>>;
-  /** `"kBase:targetChunkCoords.join(',')"` -> discovered shard coordinates. */
-  readonly shardCoords: Map<string, Promise<number[][]>>;
-  /** `"kBase/c/shardCoord.join('/')"` -> raw (compressed) shard bytes. */
-  readonly shardBytes: BoundedByteCache;
+  readonly shardIndexCaches: Map<string, ShardIndexCache>;
+  /**
+   * ``"packed_sharded"`` layout only: `"cross_chunk_links/<delta>"` ->
+   * that family's `<cell_key>` -> flat-array-index lookup, built once from
+   * the header's ``cell_keys`` and reused across every go-direct probe.
+   */
+  readonly cellKeyIndexMaps: Map<string, Map<string, number>>;
 }
 
 /** Fresh, empty caches for one `(store, delta)` — share across every chunk query for that pair. */
 export function createCrossChunkLinksCaches(
-  maxShardBytesCached = 256 * 1024 * 1024,
+  maxCellBytesCached = 256 * 1024 * 1024,
 ): CrossChunkLinksCaches {
   return {
     headers: new Map(),
-    shardCoords: new Map(),
-    shardBytes: new BoundedByteCache(maxShardBytesCached),
+    cellKeys: new Map(),
+    cellBytes: new BoundedByteCache(maxCellBytesCached),
+    shardIndexCaches: new Map(),
+    cellKeyIndexMaps: new Map(),
   };
 }
 
@@ -226,49 +295,109 @@ export class BoundedByteCache {
   }
 }
 
-const MISSING_SHARD_ENTRY = 0xffffffffffffffffn;
-
 /**
- * Decode one numcodecs ``vlen-bytes``-framed buffer that is known to
- * hold exactly one item (the convention for a zarr sub-chunk of shape
- * all-``1``s).  Layout: 4-byte little-endian item count, then per item
- * a 4-byte little-endian length followed by that many raw bytes.  See
- * https://github.com/zarr-developers/numcodecs/blob/main/src/numcodecs/vlen.pyx
+ * Decode one "inline-header ragged blob"
+ * (``zarr_vectors.encoding.ragged.encode_ragged_blob``) of fixed-stride
+ * ``int64`` records: an ``int64`` count ``k``, then ``k`` ``int64`` byte
+ * offsets into the data section that follows, then the data itself.
+ * Each record occupies ``[offsets[i], offsets[i+1] or end)`` and must be
+ * exactly ``ncols * 8`` bytes. Returns one `BigInt64Array` of length
+ * `ncols` per record. Exported so tests can drive the decoder with
+ * hand-crafted byte fixtures.
  */
-export function decodeVlenBytesSingleItem(buf: Uint8Array): Uint8Array {
-  if (buf.byteLength < 8) {
+export function decodeRaggedBlobInt64Records(
+  bytes: Uint8Array,
+  ncols: number,
+): BigInt64Array[] {
+  if (bytes.byteLength < 8) return [];
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const k = Number(dv.getBigInt64(0, true));
+  if (k === 0) return [];
+  const headerLen = 8 * (1 + k);
+  if (bytes.byteLength < headerLen) {
     throw new Error(
-      `cross_chunk_links: vlen-bytes cell buffer too short (${buf.byteLength} bytes)`,
+      `cross_chunk_links: ragged blob header declares ${k} records ` +
+        `(needs ${headerLen} header bytes) but buffer is only ` +
+        `${bytes.byteLength} bytes`,
     );
   }
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const numItems = dv.getUint32(0, true);
-  if (numItems !== 1) {
-    throw new Error(
-      `cross_chunk_links: expected exactly 1 vlen-bytes item per cell, got ${numItems}`,
-    );
+  const offsets = new Array<number>(k);
+  for (let i = 0; i < k; ++i) {
+    offsets[i] = Number(dv.getBigInt64(8 + i * 8, true));
   }
-  const length = dv.getUint32(4, true);
-  if (8 + length > buf.byteLength) {
-    throw new Error(
-      `cross_chunk_links: vlen-bytes cell buffer truncated ` +
-        `(declared length ${length}, have ${buf.byteLength - 8} bytes)`,
+  const dataStart = headerLen;
+  const dataLen = bytes.byteLength - dataStart;
+  const rows: BigInt64Array[] = new Array(k);
+  for (let i = 0; i < k; ++i) {
+    const start = offsets[i];
+    const end = i + 1 < k ? offsets[i + 1] : dataLen;
+    const rowByteLength = end - start;
+    if (rowByteLength !== ncols * 8) {
+      throw new Error(
+        `cross_chunk_links: ragged blob record ${i} is ${rowByteLength} ` +
+          `bytes; expected ${ncols * 8} (ncols=${ncols})`,
+      );
+    }
+    const row = new BigInt64Array(ncols);
+    const rowDv = new DataView(
+      bytes.buffer,
+      bytes.byteOffset + dataStart + start,
+      rowByteLength,
     );
+    for (let c = 0; c < ncols; ++c) {
+      row[c] = rowDv.getBigInt64(c * 8, true);
+    }
+    rows[i] = row;
   }
-  return buf.subarray(8, 8 + length);
+  return rows;
 }
 
 /**
- * Decode one cell's raw record payload (post vlen-bytes framing) into
- * structured records.  ``sortedChunks`` is the cell's K sorted-unique
- * chunk-coordinate tuples (length K, each of length ``sidNdim``), in
- * the same order the writer used to compute each record's ``ci``.
- * Exported so tests can drive the decoder with hand-crafted byte
- * fixtures.
+ * Decode the Lehmer code `code` of a permutation of `range(L)` back into
+ * that permutation — the inverse of
+ * ``zarr_vectors.spatial.boundary._lehmer_encode``. `L` is small in
+ * practice (`link_width`, typically 2-4), so plain `number` arithmetic
+ * (not `BigInt`) is used throughout; `code` must already fit in a safe
+ * integer (guaranteed since `code < L!`, which is tiny for realistic
+ * `L`).
+ */
+export function lehmerDecode(code: number, L: number): number[] {
+  if (L < 1) {
+    throw new Error(`cross_chunk_links: lehmerDecode requires L >= 1, got ${L}`);
+  }
+  const available: number[] = [];
+  for (let i = 0; i < L; ++i) available.push(i);
+  const perm = new Array<number>(L);
+  let fact = 1;
+  for (let i = 2; i <= L; ++i) fact *= i; // L!
+  let remaining = code;
+  if (remaining < 0 || remaining >= fact) {
+    throw new Error(
+      `cross_chunk_links: perm_idx ${code} out of range [0, ${fact}) for L=${L}`,
+    );
+  }
+  for (let i = 0; i < L; ++i) {
+    fact = fact / (L - i);
+    const idx = Math.floor(remaining / fact);
+    remaining = remaining % fact;
+    perm[i] = available[idx];
+    available.splice(idx, 1);
+  }
+  return perm;
+}
+
+/**
+ * Decode one cell's decompressed payload (the ragged-blob-of-fixed-stride-
+ * records format described in this module's docstring) into structured
+ * records. ``cellChunks`` is the cell's `link_width` chunk-coordinate
+ * tuples in the exact order encoded in the cell's key (canonical order
+ * for an undirected family, literal input order for a directed one — see
+ * this module's docstring). Exported so tests can drive the decoder with
+ * hand-crafted byte fixtures.
  */
 export function decodeCrossChunkLinkCell(
   payload: Uint8Array,
-  sortedChunks: readonly (readonly number[])[],
+  cellChunks: readonly (readonly number[])[],
   linkWidth: number,
 ): CrossChunkLinkRecord[] {
   if (linkWidth < 1) {
@@ -276,335 +405,85 @@ export function decodeCrossChunkLinkCell(
       `cross_chunk_links: link_width must be >= 1; got ${linkWidth}`,
     );
   }
-  const K = sortedChunks.length;
-  const recordStride = linkWidth * 1 + linkWidth * 8; // L uint8 + L int64
-  if (payload.byteLength % recordStride !== 0) {
+  if (cellChunks.length !== linkWidth) {
     throw new Error(
-      `cross_chunk_links: cell payload ${payload.byteLength} bytes is not ` +
-        `a multiple of one record (${recordStride} bytes for link_width=${linkWidth})`,
+      `cross_chunk_links: cell has ${cellChunks.length} chunks; expected ` +
+        `link_width=${linkWidth}`,
     );
   }
-  const numRecords = payload.byteLength / recordStride;
-  const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const recordLen = 1 + linkWidth;
+  const rows = decodeRaggedBlobInt64Records(payload, recordLen);
   const records: CrossChunkLinkRecord[] = [];
-  for (let r = 0; r < numRecords; ++r) {
-    const recBase = r * recordStride;
-    const ciBase = recBase;
-    const viBase = recBase + linkWidth;
-    const endpoints: CrossChunkLinkEndpoint[] = [];
+  for (const row of rows) {
+    const permIdx = Number(row[0]);
+    const sortedEndpoints: CrossChunkLinkEndpoint[] = new Array(linkWidth);
     for (let i = 0; i < linkWidth; ++i) {
-      const ci = dv.getUint8(ciBase + i);
-      if (ci < 0 || ci >= K) {
-        throw new Error(
-          `cross_chunk_links: record ${r} endpoint ${i} has ci=${ci} out of ` +
-            `range [0, ${K})`,
-        );
-      }
-      const vi = dv.getBigInt64(viBase + i * 8, true);
-      endpoints.push({
-        chunkCoords: sortedChunks[ci].slice(),
-        vertexIndex: Number(vi),
-      });
+      sortedEndpoints[i] = {
+        chunkCoords: cellChunks[i].slice(),
+        vertexIndex: Number(row[1 + i]),
+      };
+    }
+    const sortedIdx = lehmerDecode(permIdx, linkWidth);
+    const endpoints = new Array<CrossChunkLinkEndpoint>(linkWidth);
+    for (let i = 0; i < linkWidth; ++i) {
+      endpoints[sortedIdx[i]] = sortedEndpoints[i];
     }
     records.push({ endpoints });
   }
   return records;
 }
 
-function unflattenRowMajor(
-  flatIndex: number,
-  shape: readonly number[],
-): number[] {
-  const ndim = shape.length;
-  const out = new Array<number>(ndim);
-  let rem = flatIndex;
-  for (let d = ndim - 1; d >= 0; --d) {
-    out[d] = rem % shape[d];
-    rem = Math.floor(rem / shape[d]);
+/** Concatenate `link_width` pre-ordered chunk-coord tuples into a dotted cell key. */
+function formatCellKey(chunks: readonly (readonly number[])[]): string {
+  const parts: string[] = [];
+  for (const c of chunks) {
+    for (const x of c) parts.push(String(x));
   }
-  return out;
+  return parts.join(".");
 }
 
-/**
- * Walk one shard's trailing/leading index and yield every populated
- * cell's local (within-shard) coordinate and byte range.
- */
-function* iteratePopulatedCellsInShard(
-  shardBytes: Uint8Array,
-  shardShape: readonly number[],
-  indexLocation: "start" | "end",
-): Iterable<{ subChunk: number[]; byteRange: { offset: number; length: number } }> {
-  const numCells = shardShape.reduce((a, b) => a * b, 1);
-  const indexBodyLen = numCells * 2 * 8;
-  const CHECKSUM_LEN = 4;
-  const indexRegionLen = indexBodyLen + CHECKSUM_LEN;
-  if (shardBytes.byteLength < indexRegionLen) {
+/** Inverse of {@link formatCellKey}: split a cell key into `linkWidth` chunk-coord tuples. */
+function parseCellKey(
+  key: string,
+  sidNdim: number,
+  linkWidth: number,
+): number[][] {
+  const parts = key.split(".");
+  const expected = sidNdim * linkWidth;
+  if (parts.length !== expected) {
     throw new Error(
-      `cross_chunk_links: shard (${shardBytes.byteLength} bytes) is smaller ` +
-        `than its own index region (${indexRegionLen} bytes for ${numCells} cells)`,
+      `cross_chunk_links: cell key ${JSON.stringify(key)} has ` +
+        `${parts.length} components; expected ${expected} ` +
+        `(sid_ndim=${sidNdim} * link_width=${linkWidth})`,
     );
   }
-  const indexStart =
-    indexLocation === "end"
-      ? shardBytes.byteLength - indexRegionLen
-      : 0;
-  const dv = new DataView(
-    shardBytes.buffer,
-    shardBytes.byteOffset + indexStart,
-    indexBodyLen,
-  );
-  for (let flatCell = 0; flatCell < numCells; ++flatCell) {
-    const offsetVal = dv.getBigUint64(flatCell * 16, true);
-    const lengthVal = dv.getBigUint64(flatCell * 16 + 8, true);
-    if (offsetVal === MISSING_SHARD_ENTRY && lengthVal === MISSING_SHARD_ENTRY) {
-      continue;
-    }
-    yield {
-      subChunk: unflattenRowMajor(flatCell, shardShape),
-      byteRange: { offset: Number(offsetVal), length: Number(lengthVal) },
-    };
+  const nums = parts.map(Number);
+  const chunks: number[][] = [];
+  for (let i = 0; i < linkWidth; ++i) {
+    chunks.push(nums.slice(i * sidNdim, (i + 1) * sidNdim));
   }
+  return chunks;
 }
 
-/**
- * Upper bound on simultaneously in-flight ``kvStoreList`` requests during
- * shard discovery.  The shard-coordinate space is ``ndim``-D (``sid_ndim *
- * K`` for a ``kK`` array), so a naive fully-parallel recursive walk over a
- * wide chunk grid can fan out into tens of thousands of concurrent HTTP
- * requests and exhaust the browser's connection pool
- * (``net::ERR_INSUFFICIENT_RESOURCES``). Capping concurrency keeps total
- * request count the same but bounds how many are ever in flight at once.
- */
-const MAX_CONCURRENT_SHARD_LIST_REQUESTS = 8;
-
-/**
- * Minimal concurrency limiter: at most ``maxConcurrent`` wrapped calls run
- * at once; additional calls queue and start as running ones settle.
- */
-function createConcurrencyLimiter(maxConcurrent: number) {
-  let active = 0;
-  const queue: Array<() => void> = [];
-  function next(): void {
-    if (active >= maxConcurrent || queue.length === 0) return;
-    active++;
-    queue.shift()!();
-  }
-  return function limit<T>(fn: () => Promise<T>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      queue.push(() => {
-        fn().then(
-          (value) => {
-            active--;
-            resolve(value);
-            next();
-          },
-          (error) => {
-            active--;
-            reject(error);
-            next();
-          },
-        );
-      });
-      next();
-    });
-  };
-}
-
-/**
- * Target-chunk-aware pruning info for {@link listPopulatedShardCoords}. A
- * ``kK`` array's ``ndim = sidNdim * K`` axes are ``K`` consecutive
- * ``sidNdim``-wide "slots," one per endpoint chunk a cell's K-tuple
- * touches. A cell can equal the target chunk in slot ``k`` only if
- * *every* axis of that slot's block contains the target's (origin
- * -shifted) coordinate — and a shard's axis range at each depth is known
- * from the path prefix alone, before any request is made for it. Once
- * every slot has been proven impossible along a given path (an axis
- * inside it failed containment), no completion of that path can ever
- * yield a matching cell, so the whole subtree is skipped.
- */
-interface ShardDiscoveryPruneTarget {
-  /** Target chunk's coordinates minus the array's `chunk_origin` (length `sidNdim`). */
-  readonly targetShifted: readonly number[];
-  readonly sidNdim: number;
-  /** The `kK` array's shard shape (length `ndim = sidNdim * K`). */
-  readonly shardShape: readonly number[];
-}
-
-/**
- * Recursively list every populated shard's coordinate tuple under
- * ``<kKBasePath>/c``.  zarr v3's default chunk-key encoding lays a
- * ``ndim``-D chunk coordinate out as ``ndim`` nested path segments
- * (``c/<i0>/<i1>/…/<i_{ndim-1}>``); this walks that tree one level at a
- * time via ``kvStoreList``, descending into every reported subdirectory
- * and treating leaves at depth ``ndim`` as populated shard files.
- *
- * Requests are routed through a shared concurrency limiter (see
- * ``MAX_CONCURRENT_SHARD_LIST_REQUESTS``) so a wide/deep shard grid can't
- * fire an unbounded burst of simultaneous ``kvStoreList`` calls.
- *
- * When ``pruneTarget`` is supplied, subtrees that provably cannot contain
- * a cell touching the target chunk are skipped without ever calling
- * ``kvStoreList`` on them — see {@link ShardDiscoveryPruneTarget}. Omit it
- * (as {@link readCrossChunkLinks}'s whole-table read does) to walk the
- * full tree unfiltered.
- */
-async function listPopulatedShardCoords(
-  kvStoreList: (
-    prefix: string,
-    signal: AbortSignal,
-  ) => Promise<CrossChunkLinksListResult>,
-  cBasePath: string,
-  ndim: number,
-  signal: AbortSignal,
-  pruneTarget?: ShardDiscoveryPruneTarget,
-): Promise<number[][]> {
-  const results: number[][] = [];
-  const limit = createConcurrencyLimiter(MAX_CONCURRENT_SHARD_LIST_REQUESTS);
-  const numSlots =
-    pruneTarget !== undefined ? ndim / pruneTarget.sidNdim : 0;
-  async function walk(
-    prefix: string,
-    coordsSoFar: number[],
-    slotPossible: readonly boolean[],
-  ): Promise<void> {
-    if (coordsSoFar.length === ndim) {
-      results.push(coordsSoFar);
-      return;
-    }
-    const { directories, files } = await limit(() =>
-      kvStoreList(`${prefix}/`, signal),
-    );
-    const isLastLevel = coordsSoFar.length === ndim - 1;
-    const names = isLastLevel ? [...directories, ...files] : directories;
-    const depth = coordsSoFar.length;
-    await Promise.all(
-      names.map((name) => {
-        // Reject empty / non-numeric entries. `Number("")` is `0` (an
-        // integer!), so an empty directory-listing entry would otherwise
-        // become a phantom coordinate `0` and produce a double-slash path
-        // (`c/0/0//0`) plus a bogus shard coord — guard against it.
-        if (name === "") return Promise.resolve();
-        const idx = Number(name);
-        if (!Number.isInteger(idx) || idx < 0) return Promise.resolve();
-        let nextSlotPossible = slotPossible;
-        if (pruneTarget !== undefined) {
-          const { targetShifted, sidNdim, shardShape } = pruneTarget;
-          const slot = Math.floor(depth / sidNdim);
-          if (slotPossible[slot]) {
-            const axis = depth % sidNdim;
-            const width = shardShape[depth];
-            const lo = idx * width;
-            if (targetShifted[axis] < lo || targetShifted[axis] >= lo + width) {
-              const copy = slotPossible.slice();
-              copy[slot] = false;
-              nextSlotPossible = copy;
-              // Every slot proven impossible (slots not yet visited stay
-              // `true` until disproven, so this can only fire once the
-              // last slot's own axes have been ruled out) — no
-              // completion of this path can match; skip it entirely.
-              if (copy.every((possible) => !possible)) {
-                return Promise.resolve();
-              }
-            }
-          }
-        }
-        return walk(
-          `${prefix}/${name}`,
-          [...coordsSoFar, idx],
-          nextSlotPossible,
-        );
-      }),
-    );
-  }
-  await walk(
-    cBasePath,
-    [],
-    pruneTarget !== undefined ? new Array(numSlots).fill(true) : [],
-  );
-  return results;
-}
-
-interface KArrayMeta {
-  shardShape: number[];
-  chunkOrigin: number[];
-  indexLocation: "start" | "end";
-}
-
-/**
- * Parse + validate one ``kK`` array's ``zarr.json``, asserting the
- * exact codec chain this reader knows how to decode (defensive: a
- * differently-configured store should fail loudly, not silently
- * mis-decode).
- */
-function parseKArrayMeta(bytes: Uint8Array, kBase: string): KArrayMeta {
-  let meta: any;
-  try {
-    meta = JSON.parse(new TextDecoder().decode(bytes));
-  } catch (e) {
-    throw new Error(
-      `${kBase}/zarr.json: invalid JSON: ${(e as Error).message}`,
-    );
-  }
-  const attrs = meta?.attributes ?? {};
-  const shardShape = attrs.shard_shape;
-  const chunkOrigin = attrs.chunk_origin;
-  if (!Array.isArray(shardShape) || !Array.isArray(chunkOrigin)) {
-    throw new Error(
-      `${kBase}/zarr.json: missing 'shard_shape' / 'chunk_origin' attributes`,
-    );
-  }
-  const codecs = meta?.codecs;
-  const shardingCodec = Array.isArray(codecs)
-    ? codecs.find((c: any) => c?.name === "sharding_indexed")
-    : undefined;
-  if (shardingCodec === undefined) {
-    throw new Error(
-      `${kBase}/zarr.json: expected a 'sharding_indexed' codec, got ` +
-        `${JSON.stringify(codecs)}`,
-    );
-  }
-  const indexLocation = shardingCodec.configuration?.index_location;
-  if (indexLocation !== "start" && indexLocation !== "end") {
-    throw new Error(
-      `${kBase}/zarr.json: unsupported sharding index_location ` +
-        `${JSON.stringify(indexLocation)}`,
-    );
-  }
-  const innerCodecs = shardingCodec.configuration?.codecs;
-  const hasVlenBytes =
-    Array.isArray(innerCodecs) &&
-    innerCodecs.some((c: any) => c?.name === "vlen-bytes");
-  if (!hasVlenBytes) {
-    throw new Error(
-      `${kBase}/zarr.json: expected inner codec chain to include ` +
-        `'vlen-bytes', got ${JSON.stringify(innerCodecs)}`,
-    );
-  }
-  return {
-    shardShape: shardShape.map(Number),
-    chunkOrigin: chunkOrigin.map(Number),
-    indexLocation,
-  };
-}
-
-/** One K-bucket's resolved metadata (or `null` = bucket absent, e.g. `k1`). */
-interface ResolvedKMeta extends KArrayMeta {
-  readonly K: number;
-  readonly kBase: string;
-  readonly ndim: number;
-}
-
-/**
- * Resolved `cross_chunk_links/<delta>` header: the group's `link_width` /
- * `sid_ndim` plus each K-bucket's metadata (or `null` when that bucket's
- * array doesn't exist — streamline stores never create `k1`, so probing it
- * 404s). `undefined` when the group itself is absent.
- */
+/** Resolved `cross_chunk_links/<delta>` family metadata. `undefined` when the family is absent. */
 interface ResolvedCclHeader {
   readonly linkWidth: number;
   readonly sidNdim: number;
-  /** Index `K-1` → that bucket's meta, or `null` if absent. */
-  readonly perK: (ResolvedKMeta | null)[];
+  readonly directed: boolean;
+  readonly store: "canonical" | "duplicate";
+  /** Physical layout (defaults to `"flat_cells"` when the `layout` attribute is absent). */
+  readonly layout: "flat_cells" | "packed_sharded";
+  /**
+   * ``"packed_sharded"`` only: the sorted `<cell_key>` list, where flat
+   * array index `i` holds `cellKeys[i]`. `undefined` for `"flat_cells"`.
+   */
+  readonly cellKeys?: string[];
+  /**
+   * ``"packed_sharded"`` only: parsed native-sharded-array metadata for
+   * the single ``cross_chunk_links/<delta>`` array. `undefined` for
+   * `"flat_cells"`.
+   */
+  readonly shardedMeta?: ShardedArrayMeta;
 }
 
 async function resolveCclHeaderUncached(
@@ -625,20 +504,6 @@ async function resolveCclHeaderUncached(
   if (attrs === undefined) {
     throw new Error(`${base}/zarr.json: missing 'attributes' object`);
   }
-  const layout = attrs.layout;
-  if (layout !== "sharded_v1" && layout !== undefined) {
-    throw new Error(
-      `${base}: unsupported cross_chunk_links layout ${JSON.stringify(layout)} ` +
-        `(expected "sharded_v1")`,
-    );
-  }
-  if (layout === undefined && attrs.num_links !== undefined) {
-    throw new Error(
-      `${base}: pre-0.8 single-blob cross_chunk_links layout detected ` +
-        `('num_links' present, no 'layout' field) — run the zarr-vectors ` +
-        `0.7→0.8 migration helper`,
-    );
-  }
   const linkWidth = Number(attrs.link_width);
   const sidNdim = Number(attrs.sid_ndim);
   if (!Number.isInteger(linkWidth) || linkWidth < 1) {
@@ -647,171 +512,256 @@ async function resolveCclHeaderUncached(
   if (!Number.isInteger(sidNdim) || sidNdim < 1) {
     throw new Error(`${base}: invalid sid_ndim ${attrs.sid_ndim}`);
   }
-  const perK: (ResolvedKMeta | null)[] = [];
-  for (let K = 1; K <= linkWidth; ++K) {
-    const kBase = `${base}/k${K}`;
-    const kMetaBytes = await kvStoreRead(`${kBase}/zarr.json`, signal);
-    if (kMetaBytes === undefined) {
-      perK.push(null); // bucket never allocated (e.g. k1 for streamlines)
-      continue;
-    }
-    const { shardShape, chunkOrigin, indexLocation } = parseKArrayMeta(
-      kMetaBytes,
-      kBase,
-    );
-    const ndim = sidNdim * K;
-    if (shardShape.length !== ndim) {
-      throw new Error(
-        `${kBase}: shard_shape length ${shardShape.length} != sid_ndim*K (${ndim})`,
-      );
-    }
-    perK.push({ shardShape, chunkOrigin, indexLocation, K, kBase, ndim });
+  const directed = attrs.directed === true;
+  const store = attrs.store === "duplicate" ? "duplicate" : "canonical";
+  // `layout` absent => the original flat-cell layout (back-compat).
+  const layout = attrs.layout === "packed_sharded" ? "packed_sharded" : "flat_cells";
+  if (layout === "flat_cells") {
+    return { linkWidth, sidNdim, directed, store, layout };
   }
-  return { linkWidth, sidNdim, perK };
+  // Packed: the family's own `zarr.json` IS the sharded array's `zarr.json`
+  // (the group node collapses into a single array), so reuse the same
+  // bytes to parse the sharded metadata and read the `cell_keys` list.
+  const cellKeysAttr = attrs.cell_keys;
+  if (!Array.isArray(cellKeysAttr)) {
+    throw new Error(
+      `${base}/zarr.json: layout="packed_sharded" requires a 'cell_keys' ` +
+        `array attribute, got ${JSON.stringify(cellKeysAttr)}`,
+    );
+  }
+  const cellKeys = cellKeysAttr.map(String);
+  const shardedMeta = parseShardedArrayMeta(groupMetaBytes, base);
+  if (shardedMeta.gridShape.length !== 1) {
+    throw new Error(
+      `${base}/zarr.json: layout="packed_sharded" expects a 1-D array, got ` +
+        `shape ${JSON.stringify(shardedMeta.gridShape)}`,
+    );
+  }
+  if (shardedMeta.gridShape[0] !== cellKeys.length) {
+    throw new Error(
+      `${base}/zarr.json: layout="packed_sharded" array length ` +
+        `${shardedMeta.gridShape[0]} != cell_keys length ${cellKeys.length}`,
+    );
+  }
+  return { linkWidth, sidNdim, directed, store, layout, cellKeys, shardedMeta };
 }
 
 /**
- * Cached wrapper around {@link resolveCclHeaderUncached}: the group +
- * per-K `zarr.json` reads (and the `k1` 404) are per-level constants, so a
- * caller that queries many chunks/objects at one level resolves them ONCE
- * instead of re-fetching on every query. `cache` is keyed by the
+ * Cached wrapper around {@link resolveCclHeaderUncached}: the group
+ * ``zarr.json`` read is a per-level constant, so a caller that queries
+ * many chunks/objects at one level resolves it ONCE instead of
+ * re-fetching on every query. `cache` is keyed by the
  * `cross_chunk_links/<delta>` base path; omit it for a one-shot read.
  */
 async function resolveCclHeader(
   options: CrossChunkLinksReaderOptions,
   signal: AbortSignal,
-  cache?: Map<string, Promise<ResolvedCclHeader | undefined>>,
+  cache?: Map<string, AsyncMemoize<ResolvedCclHeader | undefined>>,
 ): Promise<ResolvedCclHeader | undefined> {
   if (cache === undefined) return resolveCclHeaderUncached(options, signal);
   const base = `cross_chunk_links/${options.delta ?? 0}`;
-  let pending = cache.get(base);
-  if (pending === undefined) {
-    pending = resolveCclHeaderUncached(options, signal).catch((error) => {
-      // Don't poison the cache on a transient failure (network blip / abort).
-      cache.delete(base);
-      throw error;
-    });
-    cache.set(base, pending);
+  let memoized = cache.get(base);
+  if (memoized === undefined) {
+    memoized = asyncMemoize(({ signal }) =>
+      resolveCclHeaderUncached(options, signal),
+    );
+    cache.set(base, memoized);
   }
-  return pending;
+  return memoized({ signal });
+}
+
+/**
+ * List every populated `<cell_key>` name directly under
+ * `cross_chunk_links/<delta>/` — a single flat `kvStoreList` call (each
+ * cell_key is its own top-level directory, unlike the pre-0.8.1 sharded
+ * layout's recursive per-axis shard-coordinate tree). Cached per level
+ * when `cache` is supplied.
+ */
+async function listAllCellKeys(
+  options: CrossChunkLinksReaderOptions,
+  signal: AbortSignal,
+  cache?: Map<string, AsyncMemoize<string[]>>,
+): Promise<string[]> {
+  const { kvStoreList, delta = 0 } = options;
+  const base = `cross_chunk_links/${delta}`;
+  const doList = async (listSignal: AbortSignal): Promise<string[]> => {
+    if (kvStoreList === undefined) {
+      throw new Error(
+        `${base}: reading a populated cross_chunk_links table requires ` +
+          `a kvStoreList callback to discover its cells`,
+      );
+    }
+    const { directories } = await kvStoreList(`${base}/`, listSignal);
+    return directories.filter((d) => d !== "");
+  };
+  if (cache === undefined) return doList(signal);
+  let memoized = cache.get(base);
+  if (memoized === undefined) {
+    memoized = asyncMemoize(({ signal }) => doList(signal));
+    cache.set(base, memoized);
+  }
+  return memoized({ signal });
 }
 
 async function decodeCellPayload(
   compressedBytes: Uint8Array,
   signal: AbortSignal,
 ): Promise<Uint8Array> {
-  // `compressedBytes` is a view into a shared per-shard buffer that other
-  // cells in the same shard still need to read from — `requestAsyncComputation`
-  // transfers its buffer argument (postMessage transfer semantics), which
-  // would detach that shared buffer out from under the rest of the shard's
-  // cells.  Copy into a freshly-allocated, standalone buffer first.
+  // `requestAsyncComputation` transfers its buffer argument (postMessage
+  // transfer semantics) — copy into a freshly-allocated, standalone
+  // buffer first so a cached/shared reference elsewhere isn't detached.
   const owned = new Uint8Array(compressedBytes);
-  const decompressed = await requestAsyncComputation(
+  return await requestAsyncComputation(
     decodeZstd,
     signal,
     [owned.buffer as ArrayBuffer],
     owned as Uint8Array<ArrayBuffer>,
   );
-  return decodeVlenBytesSingleItem(decompressed);
 }
 
 /**
- * Shared walk: parses the group + per-`K` array metadata, discovers
- * shards, and iterates every populated cell — exactly the fixed
- * structure both {@link readCrossChunkLinks} (whole table, no caching)
- * and {@link readCrossChunkLinksForChunk} (one chunk's records, cached
- * discovery/shard-bytes) need.  The two differ only in:
- *
- * - `getShardCoords`: fresh `listPopulatedShardCoords` walk each time,
- *   vs. a cached lookup.
- * - `getShardBytes`: fresh `kvStoreRead` each time, vs. a cached lookup.
- * - `shouldDecodeCell`: always `true`, vs. cheaply checking the cell's
- *   already-known chunk coordinates (no decompression needed for this
- *   check) against a target chunk before paying for `decodeCellPayload`
- *   + `decodeCrossChunkLinkCell`.
- *
- * Keeping one implementation means a decode/validation fix made here
- * can't accidentally apply to only one of the two entry points.
+ * Byte-range reader used when a ``"packed_sharded"`` family is read
+ * WITHOUT an `options.kvStoreReadRange`: fetch the whole shard file via
+ * `kvStoreRead` and slice the requested range in-process. Correct but
+ * wasteful (re-fetches the whole shard per range read) — production call
+ * sites thread a real byte-range reader through and never hit this path.
+ */
+function wholeShardFallbackReadRange(
+  kvStoreRead: CrossChunkLinksReaderOptions["kvStoreRead"],
+): ShardedArrayReadRange {
+  return async (subpath, byteRange, signal) => {
+    const whole = await kvStoreRead(subpath, signal);
+    if (whole === undefined) return undefined;
+    if ("suffixLength" in byteRange) {
+      const start = Math.max(0, whole.byteLength - byteRange.suffixLength);
+      return whole.subarray(start);
+    }
+    return whole.subarray(
+      byteRange.offset,
+      byteRange.offset + byteRange.length,
+    );
+  };
+}
+
+/**
+ * Build the {@link ShardedArrayReadContext} for a ``"packed_sharded"``
+ * family — the array path is the family base itself, and the byte-range
+ * reader is the caller-provided one (or the whole-shard fallback).
+ */
+function packedReadContext(
+  options: CrossChunkLinksReaderOptions,
+  header: ResolvedCclHeader,
+  base: string,
+): ShardedArrayReadContext {
+  return {
+    kvStoreReadRange:
+      options.kvStoreReadRange ?? wholeShardFallbackReadRange(options.kvStoreRead),
+    arrayPath: base,
+    meta: header.shardedMeta!,
+  };
+}
+
+/** Get (or lazily create) the per-family {@link ShardIndexCache} for one base path. */
+function getShardIndexCache(
+  caches: CrossChunkLinksCaches,
+  base: string,
+): ShardIndexCache {
+  let cache = caches.shardIndexCaches.get(base);
+  if (cache === undefined) {
+    cache = new Map();
+    caches.shardIndexCaches.set(base, cache);
+  }
+  return cache;
+}
+
+/** Get (or lazily build) the per-family `<cell_key>` -> flat-index map for a packed family. */
+function getCellKeyIndexMap(
+  caches: CrossChunkLinksCaches,
+  base: string,
+  cellKeys: readonly string[],
+): Map<string, number> {
+  let map = caches.cellKeyIndexMaps.get(base);
+  if (map === undefined) {
+    map = new Map();
+    for (let i = 0; i < cellKeys.length; ++i) map.set(cellKeys[i], i);
+    caches.cellKeyIndexMaps.set(base, map);
+  }
+  return map;
+}
+
+/**
+ * Shared walk over every populated cell in `cross_chunk_links/<delta>/`,
+ * decoding only the ones `shouldDecodeCell` accepts (checked cheaply from
+ * the cell's key-derived chunk tuple, before paying for decompression).
+ * Used by both {@link readCrossChunkLinks} (whole table, no caching) and
+ * {@link readCrossChunkLinksForChunk} (one chunk's records, cached).
+ * Dispatches on the family's stored `layout`.
  */
 async function readCrossChunkLinksImpl(
   options: CrossChunkLinksReaderOptions,
   signal: AbortSignal,
-  shouldDecodeCell: (sortedChunks: readonly (readonly number[])[]) => boolean,
-  getShardCoords: (
-    kBase: string,
-    ndim: number,
-    chunkOrigin: readonly number[],
-    shardShape: readonly number[],
-  ) => Promise<number[][]>,
-  getShardBytes: (shardKey: string) => Promise<Uint8Array | undefined>,
-  headerCache?: Map<string, Promise<ResolvedCclHeader | undefined>>,
+  shouldDecodeCell: (cellChunks: readonly (readonly number[])[]) => boolean,
+  headerCache?: Map<string, AsyncMemoize<ResolvedCclHeader | undefined>>,
+  cellKeysCache?: Map<string, AsyncMemoize<string[]>>,
+  cellBytesCache?: BoundedByteCache,
+  shardIndexCache?: ShardIndexCache,
 ): Promise<CrossChunkLinksTable | undefined> {
-  const { kvStoreList } = options;
-
-  // Resolve the group + per-K metadata once (cached per level when a
-  // headerCache is supplied) — avoids re-fetching cross_chunk_links/<delta>
-  // /zarr.json + each kK/zarr.json (and re-404-ing k1) on every query.
+  const { kvStoreRead, delta = 0 } = options;
+  const base = `cross_chunk_links/${delta}`;
   const header = await resolveCclHeader(options, signal, headerCache);
   if (header === undefined) return undefined;
-  const { linkWidth, sidNdim, perK } = header;
+  const { linkWidth, sidNdim } = header;
 
-  const records: CrossChunkLinkRecord[] = [];
-
-  for (const km of perK) {
-    if (km === null) continue; // bucket absent (e.g. k1 for streamlines)
-    const { shardShape, chunkOrigin, indexLocation, ndim, kBase, K } = km;
-    if (kvStoreList === undefined) {
-      throw new Error(
-        `${kBase}: reading a populated cross_chunk_links kK array requires ` +
-          `a kvStoreList callback to discover its shards`,
-      );
-    }
-    const shardCoords = await getShardCoords(kBase, ndim, chunkOrigin, shardShape);
-    for (const shardCoord of shardCoords) {
-      const shardKey = `${kBase}/c/${shardCoord.join("/")}`;
-      const shardBytes = await getShardBytes(shardKey);
-      if (shardBytes === undefined) continue;
-      for (const { subChunk, byteRange } of iteratePopulatedCellsInShard(
-        shardBytes,
-        shardShape,
-        indexLocation,
+  if (header.layout === "packed_sharded") {
+    // Cells are enumerated from the header's sorted `cell_keys` (index `i`
+    // holds `cell_keys[i]`) — no listing needed. A locally-created shard-
+    // index cache (when none is supplied, e.g. the whole-table read) keeps
+    // the single shard-index fetch amortized across every element.
+    const idxCache = shardIndexCache ?? (new Map() as ShardIndexCache);
+    const ctx = packedReadContext(options, header, base);
+    const keys = header.cellKeys!;
+    const records: CrossChunkLinkRecord[] = [];
+    for (let i = 0; i < keys.length; ++i) {
+      const cellChunks = parseCellKey(keys[i], sidNdim, linkWidth);
+      if (!shouldDecodeCell(cellChunks)) continue;
+      const payload = await readShardedArrayChunk(ctx, [i], signal, idxCache);
+      if (payload === undefined) continue;
+      for (const record of decodeCrossChunkLinkCell(
+        payload,
+        cellChunks,
+        linkWidth,
       )) {
-        const cellCoordFull = subChunk.map(
-          (v, d) => v + shardCoord[d] * shardShape[d],
-        );
-        const sortedChunks: number[][] = [];
-        for (let k = 0; k < K; ++k) {
-          const chunk: number[] = [];
-          for (let a = 0; a < sidNdim; ++a) {
-            chunk.push(cellCoordFull[k * sidNdim + a] + chunkOrigin[a]);
-          }
-          sortedChunks.push(chunk);
-        }
-        // Decided purely from the cell's position within the shard —
-        // no decompression needed, so skipping here is nearly free and
-        // avoids the (potentially very large) decode/object-allocation
-        // cost for every cell that doesn't touch the caller's target.
-        if (!shouldDecodeCell(sortedChunks)) continue;
-        const compressedCell = shardBytes.subarray(
-          byteRange.offset,
-          byteRange.offset + byteRange.length,
-        );
-        const payload = await decodeCellPayload(compressedCell, signal);
-        // Loop rather than `records.push(...cellRecords)`: a single cell can
-        // hold far more than V8's ~65,536-argument call limit on large
-        // datasets, and spreading into a call throws "Maximum call stack
-        // size exceeded" past that limit.
-        for (const record of decodeCrossChunkLinkCell(
-          payload,
-          sortedChunks,
-          linkWidth,
-        )) {
-          records.push(record);
-        }
+        records.push(record);
       }
     }
+    return { linkWidth, sidNdim, records };
   }
 
+  const cellKeys = await listAllCellKeys(options, signal, cellKeysCache);
+  const records: CrossChunkLinkRecord[] = [];
+  for (const cellKey of cellKeys) {
+    const cellChunks = parseCellKey(cellKey, sidNdim, linkWidth);
+    if (!shouldDecodeCell(cellChunks)) continue;
+    const cellPath = `${base}/${cellKey}`;
+    let bytes = cellBytesCache?.get(cellPath);
+    if (bytes === undefined) {
+      const fetched = await kvStoreRead(`${cellPath}/c/0`, signal);
+      if (fetched === undefined) continue;
+      bytes = fetched;
+      cellBytesCache?.set(cellPath, bytes);
+    }
+    const payload = await decodeCellPayload(bytes, signal);
+    // Loop rather than `records.push(...cellRecords)`: a single cell can
+    // (in principle) hold more than V8's ~65,536-argument call limit on
+    // large datasets, and spreading into a call throws past that limit.
+    for (const record of decodeCrossChunkLinkCell(
+      payload,
+      cellChunks,
+      linkWidth,
+    )) {
+      records.push(record);
+    }
+  }
   return { linkWidth, sidNdim, records };
 }
 
@@ -830,35 +780,23 @@ export async function readCrossChunkLinks(
   options: CrossChunkLinksReaderOptions,
   signal: AbortSignal,
 ): Promise<CrossChunkLinksTable | undefined> {
-  const { kvStoreRead, kvStoreList } = options;
-  return readCrossChunkLinksImpl(
-    options,
-    signal,
-    () => true,
-    (kBase, ndim) =>
-      listPopulatedShardCoords(kvStoreList!, `${kBase}/c`, ndim, signal),
-    (shardKey) => kvStoreRead(shardKey, signal),
-  );
+  return readCrossChunkLinksImpl(options, signal, () => true);
 }
 
 /**
  * Fetch + decode only the ``cross_chunk_links/<delta>/`` records whose
- * sorted-chunks tuple includes ``targetChunkCoords`` — the actual need
- * of one chunk's `download()`.  ``caches`` should be created once per
+ * chunk tuple includes ``targetChunkCoords`` — the actual need of one
+ * chunk's `download()`. ``caches`` should be created once per
  * ``(store, delta)`` via {@link createCrossChunkLinksCaches} and reused
  * across every chunk query for that pair, so repeated queries amortize
- * shard discovery/fetch instead of re-paying it (and never decode more
- * than the records the caller asked for).
+ * the one-time cell-key listing instead of re-listing on every call (and
+ * never decode more than the records the caller asked for).
  *
  * NOTE: a chunk's linked partners are not guaranteed to be spatially
- * adjacent (see {@link CrossChunkLinksCaches}'s docstring), so this
- * cannot shortcut to "only check nearby shards" — but it does prune
- * shard *discovery* itself (not just decoding) to the subtrees that could
- * possibly hold a cell touching ``targetChunkCoords``, via
- * {@link ShardDiscoveryPruneTarget}. Concurrent calls for the same
- * ``(delta, K, targetChunkCoords)`` share one discovery walk (the cache
- * stores in-flight promises, not just resolved results) instead of each
- * independently re-walking the tree.
+ * adjacent, and the 0.8.1 flat-cell-key layout has no per-chunk discovery
+ * query (unlike the pre-0.8.1 sharded kK layout's shard-coordinate
+ * pruning) — every query walks the level's full (cached) cell-key list
+ * and filters client-side.
  */
 export async function readCrossChunkLinksForChunk(
   options: CrossChunkLinksReaderOptions,
@@ -866,48 +804,15 @@ export async function readCrossChunkLinksForChunk(
   caches: CrossChunkLinksCaches,
   signal: AbortSignal,
 ): Promise<CrossChunkLinksTable | undefined> {
-  const { kvStoreRead, kvStoreList } = options;
-  const targetKey = targetChunkCoords.join(",");
+  const base = `cross_chunk_links/${options.delta ?? 0}`;
   return readCrossChunkLinksImpl(
     options,
     signal,
-    (sortedChunks) =>
-      sortedChunks.some((c) => arraysEqual(c, targetChunkCoords)),
-    (kBase, ndim, chunkOrigin, shardShape) => {
-      const cacheKey = `${kBase}:${targetKey}`;
-      let pending = caches.shardCoords.get(cacheKey);
-      if (pending === undefined) {
-        const targetShifted = targetChunkCoords.map(
-          (v, a) => v - chunkOrigin[a],
-        );
-        pending = listPopulatedShardCoords(
-          kvStoreList!,
-          `${kBase}/c`,
-          ndim,
-          signal,
-          { targetShifted, sidNdim: targetChunkCoords.length, shardShape },
-        ).catch((error) => {
-          // Don't let a transient failure (network blip, aborted signal)
-          // permanently poison future queries for this same chunk.
-          caches.shardCoords.delete(cacheKey);
-          throw error;
-        });
-        caches.shardCoords.set(cacheKey, pending);
-      }
-      return pending;
-    },
-    async (shardKey) => {
-      let bytes = caches.shardBytes.get(shardKey);
-      if (bytes === undefined) {
-        const fetched = await kvStoreRead(shardKey, signal);
-        if (fetched !== undefined) {
-          bytes = fetched;
-          caches.shardBytes.set(shardKey, bytes);
-        }
-      }
-      return bytes;
-    },
+    (cellChunks) => cellChunks.some((c) => arraysEqual(c, targetChunkCoords)),
     caches.headers,
+    caches.cellKeys,
+    caches.cellBytes,
+    getShardIndexCache(caches, base),
   );
 }
 
@@ -924,16 +829,15 @@ function lexCompareChunk(
 
 /**
  * Sorted, distinct K-combinations of `chunks` (each combination's chunks
- * ordered lexicographically — matching the writer's per-cell
- * `sorted(chunk_set)` key order). Used to enumerate the candidate cross-
+ * ordered lexicographically). Used to enumerate the candidate cross-
  * chunk-link cells whose endpoints are ALL owned by one object.
  */
 function sortedKCombinations(
   chunks: readonly (readonly number[])[],
   K: number,
 ): number[][][] {
-  // Sort + dedup so combinations are in the writer's cell order and a
-  // chunk revisited by the manifest doesn't spawn duplicate cells.
+  // Sort + dedup so a chunk revisited by the manifest doesn't spawn
+  // duplicate combinations.
   const sorted = [...chunks].sort(lexCompareChunk);
   const uniq: (readonly number[])[] = [];
   for (const c of sorted) {
@@ -958,27 +862,42 @@ function sortedKCombinations(
   return out;
 }
 
+/** Every permutation of `items` (small `items.length` only — used for `link_width` <= ~4). */
+function permutations<T>(items: readonly T[]): T[][] {
+  if (items.length <= 1) return [items.slice()];
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; ++i) {
+    const rest = [...items.slice(0, i), ...items.slice(i + 1)];
+    for (const p of permutations(rest)) out.push([items[i], ...p]);
+  }
+  return out;
+}
+
 /**
  * "Go-direct" cross-chunk-links read for pass-2: given the set of chunks a
  * single object owns, read ONLY the records whose endpoints are all among
- * those chunks — computing the exact shard coordinates from the candidate
- * owned-only cells rather than discovering shards by listing the chunk-key
- * directory tree.
+ * those chunks — computing the exact candidate cell keys directly rather
+ * than listing and filtering the whole level's cell-key table.
  *
- * Contrast with {@link readCrossChunkLinksForChunk} (used by pass-1's ghost
- * fetch), which scans every cell touching one chunk (i.e. that chunk paired
- * with ANY partner) and relies on the caller to discard non-owned pairs.
- * For an object spanning C chunks that per-chunk scan reads far more shard
- * bytes than needed and requires a per-chunk directory-listing walk; this
- * reads only the C-choose-K owned-only candidate cells' shards (deduped,
- * cached) with zero listing. The returned records are identical to the
- * union of per-chunk scans after owned-only filtering, so downstream
- * `collectOwnedCrossChunkEdges` behaves the same.
+ * Contrast with {@link readCrossChunkLinksForChunk} (used by pass-1's
+ * ghost fetch), which needs one level-wide listing + client-side filter
+ * (the 0.8.1 flat-cell-key layout has no cheaper way to answer "records
+ * touching chunk X, any partner"). Here the partner set is bounded to the
+ * object's own owned chunks, so candidate cell keys can be constructed
+ * directly with zero listing: they are exactly the sorted K-combinations
+ * of the owned chunk set (K = `link_width`), formatted as cell keys. For
+ * a **directed** family the writer keys by literal input order (not
+ * canonical order), and a reader can't predict which of the `K!`
+ * orderings of a given combination was actually written, so every
+ * ordering is tried as a candidate key — cheap since `K = link_width` is
+ * small in practice (2 for streamlines' cross-chunk edges).
  *
- * Cells are keyed by the sorted-unique chunk set, and a streamline's cross-
- * chunk edges always connect two chunks it owns — so candidate cells are
- * exactly the sorted K-combinations of the owned chunk set. (Practical only
- * for small K; the scoped pass-2 path is `implicit_sequential`, K = 2.)
+ * Only `store: "canonical"` families are supported here (the only mode
+ * this codebase's writers produce) — a `"duplicate"`-store family uses a
+ * different cell-keying scheme entirely (one placement per distinct
+ * endpoint chunk, not per K-combination) and would need a different
+ * candidate-enumeration strategy; callers with such a store should fall
+ * back to {@link readCrossChunkLinksForChunk} per owned chunk instead.
  */
 export async function readCrossChunkLinksForOwnedChunks(
   options: CrossChunkLinksReaderOptions,
@@ -986,48 +905,85 @@ export async function readCrossChunkLinksForOwnedChunks(
   caches: CrossChunkLinksCaches,
   signal: AbortSignal,
 ): Promise<CrossChunkLinksTable | undefined> {
-  const { kvStoreRead } = options;
+  const { kvStoreRead, delta = 0 } = options;
   if (ownedChunks.length === 0) return undefined;
-  const sidNdim = ownedChunks[0].length;
+  const header = await resolveCclHeader(options, signal, caches.headers);
+  if (header === undefined) return undefined;
+  const { linkWidth, sidNdim, directed, store } = header;
+  if (store !== "canonical") {
+    throw new Error(
+      `cross_chunk_links: readCrossChunkLinksForOwnedChunks only supports ` +
+        `store="canonical" families, got ${JSON.stringify(store)}`,
+    );
+  }
+  const base = `cross_chunk_links/${delta}`;
   const ownedKeys = new Set(ownedChunks.map((c) => c.join(",")));
-  return readCrossChunkLinksImpl(
-    options,
-    signal,
-    // Decode only cells all of whose endpoint chunks are owned.
-    (sortedChunks) => sortedChunks.every((c) => ownedKeys.has(c.join(","))),
-    (_kBase, ndim, chunkOrigin, shardShape) => {
-      const K = Math.round(ndim / sidNdim);
-      const cells = sortedKCombinations(ownedChunks, K);
-      const shardCoordsByKey = new Map<string, number[]>();
-      for (const cell of cells) {
-        const shardCoord = new Array<number>(ndim);
-        let valid = true;
-        for (let d = 0; d < ndim; ++d) {
-          const chunkIdx = Math.floor(d / sidNdim);
-          const axis = d % sidNdim;
-          const cellGrid = cell[chunkIdx][axis] - chunkOrigin[axis];
-          if (cellGrid < 0) {
-            valid = false;
-            break;
-          }
-          shardCoord[d] = Math.floor(cellGrid / shardShape[d]);
-        }
-        if (!valid) continue;
-        shardCoordsByKey.set(shardCoord.join(","), shardCoord);
+  const combos = sortedKCombinations(ownedChunks, linkWidth);
+  const candidateKeys = new Set<string>();
+  for (const combo of combos) {
+    if (!directed) {
+      candidateKeys.add(formatCellKey(combo));
+    } else {
+      for (const perm of permutations(combo)) {
+        candidateKeys.add(formatCellKey(perm));
       }
-      return Promise.resolve([...shardCoordsByKey.values()]);
-    },
-    async (shardKey) => {
-      let bytes = caches.shardBytes.get(shardKey);
-      if (bytes === undefined) {
-        const fetched = await kvStoreRead(shardKey, signal);
-        if (fetched !== undefined) {
-          bytes = fetched;
-          caches.shardBytes.set(shardKey, bytes);
-        }
+    }
+  }
+  const records: CrossChunkLinkRecord[] = [];
+
+  if (header.layout === "packed_sharded") {
+    // Same candidate keys, but resolve each to its flat array index via
+    // the header's `cell_keys` (built once, cached) and read that element
+    // — a candidate absent from the map simply isn't a written cell.
+    const cellKeyIndex = getCellKeyIndexMap(caches, base, header.cellKeys!);
+    const ctx = packedReadContext(options, header, base);
+    const idxCache = getShardIndexCache(caches, base);
+    for (const cellKey of candidateKeys) {
+      const flatIndex = cellKeyIndex.get(cellKey);
+      if (flatIndex === undefined) continue;
+      const cellChunks = parseCellKey(cellKey, sidNdim, linkWidth);
+      // Defensive: candidates are owned-only by construction, but keep the
+      // check cheap and explicit rather than trusting it silently.
+      if (!cellChunks.every((c) => ownedKeys.has(c.join(",")))) continue;
+      const payload = await readShardedArrayChunk(
+        ctx,
+        [flatIndex],
+        signal,
+        idxCache,
+      );
+      if (payload === undefined) continue;
+      for (const record of decodeCrossChunkLinkCell(
+        payload,
+        cellChunks,
+        linkWidth,
+      )) {
+        records.push(record);
       }
-      return bytes;
-    },
-    caches.headers,
-  );
+    }
+    return { linkWidth, sidNdim, records };
+  }
+
+  for (const cellKey of candidateKeys) {
+    const cellPath = `${base}/${cellKey}`;
+    let bytes = caches.cellBytes.get(cellPath);
+    if (bytes === undefined) {
+      const fetched = await kvStoreRead(`${cellPath}/c/0`, signal);
+      if (fetched === undefined) continue;
+      bytes = fetched;
+      caches.cellBytes.set(cellPath, bytes);
+    }
+    const cellChunks = parseCellKey(cellKey, sidNdim, linkWidth);
+    // Defensive: candidates are owned-only by construction, but keep the
+    // check cheap and explicit rather than trusting it silently.
+    if (!cellChunks.every((c) => ownedKeys.has(c.join(",")))) continue;
+    const payload = await decodeCellPayload(bytes, signal);
+    for (const record of decodeCrossChunkLinkCell(
+      payload,
+      cellChunks,
+      linkWidth,
+    )) {
+      records.push(record);
+    }
+  }
+  return { linkWidth, sidNdim, records };
 }

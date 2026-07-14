@@ -172,6 +172,24 @@ function makeKvStore(map: Record<string, Uint8Array | undefined>) {
   return async (path: string) => map[path];
 }
 
+/**
+ * Adapt a flat-path `kvStoreRead` (still used for `object_index/manifests`
+ * fixtures, whose on-disk format is unchanged) into a `readArrayChunk`
+ * for per-chunk arrays (`vertices`, `vertex_fragments`, etc.) — the same
+ * fixture literals (keyed `"<array>/<chunk>/c/0"`) serve both, since this
+ * just re-derives that flat path from `(arrayPath, chunkCoords)`.
+ */
+function makeReadArrayChunk(
+  kvStoreRead: (path: string) => Promise<Uint8Array | undefined>,
+): (
+  arrayPath: string,
+  chunkCoords: readonly number[],
+  signal: AbortSignal,
+) => Promise<Uint8Array | undefined> {
+  return async (arrayPath, chunkCoords) =>
+    kvStoreRead(`${arrayPath}/${chunkCoords.join(".")}/c/0`);
+}
+
 // ---------------------------------------------------------------------------
 // filterChunkByFragments — unit tests over an in-memory SkeletonChunk
 // ---------------------------------------------------------------------------
@@ -386,6 +404,7 @@ describe("downloadSegmentSkeleton", () => {
         attributeDtypes,
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
       },
       new AbortController().signal,
     );
@@ -454,6 +473,7 @@ describe("downloadSegmentSkeleton", () => {
         attributeDtypes,
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
       },
       new AbortController().signal,
     );
@@ -539,6 +559,7 @@ describe("downloadSegmentSkeleton", () => {
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
         crossChunkLinks,
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
       },
       new AbortController().signal,
     );
@@ -637,6 +658,7 @@ describe("downloadSegmentSkeleton", () => {
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
         queryCrossChunkLinksForChunks,
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
       },
       new AbortController().signal,
     );
@@ -648,7 +670,7 @@ describe("downloadSegmentSkeleton", () => {
     expect(queriedChunkCoordsLists).toEqual([[chunkB, chunkC, chunkA]]);
   });
 
-  it("range-reads only the owned fragment's vertices when kvStoreReadRange is supplied, matching the whole-chunk result", async () => {
+  it("range-reads only the owned fragment's vertices when readArrayChunkScoped is supplied, matching the whole-chunk result", async () => {
     // Chunk 5.5.5 holds 3 streamline fragments; object 0 owns only
     // fragment 1 (verts 2,3,4). The scoped reader must byte-range-read
     // ONLY that fragment's vertices, never the whole 7-vertex blob, and
@@ -684,6 +706,7 @@ describe("downloadSegmentSkeleton", () => {
       attributeDtypes,
       linksConvention: "implicit_sequential" as const,
       geometryKind: "streamline" as const,
+      readArrayChunk: makeReadArrayChunk(makeKvStore(store)),
     };
 
     // Baseline: whole-chunk read.
@@ -701,16 +724,18 @@ describe("downloadSegmentSkeleton", () => {
       wholeReads.push(path);
       return store[path];
     };
-    const kvStoreReadRange = async (
-      subpath: string,
-      byteRange: { offset: number; length: number },
+    const readArrayChunkScoped = async (
+      arrayPath: string,
+      chunkCoords: readonly number[],
+      innerByteRange: { offset: number; length: number },
     ) => {
-      rangeReads.push({ subpath, ...byteRange });
+      const subpath = `${arrayPath}/${chunkCoords.join(".")}/c/0`;
+      rangeReads.push({ subpath, ...innerByteRange });
       const whole = store[subpath];
       if (whole === undefined) return undefined;
       return whole.subarray(
-        byteRange.offset,
-        byteRange.offset + byteRange.length,
+        innerByteRange.offset,
+        innerByteRange.offset + innerByteRange.length,
       );
     };
     const scoped = await downloadSegmentSkeleton(
@@ -718,7 +743,8 @@ describe("downloadSegmentSkeleton", () => {
       {
         ...commonOptions,
         manifestReader: { ...commonOptions.manifestReader, kvStoreRead: recordingKvStoreRead },
-        kvStoreReadRange,
+        readArrayChunk: makeReadArrayChunk(recordingKvStoreRead),
+        readArrayChunkScoped,
       },
       new AbortController().signal,
     );
@@ -769,6 +795,7 @@ describe("downloadSegmentSkeleton", () => {
         attributeDtypes,
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
       },
       new AbortController().signal,
     );
@@ -820,6 +847,7 @@ describe("downloadSegmentSkeleton", () => {
         attributeDtypes,
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
       },
       new AbortController().signal,
     );
@@ -846,6 +874,7 @@ describe("downloadSegmentSkeleton", () => {
         attributeDtypes,
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
       },
       new AbortController().signal,
     );
