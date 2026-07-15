@@ -5,8 +5,9 @@ serverless** version of a Neuroglancer Python viewer.  Python runs entirely in
 the browser via [Pyodide](https://pyodide.org/) (Python compiled to WebAssembly)
 — no server, no installation, no backend required.
 
-The included example (`example_linear_registration_pyodide.py`) demonstrates
-interactive affine registration using numpy arrays and scipy.
+The included example (`user_script.py`) opens a viewer on a public precomputed
+dataset. It is the default script; select another with
+`?script=<same-origin-path>`.
 
 ## How it works
 
@@ -51,7 +52,7 @@ Output is written to `dist/pyodide/`:
 | `pyodide_sw.js` | Service Worker (stable filename, no hash) |
 | `pyodide_worker.[hash].js` | Pyodide Web Worker |
 | `neuroglancer_pyodide.zip` | Bundled neuroglancer Python package |
-| `example_linear_registration_pyodide.py` | User Python script |
+| `user_script.py` | User Python script (override with `?script=`) |
 
 For development with watch mode:
 
@@ -93,16 +94,13 @@ Subsequent loads use the browser cache and start in a few seconds.
 
 ## Using a custom Python script
 
-To deploy a different neuroglancer Python script instead of the registration
-example:
+To deploy a different neuroglancer Python script instead of the default:
 
 1. Write your script using `neuroglancer.Viewer()` (or
    `neuroglancer.UnsynchronizedViewer()`).  Adapt it for Pyodide:
    - Replace `threading.Timer`-based debounce with `js.setTimeout` /
-     `js.clearTimeout` (see `example_linear_registration_pyodide.py` for the
-     pattern).
-   - Replace file writes with browser downloads via the JS Blob API (same file
-     has a `_browser_download` helper you can copy).
+     `js.clearTimeout`.
+   - Replace file writes with browser downloads via the JS Blob API.
    - Remove `argparse`, `webbrowser`, `neuroglancer.cli`, and blocking `input()`
      calls.
    - Execute at module level — no `if __name__ == "__main__":` guard is needed.

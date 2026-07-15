@@ -30,7 +30,11 @@
 
 /// <reference lib="webworker" />
 
-declare const self: ServiceWorkerGlobalScope;
+// tsconfig loads both the `dom` and `webworker` libs, so the global `self` is
+// typed as `Window`. Redeclaring it collides with that global, so alias it
+// instead -- same approach as `self as DedicatedWorkerGlobalScope` in
+// #src/async_computation/handler.js.
+const sw = self as unknown as ServiceWorkerGlobalScope;
 
 // Port connected to the Pyodide Web Worker, set up by the main thread.
 let pyodidePort: MessagePort | null = null;
@@ -51,21 +55,21 @@ let requestCounter = 0;
 // Service Worker lifecycle
 // ---------------------------------------------------------------------------
 
-self.addEventListener("install", () => {
+sw.addEventListener("install", () => {
   // Activate immediately without waiting for existing clients to unload.
-  self.skipWaiting();
+  sw.skipWaiting();
 });
 
-self.addEventListener("activate", (event) => {
+sw.addEventListener("activate", (event) => {
   // Take control of all clients immediately.
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(sw.clients.claim());
 });
 
 // ---------------------------------------------------------------------------
 // Main-thread → Service Worker initialisation message
 // ---------------------------------------------------------------------------
 
-self.addEventListener("message", (event) => {
+sw.addEventListener("message", (event) => {
   if (event.data?.type === "init") {
     pyodidePort = event.ports[0];
     pyodidePort.onmessage = handlePyodideMessage;
@@ -117,7 +121,7 @@ function shouldIntercept(pathname: string): boolean {
   );
 }
 
-self.addEventListener("fetch", (event) => {
+sw.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (!shouldIntercept(url.pathname)) {
     // Let the browser handle static assets normally.
@@ -143,10 +147,8 @@ async function handleSSERequest(
 
   // Create a ReadableStream that stays open and receives events pushed by
   // Pyodide via the pyodidePort message handler above.
-  let controller!: ReadableStreamDefaultController<Uint8Array>;
   const stream = new ReadableStream<Uint8Array>({
     start(c) {
-      controller = c;
       sseStreams.set(token, c);
       // Flush an initial comment so the browser registers the connection.
       c.enqueue(encoder.encode(": connected\n\n"));

@@ -22,7 +22,7 @@
  *   - pyodide_sw.js                - Service Worker (no hash for stable URL)
  *   - pyodide_worker.[hash].js     - Pyodide Web Worker
  *   - neuroglancer_pyodide.zip     - Bundled Python package
- *   - example_linear_registration_pyodide.py
+ *   - user_script.py               - Default user script (override with ?script=)
  *   - index.html                   - Standalone HTML page
  *   - [chunk files]                - Code-split chunks
  *
@@ -33,10 +33,10 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import process from "node:process";
-import { rspack, HtmlRspackPlugin } from "@rspack/core";
+import { fileURLToPath } from "node:url";
 import type { Configuration, Stats } from "@rspack/core";
+import { rspack, HtmlRspackPlugin } from "@rspack/core";
 import packageJson from "../package.json" with { type: "json" };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -164,7 +164,10 @@ function runCompiler(configs: Configuration[]): Promise<Stats[]> {
         reject(err);
         return;
       }
-      const statsList: Stats[] = Array.isArray(stats) ? stats.stats : [stats];
+      // An array of configs yields a MultiCompiler, whose callback receives a
+      // MultiStats -- an object with a `.stats` array, not an array itself.
+      const multiStats = (stats as { stats?: Stats[] } | null)?.stats;
+      const statsList: Stats[] = Array.isArray(multiStats) ? multiStats : [stats];
       let hasErrors = false;
       for (const s of statsList) {
         const info = s.toJson();
@@ -235,23 +238,18 @@ function createPythonZip() {
   console.log("Created", zipPath);
 }
 
+// Default script fetched by main_pyodide.ts when ?script= is not supplied.
+// Keep this name in sync with DEFAULT_USER_SCRIPT_PATH there.
+const USER_SCRIPT_NAME = "user_script.py";
+
 function copyExampleScript() {
-  const src = path.resolve(
-    repoRoot,
-    "python",
-    "examples",
-    "pyodide",
-    "example_linear_registration_pyodide.py",
-  );
-  const dest = path.resolve(outDir, "example_linear_registration_pyodide.py");
+  const src = path.resolve(repoRoot, "python", "examples", "pyodide", USER_SCRIPT_NAME);
+  const dest = path.resolve(outDir, USER_SCRIPT_NAME);
   if (fs.existsSync(src)) {
     fs.copyFileSync(src, dest);
-    console.log("Copied example_linear_registration_pyodide.py");
+    console.log("Copied", USER_SCRIPT_NAME);
   } else {
-    console.warn(
-      "Warning: example_linear_registration_pyodide.py not found at",
-      src,
-    );
+    console.warn(`Warning: ${USER_SCRIPT_NAME} not found at`, src);
   }
 }
 

@@ -28,14 +28,6 @@
  * forwards them to the Pyodide Web Worker via the MessageChannel.
  */
 
-// ---------------------------------------------------------------------------
-// Step 0: Patch the URL immediately (before any neuroglancer code reads it).
-// getServerUrls() in api.ts parses window.location.pathname for /v/{token}.
-// ---------------------------------------------------------------------------
-if (!window.location.pathname.includes("/v/")) {
-  history.replaceState(null, "", "/v/pyodide/");
-}
-
 import "#src/util/polyfills.js";
 import "#src/layer/enabled_frontend_modules.js";
 import "#src/datasource/enabled_frontend_modules.js";
@@ -69,6 +61,17 @@ import type { Trackable } from "#src/util/trackable.js";
 import { CompoundTrackable } from "#src/util/trackable.js";
 import type { InputEventBindings } from "#src/viewer.js";
 import { VIEWER_UI_CONFIG_OPTIONS } from "#src/viewer.js";
+
+// Patch the URL before any neuroglancer code reads it. getServerUrls() in
+// api.ts parses window.location.pathname for /v/{token}; it runs lazily (from
+// a Client field initializer), so doing this at module scope is early enough.
+// It cannot go above the imports -- those are hoisted and evaluate first.
+if (!window.location.pathname.includes("/v/")) {
+  history.replaceState(null, "", "/v/pyodide/");
+}
+
+/** Script run in the Pyodide worker when `?script=` is not supplied. */
+const DEFAULT_USER_SCRIPT_PATH = "/user_script.py";
 
 // ---------------------------------------------------------------------------
 // Helpers (copied from main_python.ts)
@@ -143,6 +146,27 @@ function setLoadingMessage(msg: string) {
 function hideLoadingOverlay() {
   const el = document.getElementById("neuroglancer-pyodide-overlay");
   if (el) el.style.display = "none";
+}
+
+/**
+ * Path of the Python script to run in the Pyodide worker, from `?script=`,
+ * falling back to `user_script.py` alongside the bundle.
+ *
+ * Restricted to a same-origin relative path: the script is fetched and
+ * executed with full access to the viewer, so an attacker-supplied absolute
+ * URL in a shared link must not be able to run code here.
+ */
+function getUserScriptPath(): string {
+  const requested = new URLSearchParams(window.location.search).get("script");
+  if (requested === null) return DEFAULT_USER_SCRIPT_PATH;
+  const resolved = new URL(requested, window.location.href);
+  if (resolved.origin !== window.location.origin) {
+    throw new Error(
+      `Refusing to run cross-origin script ${resolved.href}; ` +
+        `?script= must be same-origin.`,
+    );
+  }
+  return resolved.pathname + resolved.search;
 }
 
 /** Show the URL-input form and resolve with the entered URL (or null). */
@@ -248,10 +272,25 @@ async function bootstrap() {
 
   // Send port2 and configuration to the Pyodide Worker (does NOT run script yet).
   const neuroglancerZipUrl = new URL("/neuroglancer_pyodide.zip", window.location.href).href;
-  const userScriptUrl = new URL("/example_linear_registration_pyodide.py", window.location.href).href;
-  const userScript = await fetch(userScriptUrl).then((r) => r.text());
+  const userScriptUrl = new URL(getUserScriptPath(), window.location.href).href;
+  const userScriptResponse = await fetch(userScriptUrl);
+  if (!userScriptResponse.ok) {
+    throw new Error(
+      `Failed to fetch user script ${userScriptUrl}: ` +
+        `${userScriptResponse.status} ${userScriptResponse.statusText}. ` +
+        `Pass ?script=<path> to select a different script.`,
+    );
+  }
+  const userScript = await userScriptResponse.text();
 
-  // Pyodide CDN — using 0.27.x (update as needed).
+  // Pyodide CDN.
+  //
+  // 0.27.4 ships zarr 2.18.2 and numcodecs 0.13.1, and so cannot run
+  // zarr-python v3. zarr-vectors-py requires zarr>=3.0 ("zarr 2 cannot read
+  // these stores"), and the zarr-vectors datasource is zarr-v3-only, so this
+  // pin must move to a zarr-3-capable pyodide before zarr-vectors-py can run
+  // in-browser. Note 0.28/0.29 ship no zarr at all; 314.0.2 ships zarr 3.3.1
+  // (but is Python 3.14 / emscripten 5.0.3, i.e. two ABI breaks away).
   const pyodideIndexUrl =
     "https://cdn.jsdelivr.net/pyodide/v0.27.4/full/pyodide.js";
 
