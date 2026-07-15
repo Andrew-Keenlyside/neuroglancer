@@ -13,24 +13,53 @@
 # limitations under the License.
 
 
-from . import (  # noqa: I001
-    segment_colors,  # noqa: F401
-    server,  # noqa: F401
-    skeleton,  # noqa: F401
-)
-from .default_credentials_manager import set_boss_token  # noqa: F401
+try:
+    import js as _js  # type: ignore[import]  # noqa: F401
+
+    _PYODIDE = True
+except ImportError:
+    _PYODIDE = False
+
+from . import segment_colors  # noqa: F401
+from . import skeleton  # noqa: F401
+
 from .equivalence_map import EquivalenceMap  # noqa: F401
 from .local_volume import LocalVolume  # noqa: F401
-from .screenshot import ScreenshotSaver  # noqa: F401
-from .server import (
-    is_server_running,  # noqa: F401
-    set_server_bind_address,  # noqa: F401
-    set_static_content_source,  # noqa: F401
-    set_dev_server_content_source,  # noqa: F401
-    stop,  # noqa: F401
-)
 from .url_state import parse_url, to_json_dump, to_url  # noqa: F401
-from .viewer import UnsynchronizedViewer, Viewer  # noqa: F401
+
+if _PYODIDE:
+    from .viewer_pyodide import (  # noqa: F401
+        PyodideViewer as Viewer,
+        PyodideUnsynchronizedViewer as UnsynchronizedViewer,
+    )
+
+    def is_server_running() -> bool:  # noqa: F811
+        return True
+
+    def set_server_bind_address(*args, **kwargs):  # noqa: F811
+        pass
+
+    def set_static_content_source(*args, **kwargs):  # noqa: F811
+        pass
+
+    def set_dev_server_content_source(*args, **kwargs):  # noqa: F811
+        pass
+
+    def stop():  # noqa: F811
+        pass
+
+else:
+    from . import server  # noqa: F401
+    from .default_credentials_manager import set_boss_token  # noqa: F401
+    from .screenshot import ScreenshotSaver  # noqa: F401
+    from .server import (
+        is_server_running,  # noqa: F401
+        set_server_bind_address,  # noqa: F401
+        set_static_content_source,  # noqa: F401
+        set_dev_server_content_source,  # noqa: F401
+        stop,  # noqa: F401
+    )
+    from .viewer import UnsynchronizedViewer, Viewer  # noqa: F401
 from .viewer_config_state import (
     PrefetchState,  # noqa: F401
     ScaleBarOptions,  # noqa: F401
