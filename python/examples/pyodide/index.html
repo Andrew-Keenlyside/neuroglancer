@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Neuroglancer – Linear Registration (Pyodide)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #111;
+      color: #eee;
+      font-family: sans-serif;
+      overflow: hidden;
+    }
+    #neuroglancer-pyodide-overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: #111;
+      z-index: 9999;
+    }
+    #neuroglancer-pyodide-overlay h1 {
+      font-size: 1.4rem;
+      margin-bottom: 1.5rem;
+      color: #4fc3f7;
+    }
+    #neuroglancer-pyodide-spinner {
+      width: 48px;
+      height: 48px;
+      border: 5px solid #333;
+      border-top-color: #4fc3f7;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 1.5rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #neuroglancer-pyodide-loading {
+      font-size: 0.9rem;
+      color: #aaa;
+      max-width: 400px;
+      text-align: center;
+    }
+    #neuroglancer-pyodide-note {
+      margin-top: 1.5rem;
+      font-size: 0.75rem;
+      color: #666;
+      max-width: 400px;
+      text-align: center;
+    }
+    #neuroglancer-pyodide-note a { color: #4fc3f7; }
+    #neuroglancer-pyodide-url-section {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+      max-width: 480px;
+      width: 100%;
+    }
+    #neuroglancer-pyodide-url-section p {
+      font-size: 0.9rem;
+      color: #ccc;
+      text-align: center;
+      margin: 0;
+    }
+    #neuroglancer-pyodide-url-input {
+      width: 100%;
+      padding: 0.5rem 0.75rem;
+      background: #222;
+      border: 1px solid #444;
+      border-radius: 4px;
+      color: #eee;
+      font-size: 0.85rem;
+      box-sizing: border-box;
+    }
+    #neuroglancer-pyodide-url-input::placeholder { color: #555; }
+    #neuroglancer-pyodide-url-input:focus {
+      outline: none;
+      border-color: #4fc3f7;
+    }
+    .neuroglancer-pyodide-url-buttons {
+      display: flex;
+      gap: 0.75rem;
+    }
+    .neuroglancer-pyodide-url-buttons button {
+      padding: 0.45rem 1.1rem;
+      border: none;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+    #neuroglancer-pyodide-btn-url {
+      background: #4fc3f7;
+      color: #111;
+    }
+    #neuroglancer-pyodide-btn-url:hover { background: #81d4fa; }
+    #neuroglancer-pyodide-btn-demo {
+      background: #333;
+      color: #ccc;
+      border: 1px solid #555;
+    }
+    #neuroglancer-pyodide-btn-demo:hover { background: #444; }
+  </style>
+</head>
+<body>
+  <div id="neuroglancer-pyodide-overlay">
+    <h1>Neuroglancer – Linear Registration</h1>
+    <div id="neuroglancer-pyodide-spinner"></div>
+    <div id="neuroglancer-pyodide-loading">Initialising…</div>
+    <div id="neuroglancer-pyodide-note">
+      Powered by <a href="https://pyodide.org" target="_blank">Pyodide</a>.
+      First load downloads ~40 MB of Python packages; subsequent loads use the
+      browser cache and are much faster.
+    </div>
+    <div id="neuroglancer-pyodide-url-section">
+      <p>Optionally paste a Neuroglancer URL to use as the starting state,<br>or click <em>Use demo data</em> to load a built-in example.</p>
+      <input id="neuroglancer-pyodide-url-input" type="text"
+             placeholder="https://neuroglancer-demo.appspot.com/#!{…}" />
+      <div class="neuroglancer-pyodide-url-buttons">
+        <button id="neuroglancer-pyodide-btn-url">Load URL</button>
+        <button id="neuroglancer-pyodide-btn-demo">Use demo data</button>
+      </div>
+    </div>
+  </div>
+  <!-- main_pyodide bundle injected here by HtmlRspackPlugin at build time -->
+</body>
+</html>
