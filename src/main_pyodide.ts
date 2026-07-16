@@ -73,6 +73,12 @@ if (!window.location.pathname.includes("/v/")) {
 /** Script run in the Pyodide worker when `?script=` is not supplied. */
 const DEFAULT_USER_SCRIPT_PATH = "/user_script.py";
 
+/**
+ * Stable path of the Pyodide worker bundle. Must match the `pyodide_worker`
+ * output filename in `build_tools/build_pyodide.ts`.
+ */
+const PYODIDE_WORKER_PATH = "/pyodide_worker.js";
+
 // ---------------------------------------------------------------------------
 // Helpers (copied from main_python.ts)
 // ---------------------------------------------------------------------------
@@ -246,14 +252,17 @@ async function bootstrap() {
   // ------------------------------------------------------------------
   setLoadingMessage("Starting Python runtime (Pyodide)…");
 
-  // The worker URL is resolved relative to this module at build time by rspack.
-  const pyodideWorker = new Worker(
-    new URL(
-      "./python_integration/pyodide_worker.ts",
-      import.meta.url,
-    ),
-    { type: "module" },
-  );
+  // Loaded by stable URL from its own rspack config (as pyodide_sw.js is),
+  // rather than via `new Worker(new URL(...))`. Pyodide >=314 refuses to run
+  // in a classic worker ("Classic web workers are not supported"), and a
+  // bundler-emitted worker chunk is only a real ES module if the emitting
+  // config sets `output.module` -- which for the main bundle would force the
+  // whole app to be module-output. Building it as its own module-output entry
+  // keeps that blast radius to the worker, and avoids emitting the worker
+  // twice (once here, once as a workersConfig entry).
+  const pyodideWorker = new Worker(new URL(PYODIDE_WORKER_PATH, window.location.href), {
+    type: "module",
+  });
 
   // Phase 1: load Pyodide + packages.  Resolves on 'packages_ready'.
   const packagesReadyPromise = new Promise<void>((resolve, reject) => {
@@ -283,16 +292,26 @@ async function bootstrap() {
   }
   const userScript = await userScriptResponse.text();
 
-  // Pyodide CDN.
+  // Pyodide CDN. Pinned to 314.0.2 (Python 3.14, emscripten 5.0.3, ABI
+  // pyemscripten_2026_0_wasm32).
   //
-  // 0.27.4 ships zarr 2.18.2 and numcodecs 0.13.1, and so cannot run
-  // zarr-python v3. zarr-vectors-py requires zarr>=3.0 ("zarr 2 cannot read
-  // these stores"), and the zarr-vectors datasource is zarr-v3-only, so this
-  // pin must move to a zarr-3-capable pyodide before zarr-vectors-py can run
-  // in-browser. Note 0.28/0.29 ship no zarr at all; 314.0.2 ships zarr 3.3.1
-  // (but is Python 3.14 / emscripten 5.0.3, i.e. two ABI breaks away).
+  // The pin is load-bearing for zarr-vectors: the datasource is zarr-v3-only,
+  // and zarr-vectors-py requires zarr>=3.0 ("zarr 2 cannot read these stores").
+  // No pyodide release bundles zarr -- it installs from PyPI via micropip as a
+  // pure-Python wheel -- but zarr 3 needs numcodecs>=0.14 and numpy>=2, and
+  // numcodecs has C extensions, so it can only come from the distribution:
+  //
+  //   0.27.4   numcodecs 0.13.1  -> too old for zarr 3, unusable here
+  //   314.0.2  numcodecs 0.15.1, numpy 2.4.3, google-crc32c 1.8.0 -> works
+  //
+  // google-crc32c is a hard zarr 3 dependency with no pure-Python wheel on
+  // PyPI, so the distribution shipping it is what makes micropip install of
+  // zarr possible at all. Check pyodide-lock.json before moving this pin.
+  //
+  // This must be the .mjs entry point: the worker imports it dynamically, as
+  // pyodide >=314 refuses to run in a classic worker.
   const pyodideIndexUrl =
-    "https://cdn.jsdelivr.net/pyodide/v0.27.4/full/pyodide.js";
+    "https://cdn.jsdelivr.net/pyodide/v314.0.2/full/pyodide.mjs";
 
   pyodideWorker.postMessage(
     {

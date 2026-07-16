@@ -38,8 +38,9 @@
 
 /// <reference lib="webworker" />
 
-// Pyodide is loaded via importScripts — declare its global.
-declare function loadPyodide(options?: Record<string, unknown>): Promise<any>;
+interface PyodideModule {
+  loadPyodide(options?: Record<string, unknown>): Promise<any>;
+}
 
 // Port to the Service Worker, established during init.
 let swPort: MessagePort | null = null;
@@ -110,9 +111,17 @@ async function setupPyodide(
   pyodideIndexUrl: string,
   neuroglancerZipUrl: string,
 ) {
-  // Load Pyodide runtime.
-  importScripts(pyodideIndexUrl);
-  pyodide = await loadPyodide({ indexURL: pyodideIndexUrl.replace(/[^/]*$/, "") });
+  // Load the Pyodide runtime. `pyodideIndexUrl` points at pyodide.mjs; import
+  // it dynamically rather than via importScripts(pyodide.js), because pyodide
+  // >=314 refuses to run in a classic worker and importScripts is not
+  // available in a module worker. The webpackIgnore comment keeps rspack from
+  // trying to resolve the CDN URL at build time.
+  const mod: PyodideModule = await import(
+    /* webpackIgnore: true */ pyodideIndexUrl
+  );
+  pyodide = await mod.loadPyodide({
+    indexURL: pyodideIndexUrl.replace(/[^/]*$/, ""),
+  });
 
   self.postMessage({ type: "progress", message: "Loading Python packages…" });
 

@@ -106,12 +106,19 @@ class BrowserViewerServer:
         dict with keys ``status`` (int), ``contentType`` (str), ``body`` (bytes).
         """
         try:
+            # Pyodide <=0.27 converted JS `null` to Python `None`; newer
+            # versions hand over a `JsNull` sentinel instead, so that `null`
+            # and `undefined` stay distinguishable. `JsNull` is not `None` and
+            # has no `to_py`, so test for convertibility rather than identity.
             if body_js is None:
                 body_bytes = b""
             elif isinstance(body_js, (bytes, bytearray, memoryview)):
                 body_bytes = bytes(body_js)
+            elif not hasattr(body_js, "to_py"):
+                body_bytes = b""
             else:
-                body_bytes = bytes(body_js.to_py())
+                converted = body_js.to_py()
+                body_bytes = b"" if converted is None else bytes(converted)
             status, content_type, response_body = self._route_request(
                 url, method, body_bytes
             )

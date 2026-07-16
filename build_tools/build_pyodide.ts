@@ -127,27 +127,50 @@ const mainConfig: Configuration = {
 // Config 2: Web Workers (Service Worker + Pyodide Worker → webworker target)
 // ---------------------------------------------------------------------------
 
-const workersConfig: Configuration = {
+// The two workers are built separately because they need different output
+// formats. Both use stable filenames: the Service Worker because its
+// registration URL must be stable, and the Pyodide worker because
+// main_pyodide.ts loads it by path (PYODIDE_WORKER_PATH).
+
+// Classic output: registered with `navigator.serviceWorker.register(url)`
+// without `{ type: "module" }`. Module service workers are not supported by
+// every browser, so this deliberately stays classic.
+const serviceWorkerConfig: Configuration = {
   mode,
   context: repoRoot,
   entry: {
-    // Stable filename for Service Worker registration URL
     pyodide_sw: "./src/python_integration/pyodide_service_worker.ts",
-    // Content-hashed filename for the Pyodide Worker
+  },
+  target: "webworker",
+  module: moduleRules,
+  output: {
+    path: outDir,
+    filename: "[name].js",
+    // No code splitting for workers
+  },
+  resolve: {},
+  devtool: mode === "development" ? "source-map" : false,
+};
+
+// Module output: pyodide >=314 hard-rejects classic workers ("Classic web
+// workers are not supported"), so this must be a real ES module and
+// main_pyodide.ts spawns it with { type: "module" }.
+const pyodideWorkerConfig: Configuration = {
+  mode,
+  context: repoRoot,
+  entry: {
     pyodide_worker: "./src/python_integration/pyodide_worker.ts",
   },
   target: "webworker",
   module: moduleRules,
   output: {
     path: outDir,
-    filename: (pathData) => {
-      if (pathData.chunk?.name === "pyodide_sw") {
-        return "pyodide_sw.js";
-      }
-      return "[name].[chunkhash].js";
-    },
+    filename: "[name].js",
+    module: true,
+    chunkFormat: "module",
     // No code splitting for workers
   },
+  experiments: { outputModule: true },
   resolve: {},
   devtool: mode === "development" ? "source-map" : false,
 };
@@ -263,7 +286,8 @@ fs.mkdirSync(outDir, { recursive: true });
 // Run main config first (it has clean:true, which wipes outDir).
 // Workers config must run after so its output isn't deleted.
 await runCompiler([mainConfig]);
-await runCompiler([workersConfig]);
+await runCompiler([serviceWorkerConfig]);
+await runCompiler([pyodideWorkerConfig]);
 
 if (!watchMode) {
   createPythonZip();
