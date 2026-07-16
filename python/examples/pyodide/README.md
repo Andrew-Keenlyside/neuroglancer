@@ -105,13 +105,16 @@ To deploy a different neuroglancer Python script instead of the default:
      calls.
    - Execute at module level — no `if __name__ == "__main__":` guard is needed.
 
-2. Update `copyExampleScript()` in `build_tools/build_pyodide.ts` to copy your
-   script instead of (or in addition to) the registration example.
+2. Serve it alongside the bundle and select it with the `?script=` query
+   parameter, e.g. <http://localhost:8080/?script=/my_script.py>.  The path must
+   be same-origin: the script is fetched and executed with full access to the
+   viewer, so an absolute URL in a shared link must not be able to run code.
 
-3. Update `userScriptUrl` in `src/main_pyodide.ts` to point at your script's
-   filename.
+   To change the default instead, replace `python/examples/pyodide/user_script.py`
+   (the build copies it to `dist/pyodide/user_script.py`, which
+   `DEFAULT_USER_SCRIPT_PATH` in `src/main_pyodide.ts` points at).
 
-4. Rebuild with `npm run build-pyodide`.
+3. Rebuild with `npm run build-pyodide`.
 
 **Available packages:** numpy, scipy, pillow are loaded by default.  Add more
 via `micropip` inside your script or by extending `loadPackage(...)` in
