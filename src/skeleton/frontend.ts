@@ -306,7 +306,10 @@ class RenderHelper extends RefCounted {
   private gpuVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuTemporaryVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuEmptySegmentsHashTable: GPUHashTable<HashSetUint64>;
-  private gpuSegmentStatedColorHashTable: GPUHashTable<HashMapUint64>;
+  // Lazily acquired and re-checked each draw; see getSegmentStatedColorHashTable.
+  private gpuSegmentStatedColorHashTable:
+    | GPUHashTable<HashMapUint64>
+    | undefined;
   get vertexAttributes(): VertexAttributeRenderInfo[] {
     return this.base.vertexAttributes;
   }
@@ -584,7 +587,7 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
       this.segmentStatedColorShaderManager.enable(
         gl,
         shader,
-        this.gpuSegmentStatedColorHashTable,
+        this.getSegmentStatedColorHashTable(),
       );
     }
 
@@ -639,9 +642,13 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
     this.selectedNodeAttributeIndex =
       selectedNodeAttrIndex >= 0 ? selectedNodeAttrIndex : undefined;
 
+    // `segmentationGroupState` may be captured once: changing it goes through
+    // `linkedSegmentationGroup.changed` -> `updateDataSubsourceActivations()`,
+    // which rebuilds this layer. The colour group has no such handler and is
+    // swapped in place, so its table is resolved per draw instead -- see
+    // `getSegmentStatedColorHashTable`.
     const segmentationGroupState =
       base.displayState.segmentationGroupState.value;
-    const colorGroupState = base.displayState.segmentationColorGroupState.value;
 
     this.gpuVisibleSegmentsHashTable = this.registerDisposer(
       GPUHashTable.get(
@@ -657,9 +664,6 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
     );
     this.gpuEmptySegmentsHashTable = this.registerDisposer(
       GPUHashTable.get(this.gl, this.emptySegmentSet.hashTable),
-    );
-    this.gpuSegmentStatedColorHashTable = this.registerDisposer(
-      GPUHashTable.get(this.gl, colorGroupState.segmentStatedColors.hashTable),
     );
 
     this.edgeShaderGetter = parameterizedEmitterDependentShaderGetter(
@@ -1085,6 +1089,33 @@ void emitDefault() {
       }
     }
     this.vertexIdHelper.disable();
+  }
+
+  /**
+   * `linkedSegmentationColorGroup` swaps the colour group in place without
+   * rebuilding this layer, so a table captured at construction goes stale and
+   * the layer keeps rendering the previous group's colours. Re-resolve by
+   * identity each draw, as `SegmentationRenderLayer` does.
+   */
+  private getSegmentStatedColorHashTable(): GPUHashTable<HashMapUint64> {
+    const { hashTable } =
+      this.base.displayState.segmentationColorGroupState.value
+        .segmentStatedColors;
+    let table = this.gpuSegmentStatedColorHashTable;
+    if (table === undefined || table.hashTable !== hashTable) {
+      table?.dispose();
+      table = this.gpuSegmentStatedColorHashTable = GPUHashTable.get(
+        this.gl,
+        hashTable,
+      );
+    }
+    return table;
+  }
+
+  disposed() {
+    this.gpuSegmentStatedColorHashTable?.dispose();
+    this.gpuSegmentStatedColorHashTable = undefined;
+    super.disposed();
   }
 }
 
