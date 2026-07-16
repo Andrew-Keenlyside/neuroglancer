@@ -398,29 +398,30 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
   }
 
   /**
-   * Grid spacing the picker UI and the auto-LOD target match against, one
-   * entry per level.
+   * The pyramid's levels, **coarsest first** — the order `lod` is derived
+   * from, and the order the picker and render-scale widget present.
    *
-   * The framework ranks levels by `min(x, y, z)` and treats chunk size as the
-   * proxy for detail, which holds only when a writer grows `chunk_shape` at
-   * coarser levels via ``chunk_scale_factors`` (the CATMAID pattern at
-   * `src/datasource/catmaid/frontend.ts:386-390`). An **object-sparsity**
-   * pyramid does not: it keeps one `chunk_shape` for every level and drops
-   * whole objects instead. Every level then reports the same spacing, the
-   * picker cannot tell them apart, and it settles on level 0 -- the finest.
-   * For a whole-brain tractogram that is ~10^8 vertices, which saturates the
-   * browser while four progressively sparser levels sit unused.
+   * `levels` is finest-first, mirroring the store's `multiscales` directory
+   * order, so this reverses it. That directory order *is* the level structure:
+   * each level's `gridIndex` is assigned straight from it
+   * (`levelPaths.length - 1 - k` in `frontend.ts`), and the backend matches
+   * the selected level back to a source by that `gridIndex`. Declaring the
+   * order here keeps the two definitions in agreement by construction, rather
+   * than relying on a spacing sort to rediscover it — which it cannot do for
+   * an object-sparsity pyramid, where every level shares one `chunk_shape`
+   * and the sort degenerates to a no-op that leaves position and `gridIndex`
+   * contradicting each other.
    *
-   * So the reported size is corrected by vertex density. Mean spacing between
-   * vertices scales as the cube root of density, so a level holding 1/1000 of
-   * the vertices is ~10x sparser and is reported ~10x coarser. The correction
-   * is expressed relative to the chunk-shape growth already present, and
-   * clamped at 1, so a writer that *does* use ``chunk_scale_factors`` (where
-   * chunk growth already tracks the vertex drop) is left exactly as it was --
-   * this only spreads levels the existing signal cannot separate.
+   * `size` is no longer what orders the levels, only what scales them: it is
+   * reported as the mean spacing between *objects*, so the widget reads in
+   * real units. Sparser levels genuinely are coarser — spacing between
+   * objects grows as the cube root of the drop in their number — and for this
+   * store that is the only axis that varies: vertices-per-object stays ~203
+   * at every level, so the levels differ in how many complete streamlines
+   * they hold, not in per-streamline fidelity.
    *
    * `getSources()` keeps using the true `chunk_shape`: this affects which
-   * level is chosen, never how its chunks are addressed.
+   * level is chosen and how it is described, never how its chunks are read.
    */
   override getSpatialSkeletonGridSizes(liveScale?: Float64Array): {
     x: number;
@@ -438,10 +439,11 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     // relative to the camera-driven target after such an edit.
     const m = liveScale ?? this.metersPerUnit;
     const density = this.computeDensityScales();
-    return this.perLevelChunkShape.map((cs, k) => {
+    const finestFirst = this.perLevelChunkShape.map((cs, k) => {
       const s = density[k];
       return { x: cs[0] * m[0] * s, y: cs[1] * m[1] * s, z: cs[2] * m[2] * s };
     });
+    return finestFirst.reverse();
   }
 
   /**

@@ -16,7 +16,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { getDefaultSpatiallyIndexedSkeletonChunkSize } from "#src/skeleton/spatial_chunk_sizing.js";
+import {
+  buildSpatialSkeletonGridLevels,
+  getDefaultSpatiallyIndexedSkeletonChunkSize,
+  getSpatialSkeletonGridSpacing,
+  sortSpatialSkeletonGridSizes,
+  type SpatialSkeletonGridSize,
+} from "#src/skeleton/spatial_chunk_sizing.js";
 
 describe("skeleton/spatial_chunk_sizing", () => {
   it("derives an isotropic chunk size that stays within the default chunk budget", () => {
@@ -116,5 +122,81 @@ describe("skeleton/spatial_chunk_sizing", () => {
         { maxChunks: Number.POSITIVE_INFINITY },
       ),
     ).toThrow(/maxChunks must be finite/i);
+  });
+});
+
+const size = (x: number, y = x, z = x): SpatialSkeletonGridSize => ({
+  x,
+  y,
+  z,
+});
+
+describe("getSpatialSkeletonGridSpacing", () => {
+  it("is the smallest axis", () => {
+    expect(getSpatialSkeletonGridSpacing(size(30, 20, 40))).toBe(20);
+  });
+});
+
+describe("sortSpatialSkeletonGridSizes", () => {
+  it("orders coarsest first without mutating the input", () => {
+    const input = [size(1), size(100), size(10)];
+    expect(sortSpatialSkeletonGridSizes(input).map((s) => s.x)).toEqual([
+      100, 10, 1,
+    ]);
+    expect(input.map((s) => s.x)).toEqual([1, 100, 10]);
+  });
+});
+
+describe("buildSpatialSkeletonGridLevels", () => {
+  it("keeps the caller's order rather than deriving one", () => {
+    // Deliberately not sorted by spacing: the caller declares the pyramid, so
+    // the order it gives is the order of the levels.
+    const levels = buildSpatialSkeletonGridLevels([
+      size(1),
+      size(100),
+      size(10),
+    ]);
+    expect(levels.map((l) => l.size.x)).toEqual([1, 100, 10]);
+  });
+
+  it("assigns lod as the normalised position, coarsest = 0", () => {
+    const levels = buildSpatialSkeletonGridLevels([
+      size(100),
+      size(10),
+      size(1),
+    ]);
+    expect(levels.map((l) => l.lod)).toEqual([0, 0.5, 1]);
+  });
+
+  it("gives a lone level lod 0 rather than dividing by zero", () => {
+    expect(buildSpatialSkeletonGridLevels([size(5)])).toEqual([
+      { size: size(5), lod: 0 },
+    ]);
+  });
+
+  it("returns nothing for no levels", () => {
+    expect(buildSpatialSkeletonGridLevels([])).toEqual([]);
+  });
+
+  it("separates levels that share a spacing, which a sort cannot", () => {
+    // An object-sparsity pyramid: one chunk_shape at every level, differing
+    // only in how many objects each holds. Sorting by spacing is a no-op
+    // here, so the declared order is the only thing that can order them --
+    // and it must, because each level's gridIndex is assigned from that
+    // same order.
+    const levels = buildSpatialSkeletonGridLevels([
+      size(31),
+      size(31),
+      size(31),
+    ]);
+    expect(levels.map((l) => l.lod)).toEqual([0, 0.5, 1]);
+  });
+
+  it("composes with the sort for callers that do rank by spacing", () => {
+    const levels = buildSpatialSkeletonGridLevels(
+      sortSpatialSkeletonGridSizes([size(1), size(100), size(10)]),
+    );
+    expect(levels.map((l) => l.size.x)).toEqual([100, 10, 1]);
+    expect(levels.map((l) => l.lod)).toEqual([0, 0.5, 1]);
   });
 });

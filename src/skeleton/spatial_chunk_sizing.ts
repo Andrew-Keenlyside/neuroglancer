@@ -47,13 +47,32 @@ export function sortSpatialSkeletonGridSizes(
   );
 }
 
+/**
+ * Build the level list, **preserving the caller's order**: coarsest first.
+ *
+ * `lod` is nothing but the normalised position in this list, so the order is
+ * the whole of the level structure — `size` only supplies a physical scale for
+ * the render-scale widget and for matching a resolution target.
+ *
+ * The order is therefore the caller's to declare, and it deliberately is not
+ * re-derived here by sorting on `size`. A datasource already knows its
+ * pyramid: for zarr-vectors it is the `multiscales` directory order, and the
+ * `gridIndex` each level carries is assigned straight from that order. Sorting
+ * by spacing silently assumed the two would agree, which holds only while
+ * spacing is what separates the levels. An object-sparsity pyramid keeps one
+ * chunk_shape at every level and drops whole objects instead: every level then
+ * reports the same spacing, the sort degenerates to a no-op, and the resulting
+ * positions disagree with the `gridIndex` values — so the wrong level loads.
+ *
+ * Callers that genuinely rank by spacing can pass
+ * `sortSpatialSkeletonGridSizes(sizes)` and get the previous behaviour.
+ */
 export function buildSpatialSkeletonGridLevels(
   gridSizes: readonly SpatialSkeletonGridSize[],
 ): SpatialSkeletonGridLevel[] {
-  const sortedSizes = sortSpatialSkeletonGridSizes(gridSizes);
-  if (sortedSizes.length === 0) return [];
-  const lastIndex = sortedSizes.length - 1;
-  return sortedSizes.map((size, index) => ({
+  if (gridSizes.length === 0) return [];
+  const lastIndex = gridSizes.length - 1;
+  return gridSizes.map((size, index) => ({
     size,
     lod: lastIndex === 0 ? 0 : index / lastIndex,
   }));
