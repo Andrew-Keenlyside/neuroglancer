@@ -42,6 +42,7 @@ import {
   annotationToJson,
   AnnotationType,
   annotationTypeHandlers,
+  computeEllipsoidRadii,
   formatNumericProperty,
   propertyTypeDataType,
 } from "#src/annotation/index.js";
@@ -1491,15 +1492,20 @@ class PlaceEllipsoidTool extends TwoStepAnnotationTool {
       annotationLayer,
     );
 
-    return <Ellipsoid>{
+    // `satisfies` rather than a `<Ellipsoid>{...}` assertion: the assertion
+    // skipped excess-property checking, which is how this passed `segments:`
+    // -- the field is `relatedSegments` -- and silently discarded the
+    // association. `point!` keeps the same assumption the sibling tools make
+    // (a placement gesture always has a live mouse position), but states it.
+    return {
       type: AnnotationType.ELLIPSOID,
       id: "",
       description: "",
-      segments: getSelectedAssociatedSegments(annotationLayer),
-      center: point,
+      relatedSegments: getSelectedAssociatedSegments(annotationLayer),
+      center: point!,
       radii: vec3.fromValues(0, 0, 0),
       properties: annotationLayer.source.properties.value.map((x) => x.default),
-    };
+    } satisfies Ellipsoid;
   }
 
   getUpdatedAnnotation(
@@ -1507,20 +1513,13 @@ class PlaceEllipsoidTool extends TwoStepAnnotationTool {
     mouseState: MouseSelectionState,
     annotationLayer: AnnotationLayerState,
   ) {
-    const radii = getMousePositionInAnnotationCoordinates(
+    const corner = getMousePositionInAnnotationCoordinates(
       mouseState,
       annotationLayer,
     );
-    if (radii === undefined) return oldAnnotation;
-    const center = oldAnnotation.center;
-    const rank = center.length;
-    for (let i = 0; i < rank; ++i) {
-      radii[i] = Math.abs(center[i] - radii[i]);
-    }
-    return <Ellipsoid>{
-      ...oldAnnotation,
-      radii,
-    };
+    if (corner === undefined) return oldAnnotation;
+    const radii = computeEllipsoidRadii(oldAnnotation.center, corner);
+    return { ...oldAnnotation, radii } satisfies Ellipsoid;
   }
   get description() {
     return "annotate ellipsoid";
