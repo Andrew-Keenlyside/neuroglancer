@@ -368,16 +368,19 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
    * Per-level chunk shape in world units, finest-first.  Length ==
    * `levels.length`.  Each entry comes from the level's own
    * ``zarr_vectors_level.chunk_shape`` if present, otherwise from the
-   * root chunk_shape.  Writers should use ``chunk_scale_factors`` to
-   * make this monotonically distinct across levels — that's what makes
-   * the spatial grid-resolution picker show multiple positions and
-   * what makes auto-LOD level switching meaningful (matches the
-   * CATMAID per-level chunk-size pattern at
-   * `src/datasource/catmaid/frontend.ts:386-390`).  Sparsity-only
-   * pyramids without per-level chunk-shape changes still load, but
-   * adjacent levels collapse into one widget entry.
+   * root chunk_shape.  Used verbatim for chunk addressing in
+   * `getSources()`; `getSpatialSkeletonGridSizes()` reports a
+   * density-corrected size instead, so an object-sparsity pyramid (which
+   * keeps one chunk_shape for every level) is still pickable.
    */
   readonly perLevelChunkShape: Float32Array[];
+  /**
+   * Live object count per level, finest-first; `undefined` where it could not
+   * be determined.  This is the detail axis of an object-sparsity pyramid --
+   * coarser levels hold fewer *complete* objects at the same chunk_shape.
+   * See `getSpatialSkeletonGridSizes()`.
+   */
+  readonly perLevelObjectCount: (number | undefined)[];
   /**
    * Meters per coordinate unit, per axis (from the store's NGFF
    * scale + unit).  Used to report grid sizes in physical meters so the
@@ -395,12 +398,29 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
   }
 
   /**
-   * Returns each level's chunk shape verbatim as the grid spacing the
-   * picker UI matches against.  Mirrors CATMAID's per-level
-   * ``chunkSize`` extraction — no synthetic factors, no inference.
-   * Writers that want distinct picker entries set
-   * ``chunk_scale_factors`` so each level's chunk_shape is monotonically
-   * different.
+   * Grid spacing the picker UI and the auto-LOD target match against, one
+   * entry per level.
+   *
+   * The framework ranks levels by `min(x, y, z)` and treats chunk size as the
+   * proxy for detail, which holds only when a writer grows `chunk_shape` at
+   * coarser levels via ``chunk_scale_factors`` (the CATMAID pattern at
+   * `src/datasource/catmaid/frontend.ts:386-390`). An **object-sparsity**
+   * pyramid does not: it keeps one `chunk_shape` for every level and drops
+   * whole objects instead. Every level then reports the same spacing, the
+   * picker cannot tell them apart, and it settles on level 0 -- the finest.
+   * For a whole-brain tractogram that is ~10^8 vertices, which saturates the
+   * browser while four progressively sparser levels sit unused.
+   *
+   * So the reported size is corrected by vertex density. Mean spacing between
+   * vertices scales as the cube root of density, so a level holding 1/1000 of
+   * the vertices is ~10x sparser and is reported ~10x coarser. The correction
+   * is expressed relative to the chunk-shape growth already present, and
+   * clamped at 1, so a writer that *does* use ``chunk_scale_factors`` (where
+   * chunk growth already tracks the vertex drop) is left exactly as it was --
+   * this only spreads levels the existing signal cannot separate.
+   *
+   * `getSources()` keeps using the true `chunk_shape`: this affects which
+   * level is chosen, never how its chunks are addressed.
    */
   override getSpatialSkeletonGridSizes(liveScale?: Float64Array): {
     x: number;
@@ -417,11 +437,42 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     // only reflects the store's own metadata and silently goes stale
     // relative to the camera-driven target after such an edit.
     const m = liveScale ?? this.metersPerUnit;
-    return this.perLevelChunkShape.map((cs) => ({
-      x: cs[0] * m[0],
-      y: cs[1] * m[1],
-      z: cs[2] * m[2],
-    }));
+    const density = this.computeDensityScales();
+    return this.perLevelChunkShape.map((cs, k) => {
+      const s = density[k];
+      return { x: cs[0] * m[0] * s, y: cs[1] * m[1] * s, z: cs[2] * m[2] * s };
+    });
+  }
+
+  /**
+   * Per-level multiplier that spreads levels the chunk-shape signal cannot
+   * separate. All 1 when vertex counts are unavailable, when every level has
+   * the same count, or when chunk growth already reflects the vertex drop.
+   */
+  private computeDensityScales(): number[] {
+    const counts = this.perLevelObjectCount;
+    const n = this.perLevelChunkShape.length;
+    const ones = new Array<number>(n).fill(1);
+    if (counts.length !== n) return ones;
+    // Anchor on the densest level; `levels` is finest-first, but derive it
+    // rather than assume, so an unordered store still behaves.
+    let finestCount: number | undefined;
+    for (const c of counts) {
+      if (c === undefined) return ones; // partial metadata: don't half-apply
+      if (finestCount === undefined || c > finestCount) finestCount = c;
+    }
+    if (finestCount === undefined || finestCount <= 0) return ones;
+    const spacing = this.perLevelChunkShape.map((cs) =>
+      Math.min(cs[0], cs[1], cs[2]),
+    );
+    const finestSpacing = Math.min(...spacing);
+    if (!(finestSpacing > 0)) return ones;
+    return counts.map((c, k) => {
+      const densityFactor = Math.cbrt(finestCount! / c!);
+      const chunkGrowth = spacing[k] / finestSpacing;
+      // Only make up the shortfall the chunk shape does not already express.
+      return Math.max(1, densityFactor / chunkGrowth);
+    });
   }
 
   /**
@@ -448,6 +499,7 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     options: {
       levels: ReadonlyArray<ZarrVectorsSkeletonSpatialLevel>;
       perLevelChunkShape: Float32Array[];
+      perLevelObjectCount?: (number | undefined)[];
       metersPerUnit: Float64Array;
       lowerBounds: Float32Array;
       upperBounds: Float32Array;
@@ -456,6 +508,11 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     super(chunkManager);
     this.levels = options.levels;
     this.perLevelChunkShape = options.perLevelChunkShape;
+    this.perLevelObjectCount =
+      options.perLevelObjectCount ??
+      new Array<number | undefined>(options.perLevelChunkShape.length).fill(
+        undefined,
+      );
     this.metersPerUnit = options.metersPerUnit;
     this.lowerBounds = options.lowerBounds;
     this.upperBounds = options.upperBounds;

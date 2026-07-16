@@ -836,6 +836,50 @@ function enumerateLevelPaths(multiscales: any): string[] {
   return ["0"];
 }
 
+/**
+ * Live object count per level, finest-first, or `undefined` per level where it
+ * cannot be determined.
+ *
+ * This is the detail axis of an object-sparsity pyramid: every level covers
+ * the whole volume with the same `chunk_shape`, and coarser levels simply hold
+ * fewer *complete* objects. It cannot be read off `object_index/manifests`,
+ * whose length is the object-id space rather than the live count -- with
+ * ``preserves_object_ids`` a dropped object keeps its slot and stores an empty
+ * manifest, so every level reports the same shape.
+ *
+ * So it is derived instead: ``inherited_num_objects`` scaled by the product of
+ * ``object_sparsity`` down the chain (each level's sparsity is relative to its
+ * parent). Falls back to ``vertex_count``, which tracks object count closely
+ * while vertices-per-object stays roughly constant across levels.
+ */
+function computePerLevelObjectCount(
+  perLevelMeta: ReadonlyArray<{
+    vertexCount: number | undefined;
+    objectSparsity: number | undefined;
+    numObjects: number | undefined;
+  }>,
+): (number | undefined)[] {
+  const n = perLevelMeta.length;
+  const base = perLevelMeta[0]?.numObjects;
+  if (base !== undefined) {
+    const out: (number | undefined)[] = [];
+    let cumulative = 1;
+    let ok = true;
+    for (let k = 0; k < n; ++k) {
+      const s = perLevelMeta[k].objectSparsity;
+      if (s === undefined) {
+        ok = false;
+        break;
+      }
+      // Level 0's sparsity is 1.0; each later level's is relative to its parent.
+      cumulative *= s;
+      out.push(Math.max(1, base * cumulative));
+    }
+    if (ok) return out;
+  }
+  return perLevelMeta.map((m) => m.vertexCount);
+}
+
 function computeLevelLimit(
   levelAttrs: any,
   numChunks: number,
@@ -1129,6 +1173,18 @@ interface SkeletonMetadata {
      */
     perLevelChunkShape: Float32Array[];
     /**
+     * Live object count per level, parallel to `perLevelChunkShape`;
+     * `undefined` where it cannot be determined.  See
+     * `computePerLevelObjectCount`.
+     *
+     * This is what makes an object-sparsity pyramid pickable: such a pyramid
+     * keeps the same `chunk_shape` at every level and drops whole objects
+     * instead, so chunk size — the framework's usual proxy for detail —
+     * cannot tell the levels apart. Object count can. See
+     * `getSpatialSkeletonGridSizes` in `skeleton_frontend.ts`.
+     */
+    perLevelObjectCount: (number | undefined)[];
+    /**
      * World-space lower bound of the data.  Can be negative — zarr-vectors
      * chunks are indexed around world origin `(0,0,0)`, NOT around
      * `lowerBounds`.  `makeSliceViewChunkSpecification` consumes this as
@@ -1347,6 +1403,7 @@ async function buildSkeletonMetadata(
   let spatialGrid:
     | {
         perLevelChunkShape: Float32Array[];
+        perLevelObjectCount: (number | undefined)[];
         lowerBounds: Float32Array;
         upperBounds: Float32Array;
       }
@@ -1373,43 +1430,70 @@ async function buildSkeletonMetadata(
     // per-level chunk_shape override and arrays_present list.  Reuses
     // kvstore caching: the same files are read again below by the
     // chunk-source download path with zero net traffic.
-    const perLevelMeta: { chunkShape: Float32Array; hasFragmentSegmentIds: boolean }[] =
-      await Promise.all(
-        levelPaths.map(async (levelPath) => {
-          const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
-            pipelineUrlJoin(storeUrl, levelPath),
+    const perLevelMeta: {
+      chunkShape: Float32Array;
+      hasFragmentSegmentIds: boolean;
+      vertexCount: number | undefined;
+      objectSparsity: number | undefined;
+      numObjects: number | undefined;
+    }[] = await Promise.all(
+      levelPaths.map(async (levelPath) => {
+        const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
+          pipelineUrlJoin(storeUrl, levelPath),
+        );
+        try {
+          const levelJson = await getJsonResource(
+            sharedKvStoreContext,
+            joinBaseUrlAndPath(levelUrl, "zarr.json"),
+            `zarr-vectors level ${JSON.stringify(levelPath)} metadata`,
+            options,
           );
-          try {
-            const levelJson = await getJsonResource(
-              sharedKvStoreContext,
-              joinBaseUrlAndPath(levelUrl, "zarr.json"),
-              `zarr-vectors level ${JSON.stringify(levelPath)} metadata`,
-              options,
-            );
-            const lvlAttrs = levelJson?.attributes?.zarr_vectors_level ?? {};
-            const override = lvlAttrs?.chunk_shape;
-            const chunkShape =
-              Array.isArray(override) && override.length === rank
-                ? (() => {
-                    const arr = new Float32Array(rank);
-                    for (let i = 0; i < rank; ++i) arr[i] = Number(override[i]);
-                    return arr;
-                  })()
-                : new Float32Array(rootChunkShapeF32);
-            const arraysPresent: string[] = Array.isArray(lvlAttrs?.arrays_present)
-              ? lvlAttrs.arrays_present
-              : [];
-            // When arrays_present is not stamped (older stores), assume present.
-            const hasFragmentSegmentIds =
-              arraysPresent.length === 0 || arraysPresent.includes("fragment_attributes");
-            return { chunkShape, hasFragmentSegmentIds };
-          } catch {
-            // fall through to defaults
-          }
-          return { chunkShape: new Float32Array(rootChunkShapeF32), hasFragmentSegmentIds: true };
-        }),
-      );
+          const lvlAttrs = levelJson?.attributes?.zarr_vectors_level ?? {};
+          const override = lvlAttrs?.chunk_shape;
+          const chunkShape =
+            Array.isArray(override) && override.length === rank
+              ? (() => {
+                  const arr = new Float32Array(rank);
+                  for (let i = 0; i < rank; ++i) arr[i] = Number(override[i]);
+                  return arr;
+                })()
+              : new Float32Array(rootChunkShapeF32);
+          const arraysPresent: string[] = Array.isArray(
+            lvlAttrs?.arrays_present,
+          )
+            ? lvlAttrs.arrays_present
+            : [];
+          // When arrays_present is not stamped (older stores), assume present.
+          const hasFragmentSegmentIds =
+            arraysPresent.length === 0 ||
+            arraysPresent.includes("fragment_attributes");
+          const vc = Number(lvlAttrs?.vertex_count);
+          const vertexCount = Number.isFinite(vc) && vc > 0 ? vc : undefined;
+          const sp = Number(lvlAttrs?.object_sparsity);
+          const objectSparsity = Number.isFinite(sp) && sp > 0 ? sp : undefined;
+          const no = Number(lvlAttrs?.inherited_num_objects);
+          const numObjects = Number.isFinite(no) && no > 0 ? no : undefined;
+          return {
+            chunkShape,
+            hasFragmentSegmentIds,
+            vertexCount,
+            objectSparsity,
+            numObjects,
+          };
+        } catch {
+          // fall through to defaults
+        }
+        return {
+          chunkShape: new Float32Array(rootChunkShapeF32),
+          hasFragmentSegmentIds: true,
+          vertexCount: undefined,
+          objectSparsity: undefined,
+          numObjects: undefined,
+        };
+      }),
+    );
     const perLevelChunkShape = perLevelMeta.map((m) => m.chunkShape);
+    const perLevelObjectCount = computePerLevelObjectCount(perLevelMeta);
 
     // Per-level parameter blobs.  Each level gets its own chunkShape
     // (may differ when the writer used ``chunk_scale_factors``).
@@ -1445,6 +1529,7 @@ async function buildSkeletonMetadata(
     pass1Levels = levels;
     spatialGrid = {
       perLevelChunkShape,
+      perLevelObjectCount,
       lowerBounds: lowerBoundsF32,
       upperBounds: upperBoundsF32,
     };
@@ -1528,6 +1613,7 @@ function getSkeletonDataSource(
           {
             levels: metadata.pass1Levels,
             perLevelChunkShape: metadata.spatialGrid.perLevelChunkShape,
+            perLevelObjectCount: metadata.spatialGrid.perLevelObjectCount,
             metersPerUnit: Float64Array.from(metadata.coordinateSpace.scales),
             lowerBounds: metadata.spatialGrid.lowerBounds,
             upperBounds: metadata.spatialGrid.upperBounds,
