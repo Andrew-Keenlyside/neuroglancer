@@ -75,11 +75,56 @@ function uint64SegmentIdBlob(ids: bigint[]): Uint8Array {
   return new Uint8Array(arr.buffer);
 }
 
-/** Build a kvStore stub from a path → bytes map (any missing path → undefined). */
+/**
+ * Wrap a blob in the `vlen-bytes` chunk framing: `uint32 N=1`, `uint32 L`,
+ * then the payload. Every per-chunk array cell holds exactly one element.
+ */
+function vlenChunk(blob: Uint8Array): Uint8Array {
+  const out = new Uint8Array(8 + blob.byteLength);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, 1, true);
+  view.setUint32(4, blob.byteLength, true);
+  out.set(blob, 8);
+  return out;
+}
+
+/** A trailing `"3.0.2"`-style segment marks a per-spatial-chunk array key. */
+const CHUNK_KEY_SUFFIX = /\/(\d+(?:\.\d+)*)$/;
+
+/**
+ * An already-encoded zarr chunk path (`.../c/0`). These are not per-chunk
+ * array keys — `object_index/manifests/c/0` is chunk 0 of the 1-D manifests
+ * array — but their trailing `/0` would otherwise look like a chunk key.
+ */
+const ENCODED_CHUNK_PATH = /\/c\/\d+(?:\/\d+)*$/;
+
+/**
+ * Build a kvStore stub from a logical key → blob map (missing key →
+ * undefined).
+ *
+ * Per-chunk arrays are addressed logically as `"<array>/<chunkKey>"`, e.g.
+ * `"vertices/0.0.0"`. Those are translated to the on-disk single-vlen-array
+ * layout (`vertices/c/0/0/0`) and the blob is wrapped in the vlen framing, so
+ * the tests state intent rather than restating the encoding. Any other key is
+ * passed through verbatim, which keeps already-correct paths such as
+ * `object_index/manifests/c/0` (a 1-D vlen array read by the manifest reader,
+ * not a per-chunk array) working unchanged.
+ */
 function makeKvStore(
   map: Record<string, Uint8Array | undefined>,
 ): (path: string, signal: AbortSignal) => Promise<Uint8Array | undefined> {
-  return async (path: string) => map[path];
+  const encoded = new Map<string, Uint8Array | undefined>();
+  for (const [key, blob] of Object.entries(map)) {
+    const m = ENCODED_CHUNK_PATH.test(key) ? null : key.match(CHUNK_KEY_SUFFIX);
+    if (m === null) {
+      encoded.set(key, blob);
+      continue;
+    }
+    const arrayPath = key.slice(0, m.index);
+    const cellPath = `${arrayPath}/c/${m[1].split(".").join("/")}`;
+    encoded.set(cellPath, blob === undefined ? undefined : vlenChunk(blob));
+  }
+  return async (path: string) => encoded.get(path);
 }
 
 describe("downloadSkeletonChunk — orchestrator", () => {
@@ -103,7 +148,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
 
   it("returns undefined when the vertices blob is zero bytes", async () => {
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": new Uint8Array(0),
+      "vertices/0.0.0": new Uint8Array(0),
     });
     const result = await downloadSkeletonChunk(
       {
@@ -125,8 +170,8 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     // 3 vertices marching +X by 1 each step → tangents all (1, 0, 0).
     const positions = [0, 0, 0, 1, 0, 0, 2, 0, 0];
     const kvStoreRead = makeKvStore({
-      "vertices/1.2.3/c/0": verticesBlob(positions),
-      "vertex_fragments/1.2.3/c/0": singleRangeFragmentBlob(3),
+      "vertices/1.2.3": verticesBlob(positions),
+      "vertex_fragments/1.2.3": singleRangeFragmentBlob(3),
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -156,9 +201,9 @@ describe("downloadSkeletonChunk — orchestrator", () => {
 
   it("downloads a polyline chunk with per-vertex attributes", async () => {
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0]),
-      "vertex_fragments/0.0.0/c/0": singleRangeFragmentBlob(2),
-      "vertex_attributes/radius/0.0.0/c/0": new Uint8Array(
+      "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
+      "vertex_fragments/0.0.0": singleRangeFragmentBlob(2),
+      "vertex_attributes/radius/0.0.0": new Uint8Array(
         new Float32Array([0.5, 0.7]).buffer,
       ),
     });
@@ -186,11 +231,11 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     // 5 vertices, single fragment.  Sequential edges plus a branch (1,4)
     // stored in links/0 as uint16.
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([
+      "vertices/0.0.0": verticesBlob([
         0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0,
       ]),
-      "vertex_fragments/0.0.0/c/0": singleRangeFragmentBlob(5),
-      "links/0/0.0.0/c/0": uint16LinksBlob([1, 4]),
+      "vertex_fragments/0.0.0": singleRangeFragmentBlob(5),
+      "links/0/0.0.0": uint16LinksBlob([1, 4]),
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -215,9 +260,9 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   it("downloads an explicit-only graph chunk with int32 link dtype", async () => {
     const linksBlob = new Uint8Array(new Int32Array([0, 1, 2, 3]).buffer);
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0]),
-      "vertex_fragments/0.0.0/c/0": singleRangeFragmentBlob(4),
-      "links/0/0.0.0/c/0": linksBlob,
+      "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0]),
+      "vertex_fragments/0.0.0": singleRangeFragmentBlob(4),
+      "links/0/0.0.0": linksBlob,
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -238,9 +283,9 @@ describe("downloadSkeletonChunk — orchestrator", () => {
 
   it("handles a skeleton chunk with no branches (empty links blob)", async () => {
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0]),
-      "vertex_fragments/0.0.0/c/0": singleRangeFragmentBlob(2),
-      "links/0/0.0.0/c/0": new Uint8Array(0),
+      "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
+      "vertex_fragments/0.0.0": singleRangeFragmentBlob(2),
+      "links/0/0.0.0": new Uint8Array(0),
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -261,7 +306,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
 
   it("rejects when vertex_fragments is missing", async () => {
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0]),
+      "vertices/0.0.0": verticesBlob([0, 0, 0]),
     });
     await expect(
       downloadSkeletonChunk(
@@ -287,8 +332,8 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     // than fail the whole chunk, the reader degrades each missing
     // attribute to zero-filled.
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0]),
-      "vertex_fragments/0.0.0/c/0": singleRangeFragmentBlob(2),
+      "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
+      "vertex_fragments/0.0.0": singleRangeFragmentBlob(2),
       // intentionally missing vertex_attributes/radius/...
     });
     const chunk = await downloadSkeletonChunk(
@@ -317,9 +362,9 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     // uint8 link dtype — the widening should preserve indices losslessly.
     const linksBlob = new Uint8Array([0, 1, 1, 2]); // edges (0,1) and (1,2)
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]),
-      "vertex_fragments/0.0.0/c/0": singleRangeFragmentBlob(3),
-      "links/0/0.0.0/c/0": linksBlob,
+      "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]),
+      "vertex_fragments/0.0.0": singleRangeFragmentBlob(3),
+      "links/0/0.0.0": linksBlob,
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -377,14 +422,11 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     const id1 = 720575940606327461n;
     expect(id0 > 0xffffffffn && id1 > 0xffffffffn).toBe(true); // genuinely uint64
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([
+      "vertices/0.0.0": verticesBlob([
         0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0,
       ]),
-      "vertex_fragments/0.0.0/c/0": twoRangeFragmentsBlob(2, 3),
-      "fragment_attributes/segment_id/0.0.0/c/0": uint64SegmentIdBlob([
-        id0,
-        id1,
-      ]),
+      "vertex_fragments/0.0.0": twoRangeFragmentsBlob(2, 3),
+      "fragment_attributes/segment_id/0.0.0": uint64SegmentIdBlob([id0, id1]),
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -412,10 +454,10 @@ describe("downloadSkeletonChunk — orchestrator", () => {
 
   it("falls back to the fragment's chunk-local index when segment_id is absent", async () => {
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([
+      "vertices/0.0.0": verticesBlob([
         0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0,
       ]),
-      "vertex_fragments/0.0.0/c/0": twoRangeFragmentsBlob(2, 3),
+      "vertex_fragments/0.0.0": twoRangeFragmentsBlob(2, 3),
       // no fragment_attributes/segment_id blob
     });
     const chunk = await downloadSkeletonChunk(
@@ -475,9 +517,9 @@ describe("downloadSkeletonChunk — link dtype matrix", () => {
   for (const { dtype, blob } of cases) {
     it(`reads edges with linkDtype=${dtype}`, async () => {
       const kvStoreRead = makeKvStore({
-        "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]),
-        "vertex_fragments/0.0.0/c/0": singleRangeFragmentBlob(3),
-        "links/0/0.0.0/c/0": blob(),
+        "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]),
+        "vertex_fragments/0.0.0": singleRangeFragmentBlob(3),
+        "links/0/0.0.0": blob(),
       });
       const chunk = await downloadSkeletonChunk(
         {
@@ -530,8 +572,8 @@ describe("fetchGhostVertices", () => {
   it("slices one neighbor vertex + attribute into a ghost record", async () => {
     // Neighbor chunk has 3 vertices.  Request vertex index 1.
     const kvStoreRead = makeKvStore({
-      "vertices/1.0.0/c/0": verticesBlob([10, 20, 30, 11, 21, 31, 12, 22, 32]),
-      "vertex_attributes/fa/1.0.0/c/0": new Uint8Array(
+      "vertices/1.0.0": verticesBlob([10, 20, 30, 11, 21, 31, 12, 22, 32]),
+      "vertex_attributes/fa/1.0.0": new Uint8Array(
         new Float32Array([0.1, 0.5, 0.9]).buffer,
       ),
     });
@@ -560,14 +602,19 @@ describe("fetchGhostVertices", () => {
   });
 
   it("groups multiple requests on the same neighbor into one fetch per file", async () => {
+    // Cells of the single-vlen-array layout: chunk key "1.0.0" -> "c/1/0/0".
+    const positionsCell = "vertices/c/1/0/0";
+    const attributeCell = "vertex_attributes/fa/c/1/0/0";
     const fetched: string[] = [];
     const kvStoreRead = async (path: string, _s: AbortSignal) => {
       fetched.push(path);
-      if (path === "vertices/1.0.0/c/0") {
-        return verticesBlob([10, 20, 30, 11, 21, 31, 12, 22, 32]);
+      if (path === positionsCell) {
+        return vlenChunk(verticesBlob([10, 20, 30, 11, 21, 31, 12, 22, 32]));
       }
-      if (path === "vertex_attributes/fa/1.0.0/c/0") {
-        return new Uint8Array(new Float32Array([0.1, 0.5, 0.9]).buffer);
+      if (path === attributeCell) {
+        return vlenChunk(
+          new Uint8Array(new Float32Array([0.1, 0.5, 0.9]).buffer),
+        );
       }
       return undefined;
     };
@@ -587,11 +634,10 @@ describe("fetchGhostVertices", () => {
       new AbortController().signal,
     );
     expect(ghosts).toHaveLength(3);
-    // Exactly one fetch per file (positions + 1 attribute = 2 unique paths).
-    expect(fetched.filter((p) => p === "vertices/1.0.0/c/0")).toHaveLength(1);
-    expect(
-      fetched.filter((p) => p === "vertex_attributes/fa/1.0.0/c/0"),
-    ).toHaveLength(1);
+    // Exactly one fetch per file (positions + 1 attribute = 2 unique paths),
+    // even though three requests name the same neighbor chunk.
+    expect(fetched.filter((p) => p === positionsCell)).toHaveLength(1);
+    expect(fetched.filter((p) => p === attributeCell)).toHaveLength(1);
     expect(Array.from(ghosts[0].position)).toEqual([10, 20, 30]);
     expect(Array.from(ghosts[2].position)).toEqual([12, 22, 32]);
   });
@@ -617,7 +663,7 @@ describe("fetchGhostVertices", () => {
   it("drops requests whose neighbor vertex index is out of range", async () => {
     const kvStoreRead = makeKvStore({
       // Only 2 vertices' worth of bytes — index 5 is out of range.
-      "vertices/1.0.0/c/0": verticesBlob([0, 0, 0, 1, 1, 1]),
+      "vertices/1.0.0": verticesBlob([0, 0, 0, 1, 1, 1]),
     });
     const requests: GhostVertexRequest[] = [
       { hostLocalVertex: 0, neighborChunkKey: "1.0.0", neighborLocalVertex: 5 },
@@ -637,7 +683,7 @@ describe("fetchGhostVertices", () => {
 
   it("zero-fills missing neighbor attributes (pyramid-level case)", async () => {
     const kvStoreRead = makeKvStore({
-      "vertices/1.0.0/c/0": verticesBlob([5, 6, 7]),
+      "vertices/1.0.0": verticesBlob([5, 6, 7]),
       // Intentionally NO vertex_attributes/fa/...
     });
     const requests: GhostVertexRequest[] = [
@@ -659,8 +705,8 @@ describe("fetchGhostVertices", () => {
 
   it("handles uint16-dtype attributes (mixed dtype slicing)", async () => {
     const kvStoreRead = makeKvStore({
-      "vertices/1.0.0/c/0": verticesBlob([0, 0, 0, 1, 1, 1]),
-      "vertex_attributes/swc_type/1.0.0/c/0": uint16AttrBlob([3, 7]),
+      "vertices/1.0.0": verticesBlob([0, 0, 0, 1, 1, 1]),
+      "vertex_attributes/swc_type/1.0.0": uint16AttrBlob([3, 7]),
     });
     const requests: GhostVertexRequest[] = [
       { hostLocalVertex: 0, neighborChunkKey: "1.0.0", neighborLocalVertex: 1 },
@@ -682,8 +728,8 @@ describe("fetchGhostVertices", () => {
 
   it("handles multiple neighbors (parallel fetches, results ordered by request)", async () => {
     const kvStoreRead = makeKvStore({
-      "vertices/0.0.0/c/0": verticesBlob([1, 2, 3]),
-      "vertices/1.0.0/c/0": verticesBlob([4, 5, 6]),
+      "vertices/0.0.0": verticesBlob([1, 2, 3]),
+      "vertices/1.0.0": verticesBlob([4, 5, 6]),
     });
     const requests: GhostVertexRequest[] = [
       {

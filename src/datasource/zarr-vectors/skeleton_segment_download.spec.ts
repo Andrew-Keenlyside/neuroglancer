@@ -168,8 +168,51 @@ function verticesBlob(positions: number[]): Uint8Array {
   return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
 }
 
+/**
+ * Wrap a blob in the `vlen-bytes` chunk framing: `uint32 N=1`, `uint32 L`,
+ * then the payload. Every per-chunk array cell holds exactly one element.
+ */
+function vlenChunk(blob: Uint8Array): Uint8Array {
+  const out = new Uint8Array(8 + blob.byteLength);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, 1, true);
+  view.setUint32(4, blob.byteLength, true);
+  out.set(blob, 8);
+  return out;
+}
+
+/** A trailing `"3.0.2"`-style segment marks a per-spatial-chunk array key. */
+const CHUNK_KEY_SUFFIX = /\/(\d+(?:\.\d+)*)$/;
+
+/**
+ * An already-encoded zarr chunk path (`.../c/0`). These are not per-chunk
+ * array keys — `object_index/manifests/c/0` is chunk 0 of the 1-D manifests
+ * array — but their trailing `/0` would otherwise look like a chunk key.
+ */
+const ENCODED_CHUNK_PATH = /\/c\/\d+(?:\/\d+)*$/;
+
+/**
+ * Build a kvStore stub from a logical key → blob map.
+ *
+ * Per-chunk arrays are addressed logically as `"<array>/<chunkKey>"` (e.g.
+ * `"vertices/0.0.0"`) and are translated to the on-disk single-vlen-array
+ * layout (`vertices/c/0/0/0`), with the blob wrapped in vlen framing. Other
+ * keys pass through verbatim — notably `object_index/manifests/c/0`, which is
+ * a 1-D vlen array read by the manifest reader rather than a per-chunk array,
+ * and whose fixtures already carry their own framing.
+ */
 function makeKvStore(map: Record<string, Uint8Array | undefined>) {
-  return async (path: string) => map[path];
+  const encoded = new Map<string, Uint8Array | undefined>();
+  for (const [key, blob] of Object.entries(map)) {
+    const m = ENCODED_CHUNK_PATH.test(key) ? null : key.match(CHUNK_KEY_SUFFIX);
+    if (m === null) {
+      encoded.set(key, blob);
+      continue;
+    }
+    const cellPath = `${key.slice(0, m.index)}/c/${m[1].split(".").join("/")}`;
+    encoded.set(cellPath, blob === undefined ? undefined : vlenChunk(blob));
+  }
+  return async (path: string) => encoded.get(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -367,8 +410,8 @@ describe("downloadSegmentSkeleton", () => {
     const verticesBytes = verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]);
     const kvStoreRead = makeKvStore({
       "object_index/manifests/c/0": manifestChunk,
-      "vertices/1.2.3/c/0": verticesBytes,
-      "vertex_fragments/1.2.3/c/0": fragmentBlob,
+      "vertices/1.2.3": verticesBytes,
+      "vertex_fragments/1.2.3": fragmentBlob,
     });
 
     const result = await downloadSegmentSkeleton(
@@ -433,10 +476,10 @@ describe("downloadSegmentSkeleton", () => {
     ]);
     const kvStoreRead = makeKvStore({
       "object_index/manifests/c/0": manifestChunk,
-      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0]),
-      "vertex_fragments/0.0.0/c/0": fragBlob,
-      "vertices/1.0.0/c/0": verticesBlob([10, 0, 0, 11, 0, 0, 12, 0, 0]),
-      "vertex_fragments/1.0.0/c/0": fragBlob3,
+      "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
+      "vertex_fragments/0.0.0": fragBlob,
+      "vertices/1.0.0": verticesBlob([10, 0, 0, 11, 0, 0, 12, 0, 0]),
+      "vertex_fragments/1.0.0": fragBlob3,
     });
 
     const result = await downloadSegmentSkeleton(
@@ -520,8 +563,8 @@ describe("downloadSegmentSkeleton", () => {
     const fragBlob = packFragmentIndexBlob([{ range: { start: 0, count: 2 } }]);
     const kvStoreRead = makeKvStore({
       "object_index/manifests/c/0": buildVlenBytesChunk([manifestBytes]),
-      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0]),
-      "vertex_fragments/0.0.0/c/0": fragBlob,
+      "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
+      "vertex_fragments/0.0.0": fragBlob,
       // intentionally missing vertices/9.9.9 — sparse chunk
     });
 

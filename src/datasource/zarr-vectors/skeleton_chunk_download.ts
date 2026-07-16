@@ -25,6 +25,7 @@ import {
   type SkeletonChunk,
   type SkeletonGeometryKind,
 } from "#src/datasource/zarr-vectors/skeleton_chunk.js";
+import { readVlenBytesElement } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 
 /** Supported on-disk integer dtype for `links/0/<chunk>`. */
 export type LinkDtype =
@@ -87,7 +88,8 @@ export interface SkeletonChunkDownloadOptions {
    * Async key-value-store read.  Resolves to a decompressed byte buffer,
    * or `undefined` if the key is absent (sparse chunk presence).  The
    * `subpath` is relative to the level group, e.g.
-   * `"vertices/3.0.2/c/0"`.
+   * `"vertices/c/3/0/2"`.  The buffer is the raw zarr chunk; callers go
+   * through `readChunkBlob` to unwrap the `vlen-bytes` framing.
    */
   readonly kvStoreRead: (
     subpath: string,
@@ -193,17 +195,53 @@ function reinterpretLinkBytes(
 /**
  * Download and decode one spatial chunk into a `SkeletonChunk`.
  *
- * Reads (relative paths under the level group):
- *   - `vertices/<key>/c/0`         — required for non-empty chunks.
- *   - `vertex_fragments/<key>/c/0` — required for non-empty chunks.
- *   - `links/0/<key>/c/0`          — required unless `linksConvention === "implicit_sequential"`.
- *   - `vertex_attributes/<name>/<key>/c/0` — one per declared attribute name.
+ * Reads (per-chunk arrays under the level group; for a chunk key `i.j.k` the
+ * cell is at `<array>/c/i/j/k` — see `readChunkBlob`):
+ *   - `vertices`         — required for non-empty chunks.
+ *   - `vertex_fragments` — required for non-empty chunks.
+ *   - `links/0`          — required unless `linksConvention === "implicit_sequential"`.
+ *   - `vertex_attributes/<name>` — one per declared attribute name.
  *
  * Returns `undefined` when the chunk's `vertices/` blob is absent (the
  * canonical "this chunk has no data" signal).  Throws on any partially-
  * present chunk (vertices but missing fragments, or fragments but
  * missing edges in the explicit-edge cases).
  */
+/**
+ * Read one spatial chunk's blob out of a per-chunk array.
+ *
+ * zarr-vectors stores each per-chunk array (`vertices`, `vertex_fragments`,
+ * `links/<delta>`, attribute arrays) as a *single* multidimensional
+ * `vlen-bytes` zarr v3 array with one cell per spatial chunk — see
+ * `_ensure_level_array` in zarr-vectors-py, which calls this "the default
+ * single-array layout". With `chunk_key_encoding: {name: "default",
+ * separator: "/"}` and an all-ones chunk shape, the cell for grid coords
+ * `(i, j, k)` is the whole chunk at `<array>/c/i/j/k`, and holds exactly one
+ * vlen element.
+ *
+ * Returns `undefined` when the cell is absent (sparse chunk presence) or
+ * present but empty — an empty vlen chunk is `N=0`, which is how the writer
+ * represents "no data here" for a populated grid cell.
+ */
+async function readChunkBlob(
+  kvStoreRead: SkeletonChunkDownloadOptions["kvStoreRead"],
+  arrayPath: string,
+  chunkKey: string,
+  signal: AbortSignal,
+): Promise<Uint8Array | undefined> {
+  const cellPath = `${arrayPath}/c/${chunkKey.split(".").join("/")}`;
+  const chunkBytes = await kvStoreRead(cellPath, signal);
+  if (chunkBytes === undefined) return undefined;
+  try {
+    const element = readVlenBytesElement(chunkBytes, 0);
+    return element.byteLength === 0 ? undefined : element;
+  } catch (e) {
+    // N=0: a populated grid cell that encodes no blob.
+    if (e instanceof RangeError) return undefined;
+    throw e;
+  }
+}
+
 export async function downloadSkeletonChunk(
   options: SkeletonChunkDownloadOptions,
   signal: AbortSignal,
@@ -226,7 +264,12 @@ export async function downloadSkeletonChunk(
   }
 
   // 1. Vertices — required.
-  const vertexBytes = await kvStoreRead(`vertices/${chunkKey}/c/0`, signal);
+  const vertexBytes = await readChunkBlob(
+    kvStoreRead,
+    "vertices",
+    chunkKey,
+    signal,
+  );
   if (vertexBytes === undefined || vertexBytes.byteLength === 0) {
     return undefined;
   }
@@ -245,8 +288,10 @@ export async function downloadSkeletonChunk(
   ) as Float32Array;
 
   // 2. Fragment index — required.
-  const fragmentBytes = await kvStoreRead(
-    `vertex_fragments/${chunkKey}/c/0`,
+  const fragmentBytes = await readChunkBlob(
+    kvStoreRead,
+    "vertex_fragments",
+    chunkKey,
     signal,
   );
   if (fragmentBytes === undefined) {
@@ -263,7 +308,12 @@ export async function downloadSkeletonChunk(
     linksConvention === "explicit" ||
     linksConvention === "implicit_sequential_with_branches"
   ) {
-    const linkBytes = await kvStoreRead(`links/0/${chunkKey}/c/0`, signal);
+    const linkBytes = await readChunkBlob(
+      kvStoreRead,
+      "links/0",
+      chunkKey,
+      signal,
+    );
     if (linkBytes === undefined || linkBytes.byteLength === 0) {
       // implicit_sequential_with_branches with no explicit branches in
       // this chunk is legitimate (a leaf-only sub-skeleton).
@@ -309,13 +359,20 @@ export async function downloadSkeletonChunk(
   const numFragments = fragmentIndex.numFragments;
   const segFragBytesPromise: Promise<Uint8Array | undefined> =
     (options.hasFragmentSegmentIds ?? true)
-      ? kvStoreRead(`fragment_attributes/segment_id/${chunkKey}/c/0`, signal)
+      ? readChunkBlob(
+          kvStoreRead,
+          "fragment_attributes/segment_id",
+          chunkKey,
+          signal,
+        )
       : Promise.resolve(undefined);
   const [vertexAttributes, segFragBytes] = await Promise.all([
     Promise.all(
       attributeNames.map(async (name, i) => {
-        const bytes = await kvStoreRead(
-          `vertex_attributes/${name}/${chunkKey}/c/0`,
+        const bytes = await readChunkBlob(
+          kvStoreRead,
+          `vertex_attributes/${name}`,
+          chunkKey,
           signal,
         );
         if (bytes === undefined) {
@@ -496,9 +553,9 @@ export async function fetchGhostVertices(
   await Promise.all(
     uniqueKeys.map(async (key) => {
       const [positions, ...attrs] = await Promise.all([
-        kvStoreRead(`vertices/${key}/c/0`, signal),
+        readChunkBlob(kvStoreRead, "vertices", key, signal),
         ...attributeNames.map((name) =>
-          kvStoreRead(`vertex_attributes/${name}/${key}/c/0`, signal),
+          readChunkBlob(kvStoreRead, `vertex_attributes/${name}`, key, signal),
         ),
       ]);
       byKey.set(key, { positions, attrs });

@@ -36,6 +36,7 @@ import {
 import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
 import { requestAsyncComputation } from "#src/async_computation/request.js";
 import { WithParameters } from "#src/chunk_manager/backend.js";
+import { readVlenBytesElement } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import type { ZarrVectorsAttributeDtype } from "#src/datasource/zarr-vectors/base.js";
 import {
   ZarrVectorsAnnotationSourceParameters,
@@ -77,10 +78,32 @@ async function maybeDecompress(
   );
 }
 
-// Per-chunk arrays in zarr-vectors are stored as single-chunk 1D zarr
-// v3 uint8 arrays with separator="/" and chunk-key encoding "default",
-// which makes the only data file always live at "<array>/c/0".
-const CHUNK_DATA_FILE = "c/0";
+// Each per-chunk array in zarr-vectors (`vertices`, `vertex_fragments`,
+// `links/<delta>`, attribute arrays) is a *single* multidimensional
+// `vlen-bytes` zarr v3 array with one cell per spatial chunk — what
+// zarr-vectors-py's `_ensure_level_array` calls "the default single-array
+// layout". With `chunk_key_encoding: {name: "default", separator: "/"}` and an
+// all-ones chunk shape, the cell for a chunk key `i.j.k` is the entire chunk
+// at `<array>/c/i/j/k`, holding exactly one vlen element.
+function chunkCellPath(arrayPath: string, chunkKey: string): string {
+  return `${arrayPath}/c/${chunkKey.split(".").join("/")}`;
+}
+
+/**
+ * Unwrap the single vlen element from a per-chunk array cell. Returns
+ * `undefined` for an empty (`N=0`) chunk, which is how the writer marks a
+ * populated grid cell that carries no blob.
+ */
+function unwrapChunkCell(
+  chunkBytes: Uint8Array<ArrayBuffer>,
+): Uint8Array | undefined {
+  try {
+    return readVlenBytesElement(chunkBytes, 0);
+  } catch (e) {
+    if (e instanceof RangeError) return undefined;
+    throw e;
+  }
+}
 
 const TYPED_ARRAY_CTORS: Record<
   ZarrVectorsAttributeDtype,
@@ -250,7 +273,7 @@ export class ZarrVectorsAnnotationSpatialIndexSourceBackend extends WithParamete
     const chunkKey = Array.from(chunkGridPosition, (v) => String(v)).join(".");
     const vertexUrl = joinBaseUrlAndPath(
       baseUrl,
-      `vertices/${chunkKey}/${CHUNK_DATA_FILE}`,
+      chunkCellPath("vertices", chunkKey),
     );
     const vertexResponse = await this.sharedKvStoreContext.kvStoreContext.read(
       vertexUrl,
@@ -260,11 +283,12 @@ export class ZarrVectorsAnnotationSpatialIndexSourceBackend extends WithParamete
       chunk.data = emptyGeometryData();
       return;
     }
-    const vertexBytes = await maybeDecompress(
+    const vertexCell = await maybeDecompress(
       new Uint8Array(await vertexResponse.response.arrayBuffer()),
       signal,
     );
-    if (vertexBytes.byteLength === 0) {
+    const vertexBytes = unwrapChunkCell(vertexCell);
+    if (vertexBytes === undefined || vertexBytes.byteLength === 0) {
       chunk.data = emptyGeometryData();
       return;
     }
@@ -285,7 +309,7 @@ export class ZarrVectorsAnnotationSpatialIndexSourceBackend extends WithParamete
       attributeNames.map(async (name, i) => {
         const url = joinBaseUrlAndPath(
           baseUrl,
-          `vertex_attributes/${name}/${chunkKey}/${CHUNK_DATA_FILE}`,
+          chunkCellPath(`vertex_attributes/${name}`, chunkKey),
         );
         const response = await this.sharedKvStoreContext.kvStoreContext.read(
           url,
@@ -296,10 +320,16 @@ export class ZarrVectorsAnnotationSpatialIndexSourceBackend extends WithParamete
             `zarr-vectors: chunk ${chunkKey} has vertices but property ${JSON.stringify(name)} is missing`,
           );
         }
-        const bytes = await maybeDecompress(
+        const cell = await maybeDecompress(
           new Uint8Array(await response.response.arrayBuffer()),
           signal,
         );
+        const bytes = unwrapChunkCell(cell);
+        if (bytes === undefined) {
+          throw new Error(
+            `zarr-vectors: chunk ${chunkKey} has vertices but property ${JSON.stringify(name)} is empty`,
+          );
+        }
         return reinterpretBytes(bytes, attributeDtypes[i], numPoints);
       }),
     );
