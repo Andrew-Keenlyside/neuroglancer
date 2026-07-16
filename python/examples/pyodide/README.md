@@ -122,19 +122,7 @@ via `micropip` inside your script or by extending `loadPackage(...)` in
   available in Pyodide.  Segmentation meshes return a 501 error; the rest of
   the viewer works normally.
 - TensorStore and cloudvolume are not available.  Only `LocalVolume` (numpy
-  arrays) and remote data sources that satisfy the COEP rule below.
-- **Cross-origin data is blocked by `COEP: require-corp`, and CORS is not
-  enough.**  The page must be cross-origin isolated for `SharedArrayBuffer`
-  (see above), and under `require-corp` every cross-origin subresource must
-  send `Cross-Origin-Resource-Policy`.  Public GCS buckets send
-  `Access-Control-Allow-Origin: *` but *no* CORP header, so
-  `precomputed://gs://...` sources load their metadata but render blank --
-  which is what the bundled `user_script.py` demonstrates.  Options: serve data
-  same-origin, have the data origin send
-  `Cross-Origin-Resource-Policy: cross-origin`, or relax `dev_server.py` (and
-  any production host) to `COEP: credentialless`, which keeps cross-origin
-  isolation but drops the CORP requirement for no-cors requests at the cost of
-  sending such requests without credentials.
+  arrays) and CORS-enabled remote data sources (e.g. precomputed on GCS) work.
 - Memory is limited to the browser heap (~2 GB).
 
 ## Production deployment

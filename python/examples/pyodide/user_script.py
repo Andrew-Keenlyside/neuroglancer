@@ -18,12 +18,6 @@ Runs inside the Pyodide worker; `neuroglancer.Viewer` resolves to
 `PyodideViewer`, which talks to the page through the service worker instead of
 a tornado server. Select a different script with `?script=<same-origin-path>`.
 
-Note the layers below render blank: the page is cross-origin isolated for
-SharedArrayBuffer, and `COEP: require-corp` blocks cross-origin subresources
-that do not send `Cross-Origin-Resource-Policy` -- which public GCS buckets do
-not. The layer *structure* still syncs from Python, so this demonstrates the
-state bridge. See the COEP entry in README.md for the ways around it.
-
 Pyodide scripts execute at module level -- there is no `__main__` guard, and
 `argparse`, `webbrowser`, `neuroglancer.cli`, and blocking `input()` are all
 unavailable. Use `js.setTimeout` rather than `threading.Timer`.
