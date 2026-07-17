@@ -226,6 +226,11 @@ interface VisibleChunk {
 
 interface SkeletonShaderParameters {
   dynamicSegmentAppearance: boolean;
+  /**
+   * Compile the ROI-filter alpha tier (zarr-vectors tract layers). Gated so
+   * every other skeleton layer's shader is byte-identical to before.
+   */
+  hasRoiFilter: boolean;
   hasSegmentStatedColors: boolean;
   hasSegmentDefaultColor: boolean;
   hoverHighlight: boolean;
@@ -295,6 +300,9 @@ class RenderHelper extends RefCounted {
   private excludedSegmentsShaderManager = new HashSetShaderManager(
     "excludedSegments",
   );
+  private roiPassingSegmentsShaderManager = new HashSetShaderManager(
+    "roiPassingSegments",
+  );
   private segmentColorShaderManager = new SegmentColorShaderManager(
     "segmentColorHash",
   );
@@ -306,6 +314,7 @@ class RenderHelper extends RefCounted {
   private gpuVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuTemporaryVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuEmptySegmentsHashTable: GPUHashTable<HashSetUint64>;
+  private gpuRoiPassingSegmentsHashTable: GPUHashTable<HashSetUint64> | undefined;
   // Lazily acquired and re-checked each draw; see getSegmentStatedColorHashTable.
   private gpuSegmentStatedColorHashTable:
     | GPUHashTable<HashMapUint64>
@@ -456,11 +465,27 @@ void spatialChunkCull() {
       excludedSegmentAlpha = "1.0";
     }
 
+    // ROI filter tier: ghost segments that are not in the passing set while the
+    // filter is active. Defined only when compiled in, so other skeleton layers
+    // are unaffected.
+    const roiFilterFragment = params.hasRoiFilter
+      ? `
+  if (uRoiFilterActive > 0.5 &&
+      !${this.roiPassingSegmentsShaderManager.hasFunctionName}(segmentId)) {
+    return uRoiGhostAlpha;
+  }`
+      : "";
+
     this.visibleSegmentsShaderManager.defineShader(builder);
     this.excludedSegmentsShaderManager.defineShader(builder);
     this.segmentColorShaderManager.defineShader(builder);
     if (params.hasSegmentStatedColors) {
       this.segmentStatedColorShaderManager.defineShader(builder);
+    }
+    if (params.hasRoiFilter) {
+      this.roiPassingSegmentsShaderManager.defineShader(builder);
+      builder.addUniform("highp float", "uRoiFilterActive");
+      builder.addUniform("highp float", "uRoiGhostAlpha");
     }
     builder.addUniform("highp float", "uVisibleAlpha");
     builder.addUniform("highp float", "uHiddenAlpha");
@@ -514,7 +539,7 @@ ${hoverAdjustFragment}
 float getSegmentLookupAlpha(uint64_t segmentId) {
   if (${this.excludedSegmentsShaderManager.hasFunctionName}(segmentId)) {
     return ${excludedSegmentAlpha};
-  }
+  }${roiFilterFragment}
   bool isVisible = ${this.visibleSegmentsShaderManager.hasFunctionName}(segmentId);
   ${alphaExpression}
 }
@@ -546,6 +571,22 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
       shader,
       excludedGPUTable ?? this.gpuEmptySegmentsHashTable,
     );
+    if (skeletonParams.hasRoiFilter) {
+      const dss = this.base.displayState;
+      this.roiPassingSegmentsShaderManager.enable(
+        gl,
+        shader,
+        this.gpuRoiPassingSegmentsHashTable ?? this.gpuEmptySegmentsHashTable,
+      );
+      gl.uniform1f(
+        shader.uniform("uRoiFilterActive"),
+        dss.roiFilterActive?.value ? 1 : 0,
+      );
+      gl.uniform1f(
+        shader.uniform("uRoiGhostAlpha"),
+        dss.roiGhostAlpha?.value ?? 0,
+      );
+    }
     // 3D (perspective) uses objectAlpha/hiddenObjectAlpha; 2D (slice) uses
     // the cross-section sliders selectedAlpha ("Opacity (on)") /
     // notSelectedAlpha ("Opacity (off)") when available, so the dense
@@ -665,6 +706,12 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
     this.gpuEmptySegmentsHashTable = this.registerDisposer(
       GPUHashTable.get(this.gl, this.emptySegmentSet.hashTable),
     );
+    const roiPassingSegments = base.displayState.roiPassingSegments;
+    if (roiPassingSegments !== undefined) {
+      this.gpuRoiPassingSegmentsHashTable = this.registerDisposer(
+        GPUHashTable.get(this.gl, roiPassingSegments.hashTable),
+      );
+    }
 
     this.edgeShaderGetter = parameterizedEmitterDependentShaderGetter(
       this,
@@ -1301,6 +1348,15 @@ export class SkeletonRenderingOptions implements Trackable {
 export interface SkeletonLayerDisplayState extends SegmentationDisplayState3D {
   shaderError: WatchableShaderError;
   skeletonRenderingOptions: SkeletonRenderingOptions;
+  /**
+   * ROI streamline-filter display state — present only for zarr-vectors tract
+   * layers. When set, the dynamic-appearance shader gains a tier that ghosts
+   * segments absent from `roiPassingSegments` while `roiFilterActive` is on.
+   * Absent for every other skeleton layer, so their shaders are unchanged.
+   */
+  roiPassingSegments?: Uint64Set;
+  roiFilterActive?: WatchableValueInterface<boolean>;
+  roiGhostAlpha?: WatchableValueInterface<number>;
 }
 
 export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
@@ -1316,6 +1372,7 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
   readonly skeletonShaderParameters =
     new WatchableValue<SkeletonShaderParameters>({
       dynamicSegmentAppearance: false,
+      hasRoiFilter: false,
       hasSegmentStatedColors: false,
       hasSegmentDefaultColor: false,
       hoverHighlight: false,
@@ -2883,9 +2940,13 @@ export class SpatiallyIndexedSkeletonLayer
       ...this.source.vertexAttributes,
       selectedNodeAttribute,
     ];
+    // Constant for the layer's lifetime: the passing set is attached at layer
+    // creation for zarr-vectors tract layers and never for others.
+    const hasRoiFilter = this.displayState.roiPassingSegments !== undefined;
     this.skeletonShaderParameters =
       new WatchableValue<SkeletonShaderParameters>({
         dynamicSegmentAppearance: true,
+        hasRoiFilter,
         hasSegmentStatedColors: false,
         hasSegmentDefaultColor: false,
         hoverHighlight: false,
@@ -2896,6 +2957,7 @@ export class SpatiallyIndexedSkeletonLayer
         this.displayState.segmentationColorGroupState.value;
       this.skeletonShaderParameters.value = {
         dynamicSegmentAppearance: true,
+        hasRoiFilter,
         hasSegmentStatedColors: colorGroupState.segmentStatedColors.size !== 0,
         hasSegmentDefaultColor:
           colorGroupState.segmentDefaultColor.value !== undefined ||
