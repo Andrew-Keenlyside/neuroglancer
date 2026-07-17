@@ -16,7 +16,7 @@
  * `vertexAttributes` — ready to drop into a per-segment `SkeletonChunk`.
  */
 
-import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/cross_chunk_links.js";
+import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
 import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import { resolveFragmentRef } from "#src/datasource/zarr-vectors/object_manifest.js";
 import {

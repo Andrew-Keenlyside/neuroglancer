@@ -34,14 +34,14 @@ import {
   type ZarrVectorsLinksConvention,
   type ZarrVectorsSkeletonGeometryKind,
 } from "#src/datasource/zarr-vectors/base.js";
+import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import {
   createCrossChunkLinksCaches,
   readCrossChunkLinks,
   readCrossChunkLinksForChunk,
   type CrossChunkLinksCaches,
   type CrossChunkLinksTable,
-} from "#src/datasource/zarr-vectors/cross_chunk_links.js";
-import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
+} from "#src/datasource/zarr-vectors/links.js";
 import {
   appendGhostVertices,
   appendIntraChunkEdges,
@@ -131,11 +131,10 @@ function makeKvStoreRead(
 
 /**
  * Build a `kvStoreRead` callback like {@link makeKvStoreRead} but WITHOUT
- * the magic-byte-sniffing auto-decompress step.  Required by
- * {@link readCrossChunkLinks}: a v0.8 cross-chunk-links shard file is a
- * multi-cell concatenation (each cell independently zstd-framed), not a
- * single zstd stream, so auto-decompressing the whole shard blob would
- * corrupt the shard-index/cell-boundary parsing.
+ * the magic-byte-sniffing auto-decompress step.  Required by the ZVF 0.9
+ * links reader: a `links/<delta>/<offsets>/c/...` cell is a `vlen-bytes`
+ * container whose payload is not itself a zstd stream, so the reader must
+ * see the raw stored bytes and do its own vlen framing / decode.
  */
 function makeRawKvStoreRead(
   baseUrl: string,
@@ -162,11 +161,11 @@ function makeRawKvStoreRead(
 
 /**
  * Build a `kvStoreList` callback bound to a base URL and the worker-side
- * shared kvstore context.  Used by {@link readCrossChunkLinks} to
- * recursively discover which shards of a v0.8 ``kK`` array are
- * populated.  Mirrors ``listAttributeNames`` in `frontend.ts`, but
- * returns bare (no-trailing-slash) names for both directories and files
- * instead of a single merged list.
+ * shared kvstore context.  Used by the links reader to enumerate the
+ * `<offsets>` arrays under `links/<delta>/` when the store permits object
+ * listing (it falls back to a bounded GET-only probe otherwise).  Mirrors
+ * ``listAttributeNames`` in `frontend.ts`, but returns bare
+ * (no-trailing-slash) names for both directories and files.
  */
 function makeKvStoreList(
   baseUrl: string,
@@ -276,21 +275,44 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
     ) => Promise<{ directories: string[]; files: string[] }>,
     signal: AbortSignal,
   ): Promise<CrossChunkLinksTable | undefined> {
+    // `false` latches only the "this store has no links family" case, which the
+    // reader signals by returning `undefined`. A links family that exists but
+    // cannot be read *throws* — that must NOT permanently disable links for the
+    // whole source (which is how a format-drift 404 previously masked the ZVF
+    // 0.9 migration): warn once and render this chunk intra-only, retrying the
+    // next chunk.
     if (this.crossChunkLinksCaches_ === false) return undefined;
     if (this.crossChunkLinksCaches_ === undefined) {
       this.crossChunkLinksCaches_ = createCrossChunkLinksCaches();
     }
-    const table = await readCrossChunkLinksForChunk(
-      { kvStoreRead, kvStoreList },
-      targetChunkCoords,
-      this.crossChunkLinksCaches_,
-      signal,
-    );
+    let table: CrossChunkLinksTable | undefined;
+    try {
+      table = await readCrossChunkLinksForChunk(
+        { kvStoreRead, kvStoreList },
+        targetChunkCoords,
+        this.crossChunkLinksCaches_,
+        signal,
+      );
+    } catch (e) {
+      if (!this.crossChunkLinksReadWarned_) {
+        this.crossChunkLinksReadWarned_ = true;
+        console.warn(
+          "zarr-vectors: failed to read the cross-chunk links family; streamlines " +
+            "may be broken at chunk boundaries. " +
+            (e instanceof Error ? e.message : String(e)),
+        );
+      }
+      return undefined;
+    }
     if (table === undefined) {
+      // Genuinely no links family: latch so we stop probing for it.
       this.crossChunkLinksCaches_ = false;
     }
     return table;
   }
+
+  /** Whether the "links present but unreadable" warning has been emitted. */
+  private crossChunkLinksReadWarned_ = false;
 
   /**
    * Filter the cross-chunk-link table down to records incident on the
@@ -425,7 +447,10 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
     const { chunkGridPosition } = chunk;
     const chunkKey = Array.from(chunkGridPosition, (v) => String(v)).join(".");
     const kvStoreRead = makeKvStoreRead(baseUrl, this.sharedKvStoreContext);
-    const rawKvStoreRead = makeRawKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    const rawKvStoreRead = makeRawKvStoreRead(
+      baseUrl,
+      this.sharedKvStoreContext,
+    );
     const kvStoreList = makeKvStoreList(baseUrl, this.sharedKvStoreContext);
 
     const decoded = await downloadSkeletonChunk(
@@ -720,7 +745,10 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
     if (this.crossChunkLinks_ !== undefined) {
       return this.crossChunkLinks_ ?? undefined;
     }
-    const table = await readCrossChunkLinks({ kvStoreRead, kvStoreList }, signal);
+    const table = await readCrossChunkLinks(
+      { kvStoreRead, kvStoreList },
+      signal,
+    );
     this.crossChunkLinks_ = table ?? null;
     return table;
   }
@@ -737,7 +765,10 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       hasFragmentSegmentIds,
     } = this.parameters;
     const kvStoreRead = makeKvStoreRead(baseUrl, this.sharedKvStoreContext);
-    const rawKvStoreRead = makeRawKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    const rawKvStoreRead = makeRawKvStoreRead(
+      baseUrl,
+      this.sharedKvStoreContext,
+    );
     const kvStoreList = makeKvStoreList(baseUrl, this.sharedKvStoreContext);
 
     // The manifests array's `numObjects` / `chunkSize` aren't carried

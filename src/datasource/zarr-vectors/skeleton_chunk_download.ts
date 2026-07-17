@@ -18,6 +18,10 @@
 
 import { decodeFragments } from "#src/datasource/zarr-vectors/fragment_index.js";
 import {
+  intraOffsets,
+  linksPath,
+} from "#src/datasource/zarr-vectors/links_paths.js";
+import {
   buildSkeletonChunk,
   type AttributeTypedArray,
   type GhostVertexRecord,
@@ -301,8 +305,16 @@ export async function downloadSkeletonChunk(
   }
   const fragmentIndex = decodeFragments(fragmentBytes);
 
-  // 3. Explicit edges (links/0/<key>/c/0) — required for explicit /
+  // 3. Explicit intra-chunk edges — required for explicit /
   // implicit_sequential_with_branches, absent for pure implicit_sequential.
+  //
+  // Under ZVF 0.9 `links/0` is a GROUP and the intra-chunk edges live in its
+  // all-zero-offsets array `links/0/0.0.0`; the cross-chunk offset arrays
+  // (`links/0/0.0.+1`, …) that bridge chunk boundaries are read separately by
+  // the backend's links reader. This intra array's cell is a flat int64 pair
+  // list (the `delta==0 && is_intra` "flat" encoding), which reinterpretLinkBytes
+  // reads directly.
+  const intraLinksArray = linksPath(0, intraOffsets(rank, 2));
   let explicitEdges: Uint32Array | undefined;
   if (
     linksConvention === "explicit" ||
@@ -310,7 +322,7 @@ export async function downloadSkeletonChunk(
   ) {
     const linkBytes = await readChunkBlob(
       kvStoreRead,
-      "links/0",
+      intraLinksArray,
       chunkKey,
       signal,
     );
@@ -323,8 +335,8 @@ export async function downloadSkeletonChunk(
       const totalElements = linkBytes.byteLength / elementSize;
       if (totalElements % 2 !== 0) {
         throw new Error(
-          `zarr-vectors links/0/${chunkKey}: ${totalElements} elements is ` +
-            `not a multiple of link_width=2`,
+          `zarr-vectors ${intraLinksArray}/${chunkKey}: ${totalElements} ` +
+            `elements is not a multiple of link_width=2`,
         );
       }
       const numEdges = totalElements / 2;

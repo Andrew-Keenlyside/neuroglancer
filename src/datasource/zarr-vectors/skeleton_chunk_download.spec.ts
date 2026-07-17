@@ -229,13 +229,13 @@ describe("downloadSkeletonChunk — orchestrator", () => {
 
   it("downloads a skeleton chunk with implicit_sequential_with_branches and uint16 link dtype", async () => {
     // 5 vertices, single fragment.  Sequential edges plus a branch (1,4)
-    // stored in links/0 as uint16.
+    // stored in the intra-chunk links array links/0/0.0.0 as uint16.
     const kvStoreRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([
         0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0,
       ]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(5),
-      "links/0/0.0.0": uint16LinksBlob([1, 4]),
+      "links/0/0.0.0/0.0.0": uint16LinksBlob([1, 4]),
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -262,7 +262,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     const kvStoreRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(4),
-      "links/0/0.0.0": linksBlob,
+      "links/0/0.0.0/0.0.0": linksBlob,
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -285,7 +285,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     const kvStoreRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(2),
-      "links/0/0.0.0": new Uint8Array(0),
+      "links/0/0.0.0/0.0.0": new Uint8Array(0),
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -364,7 +364,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     const kvStoreRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(3),
-      "links/0/0.0.0": linksBlob,
+      "links/0/0.0.0/0.0.0": linksBlob,
     });
     const chunk = await downloadSkeletonChunk(
       {
@@ -519,7 +519,7 @@ describe("downloadSkeletonChunk — link dtype matrix", () => {
       const kvStoreRead = makeKvStore({
         "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]),
         "vertex_fragments/0.0.0": singleRangeFragmentBlob(3),
-        "links/0/0.0.0": blob(),
+        "links/0/0.0.0/0.0.0": blob(),
       });
       const chunk = await downloadSkeletonChunk(
         {

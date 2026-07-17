@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/cross_chunk_links.js";
+import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
 import {
   FRAGMENT_INDEX_MAGIC,
   FRAGMENT_INDEX_VERSION,
