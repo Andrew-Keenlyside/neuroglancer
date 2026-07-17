@@ -29,6 +29,7 @@ import {
   LocalDataSource,
   localEquivalencesUrl,
 } from "#src/datasource/local.js";
+import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import type {
   LayerActionContext,
   ManagedUserLayer,
@@ -846,6 +847,8 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   objectAlpha = trackableAlphaValue(1.0);
   hiddenObjectAlpha = trackableAlphaValue(0.5);
   skeletonLod = trackableFiniteFloat(0.0);
+  /** TrackVis-style ROI streamline filter (zarr-vectors); persists to the URL. */
+  roiFilter = new RoiFilterState();
   spatialSkeletonGridLevel2d = new TrackableValue<number>(
     0,
     verifyNonnegativeInt,
@@ -1419,6 +1422,7 @@ export class SegmentationUserLayer extends Base {
     this.displayState.spatialSkeletonNodeFilter.changed.add(
       this.specificationChanged.dispatch,
     );
+    this.displayState.roiFilter.changed.add(this.specificationChanged.dispatch);
     this.displayState.spatialSkeletonGridResolutionTarget2d.changed.add(
       this.specificationChanged.dispatch,
     );
@@ -2237,6 +2241,11 @@ export class SegmentationUserLayer extends Base {
       (value) =>
         this.displayState.spatialSkeletonNodeFilter.restoreState(value),
     );
+    verifyOptionalObjectProperty(
+      specification,
+      json_keys.ROI_FILTER_JSON_KEY,
+      (value) => this.displayState.roiFilter.restoreState(value),
+    );
     this.displayState.spatialSkeletonGridResolutionTarget2d.restoreState(
       specification[json_keys.SKELETON_CROSS_SECTION_RENDER_SCALE_JSON_KEY],
     );
@@ -2316,6 +2325,7 @@ export class SegmentationUserLayer extends Base {
       this.displayState.spatialSkeletonNodeQuery.toJSON();
     x[json_keys.SPATIAL_SKELETON_NODE_FILTER_JSON_KEY] =
       this.displayState.spatialSkeletonNodeFilter.toJSON();
+    x[json_keys.ROI_FILTER_JSON_KEY] = this.displayState.roiFilter.toJSON();
     x[json_keys.HIDDEN_OPACITY_3D_JSON_KEY] =
       this.displayState.hiddenObjectAlpha.toJSON();
     x[json_keys.SKELETON_CROSS_SECTION_RENDER_SCALE_JSON_KEY] =

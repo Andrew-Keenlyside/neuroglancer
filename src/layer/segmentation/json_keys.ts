@@ -30,6 +30,7 @@ export const SEGMENT_QUERY_JSON_KEY = "segmentQuery";
 export const SPATIAL_SKELETON_NODE_QUERY_JSON_KEY = "spatialSkeletonNodeQuery";
 export const SPATIAL_SKELETON_NODE_FILTER_JSON_KEY =
   "spatialSkeletonNodeFilter";
+export const ROI_FILTER_JSON_KEY = "roiFilter";
 export const MESH_SILHOUETTE_RENDERING_JSON_KEY = "meshSilhouetteRendering";
 export const LINKED_SEGMENTATION_GROUP_JSON_KEY = "linkedSegmentationGroup";
 export const LINKED_SEGMENTATION_COLOR_GROUP_JSON_KEY =
