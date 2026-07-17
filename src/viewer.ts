@@ -270,6 +270,7 @@ class TrackableViewerState extends CompoundTrackable {
       "hideCrossSectionBackground3D",
       viewer.hideCrossSectionBackground3D,
     );
+    this.add("showCrossSectionOutline3D", viewer.showCrossSectionOutline3D);
     this.add(
       "gpuMemoryLimit",
       viewer.dataContext.chunkQueueManager.capacities.gpuMemory.sizeLimit,
@@ -439,6 +440,7 @@ export class Viewer extends RefCounted implements ViewerState {
   showScaleBar = new TrackableBoolean(true, true);
   showPerspectiveSliceViews = new TrackableBoolean(true, true);
   hideCrossSectionBackground3D = new TrackableBoolean(false, false);
+  showCrossSectionOutline3D = new TrackableBoolean(false, false);
   visibleLayerRoles = allRenderLayerRoles();
   showDefaultAnnotations = new TrackableBoolean(true, true);
   crossSectionBackgroundColor = new TrackableRGB(

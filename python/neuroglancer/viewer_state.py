@@ -1938,6 +1938,9 @@ class ViewerState(JsonObjectWrapper):
     hide_cross_section_background_3d = hideCrossSectionBackground3D = wrapped_property(
         "hideCrossSectionBackground3D", optional(bool, False)
     )
+    show_cross_section_outline_3d = showCrossSectionOutline3D = wrapped_property(
+        "showCrossSectionOutline3D", optional(bool, False)
+    )
     show_axis_lines = showAxisLines = wrapped_property(
         "showAxisLines", optional(bool, True)
     )
