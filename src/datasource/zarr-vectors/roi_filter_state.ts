@@ -164,6 +164,7 @@ export class RoiFilterState {
 
   private active_ = false;
   private ghostAlpha_ = DEFAULT_GHOST_ALPHA;
+  private colorByGroup_ = false;
   private entries_: Roi[] = [];
 
   /** Whether the filter is applied (ghosting non-passing streamlines). */
@@ -187,6 +188,16 @@ export class RoiFilterState {
     this.changed.dispatch();
   }
 
+  /** Whether to recolour passing streamlines by their matched ROI group. */
+  get colorByGroup(): boolean {
+    return this.colorByGroup_;
+  }
+  set colorByGroup(value: boolean) {
+    if (value === this.colorByGroup_) return;
+    this.colorByGroup_ = value;
+    this.changed.dispatch();
+  }
+
   /** The ordered ROI list. Already a valid `Roi[]` for the filter. */
   get rois(): readonly Roi[] {
     return this.entries_;
@@ -198,6 +209,45 @@ export class RoiFilterState {
     this.changed.dispatch();
   }
 
+  /** Append one ROI; returns its index. */
+  addRoi(roi: Roi): number {
+    this.entries_ = [...this.entries_, roi];
+    this.changed.dispatch();
+    return this.entries_.length - 1;
+  }
+
+  /** Replace fields of the ROI at `index` (no-op if out of range). */
+  updateRoi(index: number, changes: Partial<Roi>): void {
+    if (index < 0 || index >= this.entries_.length) return;
+    const next = this.entries_.slice();
+    next[index] = { ...next[index], ...changes };
+    this.entries_ = next;
+    this.changed.dispatch();
+  }
+
+  /** Remove the ROI at `index` (no-op if out of range). */
+  removeRoi(index: number): void {
+    if (index < 0 || index >= this.entries_.length) return;
+    const next = this.entries_.slice();
+    next.splice(index, 1);
+    this.entries_ = next;
+    this.changed.dispatch();
+  }
+
+  /**
+   * Move the ROI at `from` to position `to`. Order is the whole of the
+   * left-fold syntax, so this is the primary editing operation.
+   */
+  moveRoi(from: number, to: number): void {
+    const n = this.entries_.length;
+    if (from < 0 || from >= n || to < 0 || to >= n || from === to) return;
+    const next = this.entries_.slice();
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    this.entries_ = next;
+    this.changed.dispatch();
+  }
+
   toJSON(): any {
     if (!this.active_ && this.entries_.length === 0) {
       return undefined; // stays out of the URL when unused
@@ -206,6 +256,7 @@ export class RoiFilterState {
     if (this.active_) json.active = true;
     if (this.ghostAlpha_ !== DEFAULT_GHOST_ALPHA)
       json.ghostAlpha = this.ghostAlpha_;
+    if (this.colorByGroup_) json.colorByGroup = true;
     return json;
   }
 
@@ -224,16 +275,21 @@ export class RoiFilterState {
     this.ghostAlpha_ =
       verifyOptionalObjectProperty(x, "ghostAlpha", verifyFiniteFloat) ??
       DEFAULT_GHOST_ALPHA;
+    this.colorByGroup_ =
+      verifyOptionalObjectProperty(x, "colorByGroup", (v) => v === true) ??
+      false;
     this.changed.dispatch();
   }
 
   reset(): void {
     const wasDefault =
       !this.active_ &&
+      !this.colorByGroup_ &&
       this.entries_.length === 0 &&
       this.ghostAlpha_ === DEFAULT_GHOST_ALPHA;
     this.active_ = false;
     this.ghostAlpha_ = DEFAULT_GHOST_ALPHA;
+    this.colorByGroup_ = false;
     this.entries_ = [];
     if (!wasDefault) this.changed.dispatch();
   }

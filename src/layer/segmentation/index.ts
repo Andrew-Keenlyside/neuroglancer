@@ -30,6 +30,7 @@ import {
   localEquivalencesUrl,
 } from "#src/datasource/local.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
+import { StreamlineFilterTab } from "#src/datasource/zarr-vectors/streamline_filter_tab.js";
 import type {
   LayerActionContext,
   ManagedUserLayer,
@@ -1500,6 +1501,14 @@ export class SegmentationUserLayer extends Base {
       label: "Skeleton",
       order: -45,
       getter: () => new SpatialSkeletonEditTab(this),
+      hidden: hideSpatialSkeletonEditTab,
+    });
+    // The ROI streamline filter applies to exactly the same zarr-vectors
+    // spatially-indexed tract sources the Skeleton tab gates on.
+    this.tabs.add("filter", {
+      label: "Filter",
+      order: -40,
+      getter: () => new StreamlineFilterTab(this),
       hidden: hideSpatialSkeletonEditTab,
     });
     const hideGraphTab = this.registerDisposer(

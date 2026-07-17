@@ -131,10 +131,76 @@ describe("RoiFilterState", () => {
     const s = new RoiFilterState();
     s.setRois([ellipsoid]);
     s.active = true;
+    s.colorByGroup = true;
     s.reset();
     expect(s.active).toBe(false);
+    expect(s.colorByGroup).toBe(false);
     expect(s.rois).toEqual([]);
     expect(s.toJSON()).toBeUndefined();
+  });
+
+  it("round-trips colorByGroup", () => {
+    const s = new RoiFilterState();
+    s.setRois([ellipsoid]);
+    s.colorByGroup = true;
+    const restored = new RoiFilterState();
+    restored.restoreState(s.toJSON());
+    expect(restored.colorByGroup).toBe(true);
+  });
+});
+
+describe("RoiFilterState mutators", () => {
+  it("addRoi appends and returns the new index", () => {
+    const s = new RoiFilterState();
+    expect(s.addRoi(ellipsoid)).toBe(0);
+    expect(s.addRoi(box)).toBe(1);
+    expect(s.rois.map((r) => r.shape.kind)).toEqual(["ellipsoid", "box"]);
+  });
+
+  it("updateRoi replaces fields of one entry, out-of-range is a no-op", () => {
+    const s = new RoiFilterState();
+    s.setRois([ellipsoid, box]);
+    s.updateRoi(1, { operator: RoiOperator.OR });
+    expect(s.rois[1].operator).toBe(RoiOperator.OR);
+    expect(s.rois[1].shape.kind).toBe("box"); // shape untouched
+    s.updateRoi(9, { operator: RoiOperator.AND });
+    expect(s.rois).toHaveLength(2);
+  });
+
+  it("removeRoi drops one entry; out-of-range is a no-op", () => {
+    const s = new RoiFilterState();
+    s.setRois([ellipsoid, box]);
+    s.removeRoi(0);
+    expect(s.rois.map((r) => r.shape.kind)).toEqual(["box"]);
+    s.removeRoi(5);
+    expect(s.rois).toHaveLength(1);
+  });
+
+  it("moveRoi reorders; identity/out-of-range moves are no-ops", () => {
+    const s = new RoiFilterState();
+    const c: Roi = { ...box, predicate: RoiPredicate.EITHER_ENDPOINT };
+    s.setRois([ellipsoid, box, c]);
+    s.moveRoi(2, 0); // c to front
+    expect(s.rois.map((r) => r.predicate)).toEqual([
+      RoiPredicate.EITHER_ENDPOINT,
+      RoiPredicate.ANY_SEGMENT,
+      RoiPredicate.ANY_VERTEX,
+    ]);
+    s.moveRoi(1, 1); // no-op
+    s.moveRoi(0, 9); // out of range no-op
+    expect(s.rois).toHaveLength(3);
+  });
+
+  it("each mutator dispatches changed", () => {
+    const s = new RoiFilterState();
+    let count = 0;
+    s.changed.add(() => ++count);
+    s.addRoi(ellipsoid);
+    s.addRoi(box);
+    s.updateRoi(0, { operator: RoiOperator.OR });
+    s.moveRoi(0, 1);
+    s.removeRoi(0);
+    expect(count).toBe(5);
   });
 });
 

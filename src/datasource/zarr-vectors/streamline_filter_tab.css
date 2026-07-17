@@ -1,0 +1,93 @@
+/**
+ * @license
+ * Copyright 2026 Google Inc.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ */
+
+.neuroglancer-streamline-filter-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px;
+}
+
+.neuroglancer-streamline-filter-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.neuroglancer-streamline-filter-active {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.neuroglancer-streamline-filter-count {
+  color: #bbb;
+  font-size: 11px;
+}
+
+.neuroglancer-streamline-filter-add {
+  display: flex;
+  gap: 4px;
+}
+
+.neuroglancer-streamline-filter-roi-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.neuroglancer-streamline-filter-empty {
+  color: #888;
+  font-style: italic;
+  font-size: 11px;
+  padding: 4px 0;
+}
+
+.neuroglancer-streamline-filter-roi-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.neuroglancer-streamline-filter-roi-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.neuroglancer-streamline-filter-roi-row select {
+  font-size: 11px;
+}
+
+.neuroglancer-streamline-filter-display {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid #333;
+  padding-top: 4px;
+}
+
+.neuroglancer-streamline-filter-ghost {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.neuroglancer-streamline-filter-color {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+}
+
+.neuroglancer-streamline-filter-tab .neuroglancer-disabled {
+  opacity: 0.3;
+  pointer-events: none;
+}
