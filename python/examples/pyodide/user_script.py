@@ -61,4 +61,9 @@ with viewer.txn() as s:
     s.hide_cross_section_background_3d = True
     s.show_cross_section_outline_3d = True
 
+    # The 2-d slice panels default to a grey background (meant to sit behind a
+    # volume). A tract-only layer has nothing volumetric there, so make the
+    # slice background black to match the 3-d view.
+    s.cross_section_background_color = "#000000"
+
 print("Viewer ready:", viewer.get_viewer_url())
