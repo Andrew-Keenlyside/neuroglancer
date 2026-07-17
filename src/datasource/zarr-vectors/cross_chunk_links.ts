@@ -413,13 +413,27 @@ export function decodeCrossChunkLinkCell(
   }
   const recordLen = 1 + linkWidth;
   const rows = decodeRaggedBlobInt64Records(payload, recordLen);
-  const records: CrossChunkLinkRecord[] = [];
-  for (const row of rows) {
+  // `cellChunks[i]` is the same chunk-coordinate tuple for EVERY record in
+  // this cell — copy it once per cell here, not once per record below. A
+  // busy chunk's cross-chunk-link cells can hold tens of thousands of
+  // records (measured: ~68k incident on one chunk in a real streamline-
+  // bundle store), so a `.slice()` per record per endpoint was allocating
+  // and immediately discarding `records.length * linkWidth` short-lived
+  // arrays — a real contributor to multi-second single-threaded decode
+  // stalls. Safe to share the same array across every record's endpoint:
+  // nothing downstream mutates `CrossChunkLinkEndpoint.chunkCoords` in
+  // place (it's read-only positional data used for lookups/joins).
+  const sharedChunkCoords: readonly number[][] = cellChunks.map((c) =>
+    c.slice(),
+  );
+  const records: CrossChunkLinkRecord[] = new Array(rows.length);
+  for (let r = 0; r < rows.length; ++r) {
+    const row = rows[r];
     const permIdx = Number(row[0]);
     const sortedEndpoints: CrossChunkLinkEndpoint[] = new Array(linkWidth);
     for (let i = 0; i < linkWidth; ++i) {
       sortedEndpoints[i] = {
-        chunkCoords: cellChunks[i].slice(),
+        chunkCoords: sharedChunkCoords[i],
         vertexIndex: Number(row[1 + i]),
       };
     }
@@ -428,7 +442,7 @@ export function decodeCrossChunkLinkCell(
     for (let i = 0; i < linkWidth; ++i) {
       endpoints[sortedIdx[i]] = sortedEndpoints[i];
     }
-    records.push({ endpoints });
+    records[r] = { endpoints };
   }
   return records;
 }
@@ -697,6 +711,46 @@ function getCellKeyIndexMap(
  * {@link readCrossChunkLinksForChunk} (one chunk's records, cached).
  * Dispatches on the family's stored `layout`.
  */
+/**
+ * How many cross-chunk-link cells to fetch+decode concurrently. Chosen
+ * (rather than an unbounded `Promise.all`) so a whole-level read
+ * (`readCrossChunkLinks`, potentially thousands of cells) doesn't open
+ * thousands of simultaneous requests; for a per-chunk read
+ * (`readCrossChunkLinksForChunk`, typically ≤~25 matching cells — one per
+ * spatially-adjacent chunk-pair) this cap is never actually reached, so
+ * every matching cell fetches in parallel regardless.
+ */
+const CROSS_CHUNK_LINK_CELL_FETCH_CONCURRENCY = 16;
+
+/**
+ * Run `fn` over `items` with at most `concurrency` calls in flight at
+ * once. Results are returned in the same order as `items`, independent of
+ * completion order. A small fixed-size worker pool: each of
+ * `min(concurrency, items.length)` workers repeatedly claims the next
+ * unclaimed index until none remain.
+ */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () =>
+      worker(),
+    ),
+  );
+  return results;
+}
+
 async function readCrossChunkLinksImpl(
   options: CrossChunkLinksReaderOptions,
   signal: AbortSignal,
@@ -716,51 +770,80 @@ async function readCrossChunkLinksImpl(
     // Cells are enumerated from the header's sorted `cell_keys` (index `i`
     // holds `cell_keys[i]`) — no listing needed. A locally-created shard-
     // index cache (when none is supplied, e.g. the whole-table read) keeps
-    // the single shard-index fetch amortized across every element.
+    // the single shard-index fetch amortized across every element — safe
+    // to share across concurrent fetches below since it memoizes the
+    // in-flight promise per shard path (`AsyncMemoize`), not just the
+    // resolved value, so concurrent callers naturally de-dupe rather than
+    // racing to double-fetch the same shard index.
     const idxCache = shardIndexCache ?? (new Map() as ShardIndexCache);
     const ctx = packedReadContext(options, header, base);
     const keys = header.cellKeys!;
-    const records: CrossChunkLinkRecord[] = [];
+    // Filter to matching indices first (cheap: parsed purely from the key
+    // string, no I/O), THEN fetch+decode every match in parallel. Matching
+    // cells are otherwise independent of each other, so there is no reason
+    // to fetch them one at a time — a chunk with e.g. 25 cross-chunk-link
+    // partners previously paid 25 sequential network round trips here
+    // before any ghost-vertex fetch could even start.
+    const matches: { index: number; cellChunks: number[][] }[] = [];
     for (let i = 0; i < keys.length; ++i) {
       const cellChunks = parseCellKey(keys[i], sidNdim, linkWidth);
-      if (!shouldDecodeCell(cellChunks)) continue;
-      const payload = await readShardedArrayChunk(ctx, [i], signal, idxCache);
-      if (payload === undefined) continue;
-      for (const record of decodeCrossChunkLinkCell(
-        payload,
-        cellChunks,
-        linkWidth,
-      )) {
-        records.push(record);
-      }
+      if (shouldDecodeCell(cellChunks)) matches.push({ index: i, cellChunks });
+    }
+    const perCellRecords = await mapWithConcurrency(
+      matches,
+      CROSS_CHUNK_LINK_CELL_FETCH_CONCURRENCY,
+      async ({ index, cellChunks }) => {
+        const payload = await readShardedArrayChunk(
+          ctx,
+          [index],
+          signal,
+          idxCache,
+        );
+        return payload === undefined
+          ? []
+          : decodeCrossChunkLinkCell(payload, cellChunks, linkWidth);
+      },
+    );
+    const records: CrossChunkLinkRecord[] = [];
+    for (const cellRecords of perCellRecords) {
+      for (const record of cellRecords) records.push(record);
     }
     return { linkWidth, sidNdim, records };
   }
 
   const cellKeys = await listAllCellKeys(options, signal, cellKeysCache);
-  const records: CrossChunkLinkRecord[] = [];
+  const matches: { cellKey: string; cellChunks: number[][] }[] = [];
   for (const cellKey of cellKeys) {
     const cellChunks = parseCellKey(cellKey, sidNdim, linkWidth);
-    if (!shouldDecodeCell(cellChunks)) continue;
-    const cellPath = `${base}/${cellKey}`;
-    let bytes = cellBytesCache?.get(cellPath);
-    if (bytes === undefined) {
-      const fetched = await kvStoreRead(`${cellPath}/c/0`, signal);
-      if (fetched === undefined) continue;
-      bytes = fetched;
-      cellBytesCache?.set(cellPath, bytes);
-    }
-    const payload = await decodeCellPayload(bytes, signal);
-    // Loop rather than `records.push(...cellRecords)`: a single cell can
-    // (in principle) hold more than V8's ~65,536-argument call limit on
-    // large datasets, and spreading into a call throws past that limit.
-    for (const record of decodeCrossChunkLinkCell(
-      payload,
-      cellChunks,
-      linkWidth,
-    )) {
-      records.push(record);
-    }
+    if (shouldDecodeCell(cellChunks)) matches.push({ cellKey, cellChunks });
+  }
+  // Same rationale as the packed-sharded branch above: filter cheaply,
+  // then fetch+decode every matching cell in parallel instead of one at a
+  // time. `cellBytesCache` is a plain synchronous Map keyed by distinct
+  // cell paths (never the same path twice within one call), so concurrent
+  // reads/writes on it can't race each other.
+  const perCellRecords = await mapWithConcurrency(
+    matches,
+    CROSS_CHUNK_LINK_CELL_FETCH_CONCURRENCY,
+    async ({ cellKey, cellChunks }) => {
+      const cellPath = `${base}/${cellKey}`;
+      let bytes = cellBytesCache?.get(cellPath);
+      if (bytes === undefined) {
+        const fetched = await kvStoreRead(`${cellPath}/c/0`, signal);
+        if (fetched === undefined) return [];
+        bytes = fetched;
+        cellBytesCache?.set(cellPath, bytes);
+      }
+      const payload = await decodeCellPayload(bytes, signal);
+      return decodeCrossChunkLinkCell(payload, cellChunks, linkWidth);
+    },
+  );
+  const records: CrossChunkLinkRecord[] = [];
+  // Loop rather than `records.push(...cellRecords)`: a single cell can (in
+  // principle) hold more than V8's ~65,536-argument call limit on large
+  // datasets, and spreading into a call throws past that limit.
+  for (const cellRecords of perCellRecords) {
+    for (const record of cellRecords) records.push(record);
   }
   return { linkWidth, sidNdim, records };
 }

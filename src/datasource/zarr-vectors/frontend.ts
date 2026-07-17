@@ -1020,16 +1020,25 @@ async function readGroupMemberships(
           `not a multiple of 8`,
       );
     }
-    const i64 =
-      blob.byteOffset % 8 === 0
-        ? new BigInt64Array(blob.buffer, blob.byteOffset, n)
+    // Read the low 32 bits of each little-endian int64 directly via a
+    // Uint32Array view instead of `Number(BigInt64Array[i])` — member oids
+    // are always small (bounded by `numObjects`, nowhere near 2^32), so the
+    // high word is always zero and the low word alone is a safe JS number.
+    // `Number(bigint)` boxes then unboxes a BigInt PER ELEMENT; across all
+    // groups a real bundle atlas can have close to one entry per object
+    // (measured: 1.3M objects across 40 groups here), and that per-element
+    // BigInt round-trip was a multi-second single-threaded stall — the same
+    // pattern already fixed for cross_chunk_links record decoding.
+    const u32 =
+      blob.byteOffset % 4 === 0
+        ? new Uint32Array(blob.buffer, blob.byteOffset, n * 2)
         : (() => {
             const copy = new Uint8Array(blob.byteLength);
             copy.set(blob);
-            return new BigInt64Array(copy.buffer, 0, n);
+            return new Uint32Array(copy.buffer, 0, n * 2);
           })();
     const arr: number[] = new Array(n);
-    for (let i = 0; i < n; ++i) arr[i] = Number(i64[i]);
+    for (let i = 0; i < n; ++i) arr[i] = u32[i * 2]; // low word, little-endian
     memberOids[g] = arr;
   }
   return { numGroups, memberOids };
