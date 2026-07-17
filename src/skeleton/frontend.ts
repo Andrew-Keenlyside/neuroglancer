@@ -1875,6 +1875,19 @@ export abstract class MultiscaleSpatiallyIndexedSkeletonSource extends Multiscal
     return false;
   }
 
+  /**
+   * Fragment shader this source's geometry is best drawn with, or `undefined`
+   * to keep the built-in `emitDefault()`.
+   *
+   * The layer applies it as the *default* rather than as a value, so a user's
+   * explicit `skeletonRendering.shader` still wins and the state still
+   * round-trips — see the consumer in `layer/segmentation/index.ts`. Existing
+   * sources (CATMAID) do not override this and are unaffected.
+   */
+  get defaultFragmentMain(): string | undefined {
+    return undefined;
+  }
+
   getPerspectiveSources(): SliceViewSingleResolutionSource<SpatiallyIndexedSkeletonSource>[] {
     const sources = this.getSources(SPATIAL_SKELETON_SOURCE_OPTIONS);
     const flattened: SliceViewSingleResolutionSource<SpatiallyIndexedSkeletonSource>[] =
@@ -2099,9 +2112,7 @@ export function computeDiagonalModelToGlobalMetersScale(
     for (let otherModelDim = 0; otherModelDim < layerRank; ++otherModelDim) {
       if (otherModelDim === modelDim) continue;
       const v =
-        modelToRenderLayerTransform[
-          layerDim + (layerRank + 1) * otherModelDim
-        ];
+        modelToRenderLayerTransform[layerDim + (layerRank + 1) * otherModelDim];
       if (Math.abs(v) > Math.abs(diagValue) * 1e-3 + 1e-12) {
         return undefined;
       }
@@ -3524,7 +3535,10 @@ export class SpatiallyIndexedSkeletonLayer
     projectionParameters: ProjectionParameters,
     lod: number | undefined,
     levels:
-      | ReadonlyArray<{ size: { x: number; y: number; z: number }; lod: number }>
+      | ReadonlyArray<{
+          size: { x: number; y: number; z: number };
+          lod: number;
+        }>
       | undefined,
     histogram: RenderScaleHistogram,
     frameNumber: number,

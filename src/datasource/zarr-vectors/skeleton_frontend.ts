@@ -373,6 +373,27 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     return this.levels.length > 1;
   }
 
+  /**
+   * Draw streamlines by orientation (|tangent| as RGB) rather than by the
+   * built-in per-segment hash colour -- the standard tractography convention,
+   * and the reason `DEFAULT_STREAMLINE_FRAGMENT_MAIN` exists.
+   *
+   * Only `streamline` supplies one (`KIND_CAPABILITIES`); every other geometry
+   * kind returns undefined and keeps `emitDefault()`. That gating is what makes
+   * `prop_tangent()` safe to reference: the shader is only offered for kinds
+   * with `hasSynthesisedTangent`, which is what puts `tangent` in the attribute
+   * map and emits the `#define`.
+   *
+   * `levels` is finest-first, but geometryKind is a property of the store, not
+   * of a level, so level 0 speaks for all of them.
+   */
+  override get defaultFragmentMain(): string | undefined {
+    const kind = this.levels[0]?.parameters.geometryKind;
+    return kind === undefined
+      ? undefined
+      : KIND_CAPABILITIES[kind].defaultFragmentMain;
+  }
+
   /** Per-level chunk-source parameter blobs in finest-first order. */
   readonly levels: ReadonlyArray<ZarrVectorsSkeletonSpatialLevel>;
   /**

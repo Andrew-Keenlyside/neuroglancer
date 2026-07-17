@@ -118,6 +118,7 @@ import type {
   SpatiallyIndexedSkeletonNode,
   SpatialSkeletonSourceState,
 } from "#src/skeleton/api.js";
+import { resolveSkeletonDefaultShader } from "#src/skeleton/default_shader.js";
 import {
   PerspectiveViewSkeletonLayer,
   SkeletonLayer,
@@ -1814,6 +1815,11 @@ export class SegmentationUserLayer extends Base {
     let spatialSkeletonGridSizes: SpatialSkeletonGridSize[] | undefined;
     let spatialSkeletonLevelCostsBytes: number[] | undefined;
     let spatialSkeletonBudgetBytes: number | undefined;
+    // A datasource-preferred default shader, and whether any subsource would be
+    // One entry per skeleton subsource: the shader it nominates as the layer
+    // default, or `undefined` for no opinion. Resolved after the loop, once
+    // every subsource has voted -- see `resolveSkeletonDefaultShader`.
+    const skeletonShaderCandidates: (string | undefined)[] = [];
     for (const loadedSubsource of subsources) {
       if (this.addStaticAnnotations(loadedSubsource)) continue;
       const { volume, mesh, segmentPropertyMap, segmentationGraph, local } =
@@ -1883,6 +1889,17 @@ export class SegmentationUserLayer extends Base {
               this.manager.chunkManager.chunkQueueManager.capacities.gpuMemory
                 .sizeLimit.value;
           }
+          skeletonShaderCandidates.push(mesh.defaultFragmentMain);
+        } else if (
+          mesh !== undefined &&
+          !(mesh instanceof MeshSource || mesh instanceof MultiscaleMeshSource)
+        ) {
+          // Anything else in the `mesh` slot that is not a mesh is drawn by the
+          // plain `SkeletonLayer` and shares this layer's skeleton shader, so
+          // it gets a vote. Meshes have their own shader and are not consulted.
+          skeletonShaderCandidates.push(
+            (mesh as { defaultFragmentMain?: string }).defaultFragmentMain,
+          );
         }
         loadedSubsource.activate(() => {
           const displayState = {
@@ -2076,6 +2093,9 @@ export class SegmentationUserLayer extends Base {
         updatedSegmentPropertyMaps,
       );
     this.displayState.originalSegmentationGroupState.graph.value = updatedGraph;
+    this.applySkeletonDefaultShader(
+      resolveSkeletonDefaultShader(skeletonShaderCandidates),
+    );
     this.displayState.setSpatialSkeletonGridSizes(
       spatialSkeletonGridSizes ?? [],
       spatialSkeletonLevelCostsBytes,
@@ -2083,6 +2103,38 @@ export class SegmentationUserLayer extends Base {
     );
     this.displayState.hasVolume.value = hasVolume;
     this.updateSpatialSkeletonChunkLoadState();
+  }
+
+  /**
+   * Adopt a datasource's preferred skeleton shader as the layer's *default*.
+   *
+   * Applied as the default rather than as a value, for two reasons that both
+   * hinge on `TrackableValue.toJSON()` emitting only when
+   * `value !== defaultValue`:
+   *
+   *  - Setting only `value` would make the shader text serialise into every
+   *    saved link, and on reload it would come back as an *explicit user
+   *    shader* -- permanently pinning the layer to whatever the default
+   *    happened to be that day, and defeating any later improvement to it.
+   *  - Moving `defaultValue` too keeps `value === defaultValue`, so the state
+   *    stays clean, and "Reset" and a shader-less restore both land on the
+   *    datasource's shader rather than back on `emitDefault()`.
+   *
+   * A user's own shader still wins: the layer spec is restored synchronously,
+   * while this runs later from `activateDataSubsources` once the datasource has
+   * resolved, so `value` has already diverged from `defaultValue` and only the
+   * default moves (verified against a link carrying an explicit shader). The
+   * same guard makes re-activation non-clobbering.
+   *
+   * `sourceShader` is undefined when the layer's skeleton subsources have no
+   * agreed nomination, which means: keep the generic default.
+   */
+  private applySkeletonDefaultShader(sourceShader: string | undefined) {
+    if (sourceShader === undefined) return;
+    const { shader } = this.displayState.skeletonRenderingOptions;
+    const untouched = shader.value === shader.defaultValue;
+    shader.defaultValue = sourceShader;
+    if (untouched) shader.value = sourceShader;
   }
 
   getLegacyDataSourceSpecifications(
