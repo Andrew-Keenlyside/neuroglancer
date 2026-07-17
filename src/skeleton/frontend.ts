@@ -392,6 +392,14 @@ void spatialChunkCull() {
       builder.addFragmentCode(
         `#define prop_${segInfo.name}() ${segInfo.glslDataType}(vSegmentValue)\n`,
       );
+    } else if (skeletonParams.dynamicSegmentAppearance) {
+      // Object-keyed (pass-2) uniform mode: there is no per-vertex `segment`
+      // attribute, but user shaders still reference `prop_segment()` /
+      // `segment` (the object's full uint64 id). Bind them to the uniform-
+      // sourced `vSegmentValue` so the same shader text works in both passes.
+      builder.addFragmentCode(dataTypeShaderDefinition[DataType.UINT64]);
+      builder.addFragmentCode(`#define segment uint64_t(vSegmentValue)\n`);
+      builder.addFragmentCode(`#define prop_segment() uint64_t(vSegmentValue)\n`);
     }
     for (let i = 1; i < numAttributes; ++i) {
       if (
@@ -497,6 +505,16 @@ void spatialChunkCull() {
     // segment attribute (CATMAID) is zero-extended into this at the vertex
     // stage; a 2-component (zarr-vectors) attribute fills both halves.
     builder.addVarying("highp uvec2", "vSegmentValue", "flat");
+    if (this.segmentAttributeIndex === undefined) {
+      // Object-keyed (pass-2) sources have NO per-vertex segment attribute:
+      // one draw call renders one object, and its id is known on the CPU (the
+      // chunk key = selection-model id). Supply it as a per-draw uniform so
+      // `vSegmentValue` — and thus `getSegmentAppearance()` — resolves the
+      // correct segment GPU-side, instead of defaulting to 0 (which "Hide
+      // segment ID 0" would then hide → black lines). Set by
+      // `RenderHelper.setSegmentId` in the pass-2 draw loops.
+      builder.addUniform("highp uvec2", "uSegmentId");
+    }
 
     builder.addFragmentCode(`
 uint64_t getSegmentAppearanceId(highp uvec2 segmentValue) {
@@ -735,11 +753,11 @@ highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexInde
 vSkipCull = (aVertexIndex.x >= uGhostVertexStartIndex || aVertexIndex.y >= uGhostVertexStartIndex) ? 1.0 : 0.0;
 `;
           }
-          if (
-            skeletonParams.dynamicSegmentAppearance &&
-            this.segmentAttributeIndex !== undefined
-          ) {
-            vertexMain += this.segmentValueAssignment("aVertexIndex.x");
+          if (skeletonParams.dynamicSegmentAppearance) {
+            vertexMain +=
+              this.segmentAttributeIndex !== undefined
+                ? this.segmentValueAssignment("aVertexIndex.x")
+                : "vSegmentValue = uSegmentId;\n";
           }
 
           const segmentColorExpression = this.getSegmentColorExpression();
@@ -754,6 +772,12 @@ vSkipCull = (aVertexIndex.x >= uGhostVertexStartIndex || aVertexIndex.y >= uGhos
             builder.addFragmentCode(`
 vec4 segmentColor() {
   return getSegmentAppearance(vSegmentValue);
+}
+void emitRGBA(vec4 color) {
+  vec4 baseColor = segmentColor();
+  highp float alpha = color.a * baseColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
+  if (alpha <= 0.0) discard;
+  ${this.emitColorStatement("color.rgb", "alpha")}
 }
 void emitRGB(vec3 color) {
   vec4 baseColor = segmentColor();
@@ -776,6 +800,9 @@ void emitDefault() {
 vec4 segmentColor() {
   return ${segmentColorExpression};
 }
+void emitRGBA(vec4 color) {
+  emit(vec4(color.rgb * uColor.a, color.a * uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), vPickID);
+}
 void emitRGB(vec3 color) {
   emit(vec4(color * uColor.a, uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), vPickID);
 }
@@ -789,6 +816,10 @@ void emitDefault() {
             builder.addFragmentCode(`
 vec4 segmentColor() {
   return ${segmentColorExpression};
+}
+void emitRGBA(vec4 color) {
+  highp float alpha = color.a * ${segmentAlphaExpression} * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
+  ${this.emitColorStatement("color.rgb", "alpha")}
 }
 void emitRGB(vec3 color) {
   highp float alpha = ${segmentAlphaExpression} * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
@@ -861,11 +892,11 @@ vSkipCull = (vertexIndex >= uGhostVertexStartIndex) ? 1.0 : 0.0;
           if (this.selectedNodeAttributeIndex !== undefined) {
             vertexMain += `vSelectedNode = readAttribute${this.selectedNodeAttributeIndex}(vertexIndex);\n`;
           }
-          if (
-            skeletonParams.dynamicSegmentAppearance &&
-            this.segmentAttributeIndex !== undefined
-          ) {
-            vertexMain += this.segmentValueAssignment("vertexIndex");
+          if (skeletonParams.dynamicSegmentAppearance) {
+            vertexMain +=
+              this.segmentAttributeIndex !== undefined
+                ? this.segmentValueAssignment("vertexIndex")
+                : "vSegmentValue = uSegmentId;\n";
           }
           vertexMain += `
 emitCircle(
@@ -875,13 +906,13 @@ emitCircle(
 );
 `;
           const segmentColorExpression = this.getSegmentColorExpression();
-          if (
-            skeletonParams.dynamicSegmentAppearance &&
-            this.segmentAttributeIndex !== undefined
-          ) {
-            // Dynamic path (spatial skeletons): per-segment color, visibility,
-            // saturation and hover highlight all resolved in the shader via
+          if (skeletonParams.dynamicSegmentAppearance) {
+            // Dynamic path: per-segment color, visibility, saturation and
+            // hover highlight all resolved in the shader via
             // getSegmentAppearance(). uColor is unused in this path.
+            // `vSegmentValue` is set either from a per-vertex segment
+            // attribute (spatial/pass-1) or from the `uSegmentId` uniform
+            // (object-keyed/pass-2) — see the vertexMain assignment above.
             const segmentExpression = `vSegmentValue`;
             const selectedNodeExpression =
               this.selectedNodeAttributeIndex === undefined
@@ -1031,6 +1062,24 @@ void emitDefault() {
 
   setColor(gl: GL, shader: ShaderProgram, color: vec4) {
     gl.uniform4fv(shader.uniform("uColor"), color);
+  }
+
+  /**
+   * Upload the object's full uint64 id (as a `uvec2` [lo, hi]) into
+   * `uSegmentId`, used by the dynamic segment-appearance path when there is
+   * no per-vertex `segment` attribute (object-keyed / pass-2 sources). A
+   * no-op when the shader has no `uSegmentId` uniform (attribute mode or the
+   * dynamic path disabled) — `shader.uniform` returns `null` and the GL call
+   * is skipped.
+   */
+  setSegmentId(gl: GL, shader: ShaderProgram, objectId: bigint) {
+    const location = shader.uniform("uSegmentId");
+    if (location === null) return;
+    gl.uniform2ui(
+      location,
+      Number(objectId & 0xffffffffn),
+      Number((objectId >> 32n) & 0xffffffffn),
+    );
   }
 
   setPickID(gl: GL, shader: ShaderProgram, pickID: number) {
@@ -1320,13 +1369,19 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
   private sharedObject: SegmentationLayerSharedObject;
   vertexAttributes: VertexAttributeRenderInfo[];
   segmentColorAttributeIndex: number | undefined = undefined;
-  // Non-spatial skeletons iterate segments individually and pass color/alpha via
-  // uniforms (getObjectColor), so the dynamic per-vertex segment appearance path
-  // is not needed. Stated colors and default color are likewise handled upstream
-  // before the draw call, not looked up in the shader.
+  // Object-keyed (pass-2) skeletons draw one object per call. We still use the
+  // dynamic per-segment appearance path so color/visibility resolve in-shader
+  // via `getSegmentAppearance()` (running the segment-color user shader
+  // GPU-side, exactly like meshes and spatial skeletons) — the segment id is
+  // supplied per draw via the `uSegmentId` uniform (there is no per-vertex
+  // `segment` attribute here). With an empty user shader this reproduces the
+  // old per-object hash coloring, but now the segment-color shader can drive
+  // skeleton color/alpha too, and lines no longer depend on a CPU-computed
+  // `uColor` (which the offscreen `getShaderSegmentColor` readback couldn't
+  // reliably supply mid-draw → black lines).
   readonly skeletonShaderParameters =
     new WatchableValue<SkeletonShaderParameters>({
-      dynamicSegmentAppearance: false,
+      dynamicSegmentAppearance: true,
       hasSegmentStatedColors: false,
       hasSegmentDefaultColor: false,
       hoverHighlight: false,
@@ -1453,6 +1508,30 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
       nodeShaderParameters.skeletonBuilderState.parseResult,
     );
 
+    // Object-keyed (pass-2) skeletons render through the dynamic segment-
+    // appearance path (`dynamicSegmentAppearance: true`): color, visibility
+    // and the segment-color user shader are resolved in-shader by
+    // `getSegmentAppearance(vSegmentValue)`. Bind the shared visible/excluded/
+    // selected hash tables + segment-color shader once here; `vSegmentValue`
+    // is supplied per object below via the `uSegmentId` uniform (there is no
+    // per-vertex `segment` attribute). `uColor` is unused, but set it opaque
+    // to match the spatial path in case any shared code samples it.
+    const skeletonParams = this.skeletonShaderParameters.value;
+    edgeShader.bind();
+    renderHelper.setColor(gl, edgeShader, kOneVec4);
+    renderHelper.maybeEnableDynamicSegmentAppearance(
+      gl,
+      edgeShader,
+      skeletonParams,
+    );
+    nodeShader.bind();
+    renderHelper.setColor(gl, nodeShader, kOneVec4);
+    renderHelper.maybeEnableDynamicSegmentAppearance(
+      gl,
+      nodeShader,
+      skeletonParams,
+    );
+
     const skeletons = source.chunks;
 
     forEachVisibleSegmentToDraw(
@@ -1460,7 +1539,7 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
       layer,
       renderContext.emitColor,
       renderContext.emitPickID ? renderContext.pickIDs : undefined,
-      (objectId, color, pickIndex) => {
+      (objectId, _color, pickIndex) => {
         const key = getObjectKey(objectId);
         const skeleton = skeletons.get(key);
         if (
@@ -1469,12 +1548,14 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
         ) {
           return;
         }
-        if (color !== undefined) {
-          edgeShader.bind();
-          renderHelper.setColor(gl, edgeShader, color);
-          nodeShader.bind();
-          renderHelper.setColor(gl, nodeShader, color);
-        }
+        // The segment id is known here — `objectId` from the selection model
+        // (the chunk key). Feed it to the shader as `uSegmentId` so
+        // `getSegmentAppearance()` resolves this object's color/visibility;
+        // no per-vertex `fragment_attributes/segment_id` read is involved.
+        edgeShader.bind();
+        renderHelper.setSegmentId(gl, edgeShader, objectId);
+        nodeShader.bind();
+        renderHelper.setSegmentId(gl, nodeShader, objectId);
         if (pickIndex !== undefined) {
           edgeShader.bind();
           renderHelper.setPickID(gl, edgeShader, pickIndex);
@@ -1490,6 +1571,16 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
           renderOptions.mode.value,
         );
       },
+    );
+    renderHelper.maybeDisableDynamicSegmentAppearance(
+      gl,
+      edgeShader,
+      skeletonParams,
+    );
+    renderHelper.maybeDisableDynamicSegmentAppearance(
+      gl,
+      nodeShader,
+      skeletonParams,
     );
     renderHelper.endLayer(gl, edgeShader, nodeShader);
   }
@@ -4755,9 +4846,12 @@ export class MultiscaleSkeletonLayer
   backend: ChunkRenderLayerFrontend;
   vertexAttributes: VertexAttributeRenderInfo[];
   segmentColorAttributeIndex: number | undefined = undefined;
+  // Object-keyed (pass-2) multiscale layer — same rationale as `SkeletonLayer`:
+  // dynamic in-shader appearance with the segment id supplied per draw via the
+  // `uSegmentId` uniform. See that class's `skeletonShaderParameters` comment.
   readonly skeletonShaderParameters =
     new WatchableValue<SkeletonShaderParameters>({
-      dynamicSegmentAppearance: false,
+      dynamicSegmentAppearance: true,
       hasSegmentStatedColors: false,
       hasSegmentDefaultColor: false,
       hoverHighlight: false,
@@ -5025,6 +5119,26 @@ export class MultiscaleSkeletonLayer
       nodeShaderParameters.skeletonBuilderState.parseResult,
     );
 
+    // Object-keyed (pass-2) multiscale skeletons render through the dynamic
+    // segment-appearance path — see the single-level `SkeletonLayer.draw`.
+    // Bind the shared hash tables + segment-color user shader once; the
+    // segment id arrives per object below via `uSegmentId`.
+    const skeletonParams = this.skeletonShaderParameters.value;
+    edgeShader.bind();
+    renderHelper.setColor(gl, edgeShader, kOneVec4);
+    renderHelper.maybeEnableDynamicSegmentAppearance(
+      gl,
+      edgeShader,
+      skeletonParams,
+    );
+    nodeShader.bind();
+    renderHelper.setColor(gl, nodeShader, kOneVec4);
+    renderHelper.maybeEnableDynamicSegmentAppearance(
+      gl,
+      nodeShader,
+      skeletonParams,
+    );
+
     const manifests = source.chunks;
 
     const histogram = displayState.spatialSkeletonGridRenderScaleHistogram3d;
@@ -5039,7 +5153,7 @@ export class MultiscaleSkeletonLayer
       layer,
       renderContext.emitColor,
       renderContext.emitPickID ? renderContext.pickIDs : undefined,
-      (objectId, color, pickIndex) => {
+      (objectId, _color, pickIndex) => {
         const key = getObjectKey(objectId);
         const manifestChunk = manifests.get(key);
         if (manifestChunk === undefined) return;
@@ -5048,12 +5162,12 @@ export class MultiscaleSkeletonLayer
           key,
         );
         if (fragmentChunk === undefined) return;
-        if (color !== undefined) {
-          edgeShader.bind();
-          renderHelper.setColor(gl, edgeShader, color);
-          nodeShader.bind();
-          renderHelper.setColor(gl, nodeShader, color);
-        }
+        // Segment id known from the selection model (`objectId` = chunk key);
+        // feed it to `getSegmentAppearance()` via `uSegmentId`.
+        edgeShader.bind();
+        renderHelper.setSegmentId(gl, edgeShader, objectId);
+        nodeShader.bind();
+        renderHelper.setSegmentId(gl, nodeShader, objectId);
         if (pickIndex !== undefined) {
           edgeShader.bind();
           renderHelper.setPickID(gl, edgeShader, pickIndex);
@@ -5069,6 +5183,16 @@ export class MultiscaleSkeletonLayer
           renderOptions.mode.value,
         );
       },
+    );
+    renderHelper.maybeDisableDynamicSegmentAppearance(
+      gl,
+      edgeShader,
+      skeletonParams,
+    );
+    renderHelper.maybeDisableDynamicSegmentAppearance(
+      gl,
+      nodeShader,
+      skeletonParams,
     );
     renderHelper.endLayer(gl, edgeShader, nodeShader);
   }

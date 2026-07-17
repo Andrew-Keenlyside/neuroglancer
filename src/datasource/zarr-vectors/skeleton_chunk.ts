@@ -393,6 +393,67 @@ export function computeTangentsFromEdges(
 }
 
 /**
+ * Re-orient per-vertex tangent SIGNS to be consistent across a graph, in
+ * place.  Same flood-fill as {@link computeTangentsFromEdges}'s internal
+ * step, but standalone so it can run over a graph the per-chunk decode
+ * never sees whole: the **merged** object graph assembled by
+ * `downloadSegmentSkeleton`, whose cross-chunk bridge edges join vertices
+ * whose tangents were sign-oriented in *separate* per-chunk flood-fills.
+ * Those independent orientations are arbitrary relative to each other, so a
+ * bridge can join `+t` to `-t`; a line segment interpolates its endpoints,
+ * crossing zero at the midpoint → a black band under `abs(prop_tangent())`.
+ * Re-flooding the merged graph aligns every edge (`dot >= 0`) so no edge —
+ * bridge or intra-chunk — has opposing endpoint tangents. Sign is arbitrary
+ * (the shader uses `abs()`); only per-edge consistency matters.
+ *
+ * `tangents` is flat `(numVertices, 3)`; `edges` flat `(numEdges, 2)`.
+ */
+export function orientTangentSignsAcrossEdges(
+  tangents: Float32Array,
+  edges: Uint32Array,
+  numVertices: number,
+): void {
+  if (edges.length === 0 || numVertices === 0) return;
+  const adj: number[][] = new Array(numVertices);
+  for (let v = 0; v < numVertices; ++v) adj[v] = [];
+  for (let e = 0; e < edges.length; e += 2) {
+    const a = edges[e];
+    const b = edges[e + 1];
+    if (a === b) continue;
+    if (a < numVertices) adj[a].push(b);
+    if (b < numVertices) adj[b].push(a);
+  }
+  const oriented = new Uint8Array(numVertices);
+  const stack: number[] = [];
+  for (let s = 0; s < numVertices; ++s) {
+    if (oriented[s] || adj[s].length === 0) continue;
+    oriented[s] = 1;
+    stack.push(s);
+    while (stack.length > 0) {
+      const u = stack.pop()!;
+      const ux = tangents[u * 3];
+      const uy = tangents[u * 3 + 1];
+      const uz = tangents[u * 3 + 2];
+      for (const w of adj[u]) {
+        if (oriented[w]) continue;
+        oriented[w] = 1;
+        const dot =
+          tangents[w * 3] * ux +
+          tangents[w * 3 + 1] * uy +
+          tangents[w * 3 + 2] * uz;
+        if (dot < 0) {
+          // `0 - x` (not `-x`) so a zero component negates to +0, not -0.
+          tangents[w * 3] = 0 - tangents[w * 3];
+          tangents[w * 3 + 1] = 0 - tangents[w * 3 + 1];
+          tangents[w * 3 + 2] = 0 - tangents[w * 3 + 2];
+        }
+        stack.push(w);
+      }
+    }
+  }
+}
+
+/**
  * Build a `SkeletonChunk` from already-decoded inputs.  Callers
  * (typically the chunk-source backend) are responsible for fetching the
  * raw bytes and running the dtype-aware reinterpretations.  This

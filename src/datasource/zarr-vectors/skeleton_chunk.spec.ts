@@ -14,6 +14,7 @@ import {
   computeTangents,
   computeTangentsFromEdges,
   mergeEdges,
+  orientTangentSignsAcrossEdges,
   recomputeTangentsForBridges,
   synthesizeSequentialEdges,
 } from "#src/datasource/zarr-vectors/skeleton_chunk.js";
@@ -369,6 +370,43 @@ describe("computeTangentsFromEdges", () => {
     expect(() =>
       computeTangentsFromEdges(positions, 3, new Uint32Array([0, 1, 0]), 2),
     ).toThrow(/multiple of 2/);
+  });
+});
+
+describe("orientTangentSignsAcrossEdges", () => {
+  it("flips a bridge endpoint so the bridge has no opposing tangents", () => {
+    // Two 2-vertex chains, each internally consistent, but with OPPOSITE
+    // sign — as two independently-oriented chunks would produce. A bridge
+    // edge (1—2) joins them. Pre-orientation the bridge dots to -1 (black
+    // midpoint); after orientation every edge (including the bridge) must
+    // dot >= 0.
+    //   verts 0,1 = chunk A (tangent +x);  verts 2,3 = chunk B (tangent -x)
+    const tangents = new Float32Array([
+      1, 0, 0, 1, 0, 0, -1, 0, 0, -1, 0, 0,
+    ]);
+    // intra-chunk edges (0,1) and (2,3) plus the cross-chunk bridge (1,2).
+    const edges = new Uint32Array([0, 1, 2, 3, 1, 2]);
+    orientTangentSignsAcrossEdges(tangents, edges, 4);
+    for (let e = 0; e < edges.length; e += 2) {
+      const a = edges[e];
+      const b = edges[e + 1];
+      const dot =
+        tangents[a * 3] * tangents[b * 3] +
+        tangents[a * 3 + 1] * tangents[b * 3 + 1] +
+        tangents[a * 3 + 2] * tangents[b * 3 + 2];
+      expect(dot).toBeGreaterThanOrEqual(0);
+    }
+    // Magnitudes preserved (sign-only change).
+    for (let v = 0; v < 4; ++v) {
+      expect(Math.abs(tangents[v * 3])).toBeCloseTo(1, 6);
+    }
+  });
+
+  it("is a no-op with no edges", () => {
+    const tangents = new Float32Array([1, 0, 0, -1, 0, 0]);
+    const before = Array.from(tangents);
+    orientTangentSignsAcrossEdges(tangents, new Uint32Array([]), 2);
+    expect(Array.from(tangents)).toEqual(before);
   });
 });
 

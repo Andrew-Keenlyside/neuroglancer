@@ -17,7 +17,10 @@
  */
 
 import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/cross_chunk_links.js";
-import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
+import {
+  hasSynthesisedTangent,
+  KIND_CAPABILITIES,
+} from "#src/datasource/zarr-vectors/geometry_kind.js";
 import { resolveFragmentRef } from "#src/datasource/zarr-vectors/object_manifest.js";
 import {
   readObjectManifest,
@@ -28,6 +31,10 @@ import type {
   LinksConvention,
   SkeletonChunk,
   SkeletonGeometryKind,
+} from "#src/datasource/zarr-vectors/skeleton_chunk.js";
+import {
+  computeTangentsFromEdges,
+  orientTangentSignsAcrossEdges,
 } from "#src/datasource/zarr-vectors/skeleton_chunk.js";
 import {
   downloadSkeletonChunk,
@@ -314,9 +321,24 @@ export function deriveImplicitSequentialCrossChunkEdges(
   return new Uint32Array(out);
 }
 
+/**
+ * Per-chunk map from a chunk-local vertex index to that vertex's position
+ * in the merged-output vertex array (the value already includes the owning
+ * block's `vertexOffset`).  Accumulated across **every** manifest block of a
+ * chunk — an object routinely owns many fragments in one chunk (mouselight:
+ * up to ~150), each arriving as its own `single`-mode manifest block, so a
+ * per-chunk last-write-wins `vertexRemap`/`vertexOffset` (the old
+ * {@link OwnedChunkInfo} keying) would only resolve the *last* block's
+ * vertices and silently drop every cross-chunk edge whose endpoint lives in
+ * an earlier block. Cross-chunk endpoints are chunk-local (as written by
+ * `write_skeleton_cross_chunk_links`), so this maps them straight to the
+ * merged index space.
+ */
+export type ChunkLocalVertexIndexMap = Map<string, Map<number, number>>;
+
 export function collectOwnedCrossChunkEdges(
   table: CrossChunkLinksTable,
-  ownedChunks: Map<string, OwnedChunkInfo>,
+  chunkVertexMaps: ChunkLocalVertexIndexMap,
 ): Uint32Array {
   // Only line-arity (linkWidth=2) records describe cross-chunk edges.
   // Triangle / metanode records aren't relevant to streamline rendering.
@@ -324,20 +346,17 @@ export function collectOwnedCrossChunkEdges(
   const out: number[] = [];
   for (const record of table.records) {
     const [a, b] = record.endpoints;
-    const aKey = a.chunkCoords.join(".");
-    const bKey = b.chunkCoords.join(".");
-    const aInfo = ownedChunks.get(aKey);
-    const bInfo = ownedChunks.get(bKey);
-    if (aInfo === undefined || bInfo === undefined) continue;
-    if (a.vertexIndex < 0 || a.vertexIndex >= aInfo.vertexRemap.length)
-      continue;
-    if (b.vertexIndex < 0 || b.vertexIndex >= bInfo.vertexRemap.length)
-      continue;
-    const aRemap = aInfo.vertexRemap[a.vertexIndex];
-    const bRemap = bInfo.vertexRemap[b.vertexIndex];
-    if (aRemap < 0 || bRemap < 0) continue;
-    out.push(aRemap + aInfo.vertexOffset);
-    out.push(bRemap + bInfo.vertexOffset);
+    const aMap = chunkVertexMaps.get(a.chunkCoords.join("."));
+    const bMap = chunkVertexMaps.get(b.chunkCoords.join("."));
+    if (aMap === undefined || bMap === undefined) continue;
+    const aGlobal = aMap.get(a.vertexIndex);
+    const bGlobal = bMap.get(b.vertexIndex);
+    // A missing entry means the endpoint's vertex isn't owned by this object
+    // (belongs to another object's fragment in the same chunk) — skip it, no
+    // dangling edge.
+    if (aGlobal === undefined || bGlobal === undefined) continue;
+    out.push(aGlobal);
+    out.push(bGlobal);
   }
   return new Uint32Array(out);
 }
@@ -394,11 +413,13 @@ export async function downloadSegmentSkeleton(
     { length: numAttrsExpected },
     () => [] as AttributeTypedArray[],
   );
-  // Per-source-chunk remap/offset, indexed by chunk key.  Populated as
-  // we walk the manifest; consumed below by the blob-based cross-chunk
-  // path (graphs / skeletons with explicit links).  Keyed by chunk so
-  // an arbitrary cross-chunk record can find the relevant remap.
-  const ownedChunks = new Map<string, OwnedChunkInfo>();
+  // Per-chunk chunk-local-vertex → merged-output-index map. This is what the
+  // blob-based cross-chunk edge resolver uses to translate a
+  // cross_chunk_links endpoint (chunk, chunk-local vertex) into the merged
+  // vertex array. Built once per chunk (all the object's fragments in a chunk
+  // are filtered together), so it covers every owned vertex. See
+  // `collectOwnedCrossChunkEdges` / `ChunkLocalVertexIndexMap`.
+  const chunkVertexMaps: ChunkLocalVertexIndexMap = new Map();
   // Distinct chunk-coords this object's manifest touches, in first-seen
   // order — fed to `queryCrossChunkLinksForChunks` once the walk below
   // completes, so the caller can scope its cross_chunk_links query to
@@ -423,15 +444,80 @@ export async function downloadSegmentSkeleton(
   }
   const orderedBlocks: OrderedBlock[] = [];
 
+  // Cache whole-chunk downloads by chunk key.  An object's manifest can list
+  // MANY fragment blocks in the SAME chunk — most extreme at coarsened pyramid
+  // levels, where all of an object's fragments can collapse into a single
+  // chunk (e.g. hundreds of fragments in one level-3 chunk).  Without this,
+  // each block re-downloads — and for a native-sharded array, re-range-reads —
+  // that chunk's ENTIRE cell, turning one object load into O(fragments)
+  // whole-cell reads of the identical bytes (observed as thousands of
+  // duplicate range requests / gigabytes transferred).  Reading each distinct
+  // chunk once and filtering per block makes it O(distinct chunks).  Only the
+  // whole-chunk path is cached; the `implicit_sequential` scoped path
+  // byte-range-reads per fragment and isn't keyed by chunk alone.
+  const wholeChunkCache = new Map<string, SkeletonChunk | undefined>();
+  const readWholeChunkCached = async (
+    key: string,
+    options: Parameters<typeof downloadSkeletonChunk>[0],
+  ): Promise<SkeletonChunk | undefined> => {
+    if (wholeChunkCache.has(key)) return wholeChunkCache.get(key);
+    const s = await downloadSkeletonChunk(options, signal);
+    wholeChunkCache.set(key, s);
+    return s;
+  };
+
+  // Group the manifest's blocks by chunk so every fragment an object owns
+  // in a chunk is filtered TOGETHER, in a single `filterChunkByFragments`
+  // call. This is essential for `implicit_sequential_with_branches`
+  // skeletons: within-chunk connectivity between fragments lives entirely
+  // in inter-fragment branch links (`links/0/<chunk>`), and
+  // `filterChunkByFragments` keeps an edge only when BOTH endpoints are
+  // owned. The on-disk manifest stores one `single`-mode block per fragment
+  // (mouselight: up to ~150 per chunk), so filtering one fragment at a time
+  // would drop every branch link (each has an endpoint in another fragment
+  // not in that block's `seen` set), shattering each neuron into
+  // per-fragment pieces that only cross-chunk links could partly rejoin —
+  // leaving empty gaps. Grouping also gives `chunkVertexMaps` one whole-chunk
+  // entry per chunk (no last-write-wins).
+  interface ChunkGroup {
+    readonly chunkCoords: number[];
+    readonly fragmentIds: number[];
+  }
+  const chunkGroups = new Map<string, ChunkGroup>();
+  const chunkOrder: string[] = [];
+  for (const block of manifest) {
+    const key = block.chunkCoords.join(".");
+    const ids = resolveFragmentRef(block.fragmentRef);
+    let group = chunkGroups.get(key);
+    if (group === undefined) {
+      group = { chunkCoords: block.chunkCoords, fragmentIds: [] };
+      chunkGroups.set(key, group);
+      chunkOrder.push(key);
+    }
+    for (const id of ids) group.fragmentIds.push(id);
+  }
+
+  // Per-chunk decode kept so the implicit_sequential fallback's per-fragment
+  // ordering pass (below) can map each fragment's endpoints through its
+  // chunk's shared remap/offset without re-downloading.
+  const perChunkDecoded = new Map<
+    string,
+    {
+      fragmentIndex: SkeletonChunk["fragmentIndex"];
+      vertexRemap: Int32Array;
+      vertexOffset: number;
+    }
+  >();
+
   let runningVertexOffset = 0;
 
-  for (const block of manifest) {
-    const chunkKey = block.chunkCoords.join(".");
-    // Resolve owned fragments first — the scoped reader needs them to
-    // range-read only this object's vertices instead of the whole chunk.
-    const fragmentIds = resolveFragmentRef(block.fragmentRef);
+  for (const chunkKey of chunkOrder) {
+    const group = chunkGroups.get(chunkKey)!;
+    // Dedup the owned fragment ids (a chunk revisited by the manifest, or an
+    // overlapping range/explicit ref, could list one twice).
+    const fragmentIds = Uint32Array.from(new Set(group.fragmentIds));
     const wholeChunkOptions = {
-      chunkCoords: block.chunkCoords,
+      chunkCoords: group.chunkCoords,
       rank,
       linkDtype,
       attributeNames,
@@ -458,49 +544,35 @@ export async function downloadSegmentSkeleton(
       } catch {
         // A range read that came back the wrong length (a store that
         // silently ignored the request) throws — fall back to the whole-
-        // chunk read for this block so rendering still succeeds.
-        skel = await downloadSkeletonChunk(wholeChunkOptions, signal);
+        // chunk read for this chunk so rendering still succeeds.
+        skel = await readWholeChunkCached(chunkKey, wholeChunkOptions);
       }
     } else {
-      skel = await downloadSkeletonChunk(wholeChunkOptions, signal);
+      skel = await readWholeChunkCached(chunkKey, wholeChunkOptions);
     }
     if (skel === undefined) continue;
 
+    // Filter ALL the object's owned fragments in this chunk at once — so
+    // `seen` covers them and inter-fragment branch links are retained.
     const filtered = filterChunkByFragments(skel, fragmentIds);
     if (filtered.positions.length === 0) continue;
 
-    // For the implicit_sequential cross-chunk reconstruction, capture
-    // the first and last chunk-local vertex of this block's single
-    // fragment.  Blocks with 0 or >1 fragments don't participate
-    // (cross-chunk endpoint identity becomes ambiguous).
-    let firstFragmentLocalVert = -1;
-    let lastFragmentLocalVert = -1;
-    if (fragmentIds.length === 1) {
-      const fragVerts = skel.fragmentIndex.indices(fragmentIds[0]);
-      if (fragVerts.length > 0) {
-        firstFragmentLocalVert = fragVerts[0];
-        lastFragmentLocalVert = fragVerts[fragVerts.length - 1];
-      }
+    // Chunk-local vertex → merged-output index, for the blob-based
+    // cross-chunk resolver. `filtered.vertexRemap` spans the whole chunk's
+    // vertex count, so `vi` is the true chunk-local index that
+    // cross_chunk_links endpoints reference.
+    const chunkVertexMap = new Map<number, number>();
+    chunkVertexMaps.set(chunkKey, chunkVertexMap);
+    for (let vi = 0; vi < filtered.vertexRemap.length; ++vi) {
+      const local = filtered.vertexRemap[vi];
+      if (local >= 0) chunkVertexMap.set(vi, local + runningVertexOffset);
     }
-
-    const info: OwnedChunkInfo = {
+    seenChunkKeys.add(chunkKey);
+    ownedChunkCoordsList.push(group.chunkCoords);
+    perChunkDecoded.set(chunkKey, {
+      fragmentIndex: skel.fragmentIndex,
       vertexRemap: filtered.vertexRemap,
       vertexOffset: runningVertexOffset,
-    };
-    // Last-write-wins if a chunk shows up multiple times in the
-    // manifest.  The blob-based cross-chunk path can't disambiguate
-    // either way; the manifest-driven path uses `orderedBlocks` (which
-    // does preserve all visits).
-    ownedChunks.set(chunkKey, info);
-    if (!seenChunkKeys.has(chunkKey)) {
-      seenChunkKeys.add(chunkKey);
-      ownedChunkCoordsList.push(block.chunkCoords);
-    }
-    orderedBlocks.push({
-      ...info,
-      chunkKey,
-      firstFragmentLocalVert,
-      lastFragmentLocalVert,
     });
 
     perChunkPositions.push(filtered.positions);
@@ -529,10 +601,39 @@ export async function downloadSegmentSkeleton(
     runningVertexOffset += filtered.positions.length / rank;
   }
 
+  // Build `orderedBlocks` per-fragment in manifest order — drives the
+  // `implicit_sequential` cross-chunk *fallback*
+  // (`deriveImplicitSequentialCrossChunkEdges`), which bridges consecutive
+  // fragments. All fragments in a chunk share that chunk's remap/offset, so
+  // a fragment's first/last chunk-local vertex maps to the merged space the
+  // same way regardless of which fragment it is.
+  for (const block of manifest) {
+    const chunkKey = block.chunkCoords.join(".");
+    const decoded = perChunkDecoded.get(chunkKey);
+    if (decoded === undefined) continue;
+    const ids = resolveFragmentRef(block.fragmentRef);
+    let firstFragmentLocalVert = -1;
+    let lastFragmentLocalVert = -1;
+    if (ids.length === 1) {
+      const fragVerts = decoded.fragmentIndex.indices(ids[0]);
+      if (fragVerts.length > 0) {
+        firstFragmentLocalVert = fragVerts[0];
+        lastFragmentLocalVert = fragVerts[fragVerts.length - 1];
+      }
+    }
+    orderedBlocks.push({
+      vertexRemap: decoded.vertexRemap,
+      vertexOffset: decoded.vertexOffset,
+      chunkKey,
+      firstFragmentLocalVert,
+      lastFragmentLocalVert,
+    });
+  }
+
   // Inter-fragment bridge reconstruction.  Two strategies:
   //
   //  - Preferred, whenever the on-disk cross_chunk_links blob exists and
-  //    yields edges: the blob-based filter on `ownedChunks`
+  //    yields edges: the blob-based resolver over `chunkVertexMaps`
   //    (`collectOwnedCrossChunkEdges`), using real chunk-local vertex
   //    indices for each endpoint. This is what `explicit` /
   //    `implicit_sequential_with_branches` (graphs, skeletons) always
@@ -565,13 +666,30 @@ export async function downloadSegmentSkeleton(
     queryCrossChunkLinksForChunks !== undefined &&
     ownedChunkCoordsList.length > 0
   ) {
-    resolvedCrossChunkLinks = await queryCrossChunkLinksForChunks(
-      ownedChunkCoordsList,
-      signal,
-    );
+    // Cross-chunk links are OPTIONAL connectivity — a failure to read them
+    // (missing table, layout quirk, a store that errors on a 404 probe)
+    // must NOT abort the whole skeleton: without them the object still
+    // renders as its per-chunk fragments (just not bridged across chunk
+    // boundaries), which is far better than rendering nothing.
+    try {
+      resolvedCrossChunkLinks = await queryCrossChunkLinksForChunks(
+        ownedChunkCoordsList,
+        signal,
+      );
+    } catch (e) {
+      console.warn(
+        "zarr-vectors: cross-chunk link query failed; rendering fragments " +
+          "without cross-chunk bridges",
+        e,
+      );
+      resolvedCrossChunkLinks = undefined;
+    }
   }
-  if (resolvedCrossChunkLinks !== undefined && ownedChunks.size > 0) {
-    const edges = collectOwnedCrossChunkEdges(resolvedCrossChunkLinks, ownedChunks);
+  if (resolvedCrossChunkLinks !== undefined && chunkVertexMaps.size > 0) {
+    const edges = collectOwnedCrossChunkEdges(
+      resolvedCrossChunkLinks,
+      chunkVertexMaps,
+    );
     if (edges.length > 0) crossChunkEdges = edges;
   }
   if (crossChunkEdges === undefined && linksConvention === "implicit_sequential") {
@@ -633,6 +751,45 @@ export async function downloadSegmentSkeleton(
       }
     }
     vertexAttributes.push(merged);
+  }
+
+  // Fix up the synthesised tangent (slot 0) across the fully merged graph so
+  // cross-chunk bridges don't render as black bands under
+  // `abs(prop_tangent())`. Two failure modes, both from per-chunk tangent
+  // synthesis that never saw the bridge edges:
+  //   1. Opposing SIGNS — each chunk sign-oriented independently, so a bridge
+  //      can join `+t` to `-t`; the segment interpolates through zero.
+  //   2. ZERO magnitude — a fragment that is a single vertex (or otherwise
+  //      has no intra-chunk neighbour) is degree-0 in its chunk and gets a
+  //      zero tangent; once bridged it interpolates from a real tangent to
+  //      zero → a black half-segment.
+  // For edge-adjacency kinds (skeleton/graph) we RECOMPUTE tangents from the
+  // merged graph with the same `computeTangentsFromEdges` the per-chunk decode
+  // used — now every boundary/singleton vertex has its bridge neighbour, so it
+  // gets a real direction, and the built-in flood-fill orients signs across
+  // the whole object (fixing both modes at once). Walk-order kinds
+  // (streamline/polyline) keep their per-chunk walk-order tangents and only
+  // need the cheaper sign re-orientation across bridges.
+  if (
+    hasSynthesisedTangent(geometryKind) &&
+    vertexAttributes.length > 0 &&
+    vertexAttributes[0] instanceof Float32Array &&
+    vertexAttributes[0].length === runningVertexOffset * 3
+  ) {
+    if (KIND_CAPABILITIES[geometryKind].hasEdgeAdjacencyTangent) {
+      vertexAttributes[0] = computeTangentsFromEdges(
+        vertexPositions,
+        rank,
+        indices,
+        runningVertexOffset,
+      );
+    } else {
+      orientTangentSignsAcrossEdges(
+        vertexAttributes[0],
+        indices,
+        runningVertexOffset,
+      );
+    }
   }
 
   return { vertexPositions, indices, vertexAttributes };

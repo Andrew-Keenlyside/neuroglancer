@@ -668,6 +668,59 @@ function valueEqualsFillValue(v: number, fillValue: number): boolean {
 }
 
 /**
+ * Read `object_attributes/segment_id` (the original, e.g. mouselight/flywire
+ * id for each dense object index row) as a `uint64` array, or `undefined`
+ * when absent/unreadable.
+ *
+ * This is the id space the rest of neuroglancer uses for these skeletons:
+ * the object-keyed skeleton source resolves a selected id to a dense object
+ * index by binary-searching this same array (`resolveObjectIndex` in
+ * `skeleton_backend.ts`), and the spatially-indexed source tags each fragment
+ * with its `fragment_attributes/segment_id` (the same original id) for
+ * picking/visibility/colour.  Segment-property maps must therefore be keyed
+ * by these ids, NOT by the dense row index — otherwise the segments-list
+ * shows `0..O-1` while clicking a skeleton surfaces the (larger) original id,
+ * and the two never match.  When this attribute is absent the id IS the dense
+ * index (see the `resolveObjectIndex` fallback), so callers use the row index.
+ */
+async function readObjectSegmentIds(
+  sharedKvStoreContext: SharedKvStoreContext,
+  level0Url: string,
+  numObjects: number,
+  options: Partial<ProgressOptions>,
+): Promise<BigUint64Array | undefined> {
+  const arrayUrl = joinBaseUrlAndPath(
+    level0Url,
+    "object_attributes/segment_id/",
+  );
+  const meta = await getJsonResource(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(arrayUrl, "zarr.json"),
+    "zarr-vectors object_attributes/segment_id metadata",
+    options,
+  ).catch(() => undefined);
+  if (meta === undefined) return undefined;
+  if (String(meta?.attributes?.dtype ?? "") !== "uint64") return undefined;
+  const dataResponse = await sharedKvStoreContext.kvStoreContext
+    .read(joinBaseUrlAndPath(arrayUrl, "c/0"), options)
+    .catch(() => undefined);
+  if (dataResponse === undefined) return undefined;
+  const rawBytes = new Uint8Array(
+    (await dataResponse.response.arrayBuffer()) as ArrayBuffer,
+  );
+  const bytes = await maybeDecompressObjAttr(
+    rawBytes,
+    options.signal ?? new AbortController().signal,
+  );
+  if (bytes.byteLength < numObjects * 8) return undefined;
+  // Copy into an 8-byte-aligned buffer so the BigUint64Array view is valid
+  // regardless of the source byteOffset.
+  const aligned = new Uint8Array(numObjects * 8);
+  aligned.set(bytes.subarray(0, numObjects * 8));
+  return new BigUint64Array(aligned.buffer);
+}
+
+/**
  * Build a `SegmentPropertyMap` from level-0 `object_attributes/`.  Each
  * scalar (num_channels=1) attribute becomes one numerical column in
  * neuroglancer's segment-properties UI; the row order maps directly to
@@ -820,9 +873,21 @@ async function buildObjectAttributePropertyMap(
   }
   if (keepIndices.length === 0) return undefined;
 
+  // Key the property map by the ORIGINAL segment id (object_attributes/
+  // segment_id), which is the id space neuroglancer picks/selects skeletons
+  // in — falling back to the dense row index when that attribute is absent.
+  const objectSegmentIds = await readObjectSegmentIds(
+    sharedKvStoreContext,
+    level0Url,
+    numObjects,
+    options,
+  );
   const ids = new BigUint64Array(keepIndices.length);
   for (let i = 0; i < keepIndices.length; ++i) {
-    ids[i] = BigInt(keepIndices[i]);
+    ids[i] =
+      objectSegmentIds !== undefined
+        ? objectSegmentIds[keepIndices[i]]
+        : BigInt(keepIndices[i]);
   }
 
   const properties: InlineSegmentProperty[] = [];
@@ -1184,8 +1249,19 @@ async function buildGroupPropertyMap(
     memberOids,
   );
 
+  // Key by the original segment id (same as buildObjectAttributePropertyMap /
+  // the skeleton source's id space); fall back to the dense row index.
+  const objectSegmentIds = await readObjectSegmentIds(
+    sharedKvStoreContext,
+    level0Url,
+    numObjects,
+    options,
+  );
   const ids = new BigUint64Array(numObjects);
-  for (let oid = 0; oid < numObjects; ++oid) ids[oid] = BigInt(oid);
+  for (let oid = 0; oid < numObjects; ++oid) {
+    ids[oid] =
+      objectSegmentIds !== undefined ? objectSegmentIds[oid] : BigInt(oid);
+  }
 
   const properties: InlineSegmentProperty[] = [];
   const tags: InlineSegmentTagsProperty = {

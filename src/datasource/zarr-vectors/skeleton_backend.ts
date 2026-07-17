@@ -37,13 +37,13 @@ import {
 } from "#src/datasource/zarr-vectors/base.js";
 import {
   createCrossChunkLinksCaches,
-  readCrossChunkLinks,
   readCrossChunkLinksForChunk,
   readCrossChunkLinksForOwnedChunks,
   type CrossChunkLinksCaches,
   type CrossChunkLinksTable,
 } from "#src/datasource/zarr-vectors/cross_chunk_links.js";
 import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
+import { probeObjectAcrossLevels } from "#src/datasource/zarr-vectors/multiscale_manifest.js";
 import {
   createPerChunkArrayCaches,
   makeReadArrayChunk,
@@ -66,7 +66,6 @@ import {
   type LinkDtype,
 } from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
 import { downloadSegmentSkeleton } from "#src/datasource/zarr-vectors/skeleton_segment_download.js";
-import { probeObjectAcrossLevels } from "#src/datasource/zarr-vectors/multiscale_manifest.js";
 import { WithSharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
 import { joinBaseUrlAndPath } from "#src/kvstore/url.js";
 import type {
@@ -740,25 +739,6 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
   ZarrVectorsObjectKeyedSkeletonSourceParameters,
 ) {
   /**
-   * Cached decoded ``cross_chunk_links/0/`` table for this level.  Read
-   * lazily on the first ``download()`` and reused across all subsequent
-   * object downloads — the table is per-level, not per-object.
-   *
-   * ``null`` means "checked, store has no such table" (older
-   * zarr-vectors stores written without ``cross_chunk_strategy =
-   * "explicit_links"``).  ``undefined`` means "not yet probed".
-   *
-   * Only used for ``explicit`` / ``implicit_sequential_with_branches``
-   * (graphs / skeletons), whose manifests span far fewer chunks per
-   * object than a streamline pyramid — the whole-level decode cost
-   * (tens of millions of records / multiple gigabytes for a real
-   * dataset) is a known, currently-accepted tradeoff for those (see the
-   * TODO below). ``implicit_sequential`` (streamline/polyline) uses
-   * {@link crossChunkLinksCaches_} instead — the scoped, per-chunk
-   * reader — because a whole-brain tractogram's level-0 table can be
-   * large enough to OOM the tab (confirmed in practice) just to resolve
-   * one selected segment's handful of cross-chunk edges.
-   *
    * `downloadSegmentSkeleton` prefers real cross_chunk_links-derived
    * edges (`collectOwnedCrossChunkEdges`) over
    * `deriveImplicitSequentialCrossChunkEdges` (manifest-order
@@ -769,15 +749,13 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
    * path remains as a fallback for stores where no cross_chunk_links
    * table exists at all.
    *
-   * TODO: graphs/skeletons still pay the whole-table decode here since
-   * one object's manifest can span many chunks (not the single target
-   * a per-chunk query assumes) — a proper fix would move them onto the
-   * same scoped-query mechanism as `implicit_sequential`, merging
-   * per-chunk results the way `queryCrossChunkLinksForChunks` below
-   * does. Out of scope for this pass since it hasn't caused a reported
-   * crash.
+   * ALL link conventions (graphs / skeletons included, not just
+   * `implicit_sequential`) now use the scoped per-object query
+   * ({@link crossChunkLinksCaches_} via {@link queryCrossChunkLinksForChunks})
+   * — reading only an object's owned chunk-pair cells — rather than decoding
+   * the whole per-level table, which for a branchy object spanning hundreds
+   * of chunks was both a read-request storm and a multi-GB decode.
    */
-  private crossChunkLinks_: CrossChunkLinksTable | null | undefined;
 
   /**
    * Shared shard-discovery / shard-byte caches for this level's
@@ -890,29 +868,6 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
     return undefined;
   }
 
-  private async getCrossChunkLinks(
-    kvStoreRead: (
-      subpath: string,
-      signal: AbortSignal,
-    ) => Promise<Uint8Array | undefined>,
-    kvStoreList: (
-      prefix: string,
-      signal: AbortSignal,
-    ) => Promise<{ directories: string[]; files: string[] }>,
-    kvStoreReadRange: ShardedArrayReadRange,
-    signal: AbortSignal,
-  ): Promise<CrossChunkLinksTable | undefined> {
-    if (this.crossChunkLinks_ !== undefined) {
-      return this.crossChunkLinks_ ?? undefined;
-    }
-    const table = await readCrossChunkLinks(
-      { kvStoreRead, kvStoreList, kvStoreReadRange },
-      signal,
-    );
-    this.crossChunkLinks_ = table ?? null;
-    return table;
-  }
-
   async download(chunk: SkeletonChunk, signal: AbortSignal): Promise<void> {
     const {
       baseUrl,
@@ -922,7 +877,6 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       linksConvention,
       geometryKind,
       linkDtype,
-      hasFragmentSegmentIds,
     } = this.parameters;
     const kvStoreRead = makeKvStoreRead(baseUrl, this.sharedKvStoreContext);
     const rawKvStoreRead = makeRawKvStoreRead(baseUrl, this.sharedKvStoreContext);
@@ -955,19 +909,17 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       signal,
     );
 
-    // See `crossChunkLinks_`'s docstring: `implicit_sequential` uses the
-    // scoped per-chunk query (avoids decoding a whole-level table that
-    // can be large enough to OOM the tab for a streamline pyramid);
-    // other conventions keep the whole-table fetch.
-    const crossChunkLinks =
-      linksConvention === "implicit_sequential"
-        ? undefined
-        : await this.getCrossChunkLinks(
-            rawKvStoreRead,
-            kvStoreList,
-            perChunkArraySource.kvStoreReadRange,
-            signal,
-          );
+    // Use the scoped per-object cross-chunk-link query (owned-owned cells
+    // only — see `queryCrossChunkLinksForChunks`) for EVERY links
+    // convention.  Previously only `implicit_sequential` did this; graphs /
+    // skeletons (`implicit_sequential_with_branches`/`explicit`) decoded the
+    // WHOLE per-level table via `getCrossChunkLinks` — one read per
+    // chunk-pair cell under the 0.8.1 flat-cell-key layout, i.e. a request
+    // storm (and a multi-GB decode) for a branchy object spanning hundreds
+    // of chunks.  The scoped query reads only this object's owned chunk-pair
+    // cells and yields identical edges after `collectOwnedCrossChunkEdges`
+    // (this resolves the long-standing TODO on `crossChunkLinks_`).
+    const crossChunkLinks = undefined;
 
     // Map the selected segment id (e.g. a flywire uint64) to the dense
     // object index via object_attributes/segment_id before the manifest
@@ -1009,17 +961,14 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
         geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
         crossChunkLinks,
-        queryCrossChunkLinksForChunks:
-          linksConvention === "implicit_sequential"
-            ? (chunkCoordsList, sig) =>
-                this.queryCrossChunkLinksForChunks(
-                  chunkCoordsList,
-                  rawKvStoreRead,
-                  kvStoreList,
-                  perChunkArraySource.kvStoreReadRange,
-                  sig,
-                )
-            : undefined,
+        queryCrossChunkLinksForChunks: (chunkCoordsList, sig) =>
+          this.queryCrossChunkLinksForChunks(
+            chunkCoordsList,
+            rawKvStoreRead,
+            kvStoreList,
+            perChunkArraySource.kvStoreReadRange,
+            sig,
+          ),
         readArrayChunk,
         // Byte-range-scoped vertex reads for streamline stores (see
         // `downloadSkeletonChunkScoped`): fetch only the selected object's
@@ -1027,7 +976,15 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
         // `implicit_sequential` AND supports offset reads (gated above);
         // the per-array raw-ness check happens lazily inside it.
         readArrayChunkScoped,
-        hasFragmentSegmentIds,
+        // Never read `fragment_attributes/segment_id` in the object-keyed
+        // (pass-2) path: this whole download IS for one known `objectId`
+        // (the chunk key from the selection model), so every vertex belongs
+        // to that segment. The per-vertex "segment" column the read would
+        // build is dropped by `filterChunkByFragments` and never reaches the
+        // render layer (pass-2 colors per-object via `uColor`), so fetching
+        // it is a wasted request per chunk. Force it off regardless of the
+        // level's declared `hasFragmentSegmentIds`.
+        hasFragmentSegmentIds: false,
       },
       signal,
     );
@@ -1093,16 +1050,6 @@ export class ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend extends WithP
     | { numObjects: number; chunkSize: number }
     | undefined
   )[] = [];
-
-  /**
-   * Per-level whole-table `cross_chunk_links/0/` cache, parallel to
-   * `levels`. Only used for non-`implicit_sequential` conventions — see
-   * {@link ZarrVectorsObjectKeyedSkeletonSourceBackend.crossChunkLinks_}'s
-   * docstring for why `implicit_sequential` uses the scoped
-   * {@link crossChunkLinksCachesByLevel_} instead.
-   */
-  private crossChunkLinksByLevel_: (CrossChunkLinksTable | null | undefined)[] =
-    [];
 
   /**
    * Per-level scoped shard-discovery / shard-byte caches, parallel to
@@ -1223,29 +1170,6 @@ export class ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend extends WithP
       this.manifestShapeByLevel_[level] = cached;
     }
     return cached;
-  }
-
-  private async getCrossChunkLinksForLevel(
-    level: number,
-    kvStoreRead: (
-      subpath: string,
-      signal: AbortSignal,
-    ) => Promise<Uint8Array | undefined>,
-    kvStoreList: (
-      prefix: string,
-      signal: AbortSignal,
-    ) => Promise<{ directories: string[]; files: string[] }>,
-    kvStoreReadRange: ShardedArrayReadRange,
-    signal: AbortSignal,
-  ): Promise<CrossChunkLinksTable | undefined> {
-    const cached = this.crossChunkLinksByLevel_[level];
-    if (cached !== undefined) return cached ?? undefined;
-    const table = await readCrossChunkLinks(
-      { kvStoreRead, kvStoreList, kvStoreReadRange },
-      signal,
-    );
-    this.crossChunkLinksByLevel_[level] = table ?? null;
-    return table;
   }
 
   async download(
@@ -1404,16 +1328,10 @@ export class ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend extends WithP
     // (avoids decoding a whole-level table that can be large enough to
     // OOM the tab for a streamline pyramid); other conventions keep the
     // whole-table fetch.
-    const crossChunkLinks =
-      linksConvention === "implicit_sequential"
-        ? undefined
-        : await this.getCrossChunkLinksForLevel(
-            level,
-            rawKvStoreRead,
-            kvStoreList,
-            perChunkArraySource.kvStoreReadRange,
-            signal,
-          );
+    // Scoped per-object query for every convention (owned-owned cells only)
+    // — see the matching comment in the single-level source's `download`.
+    // Avoids the whole-per-level-table request storm for branchy skeletons.
+    const crossChunkLinks = undefined;
 
     const aggregated = await downloadSegmentSkeleton(
       resolvedOid,
@@ -1431,23 +1349,23 @@ export class ZarrVectorsMultiscaleObjectKeyedSkeletonSourceBackend extends WithP
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
         geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
         crossChunkLinks,
-        queryCrossChunkLinksForChunks:
-          linksConvention === "implicit_sequential"
-            ? (chunkCoordsList, sig) =>
-                this.queryCrossChunkLinksForChunksAtLevel(
-                  level,
-                  chunkCoordsList,
-                  rawKvStoreRead,
-                  kvStoreList,
-                  perChunkArraySource.kvStoreReadRange,
-                  sig,
-                )
-            : undefined,
+        queryCrossChunkLinksForChunks: (chunkCoordsList, sig) =>
+          this.queryCrossChunkLinksForChunksAtLevel(
+            level,
+            chunkCoordsList,
+            rawKvStoreRead,
+            kvStoreList,
+            perChunkArraySource.kvStoreReadRange,
+            sig,
+          ),
         readArrayChunk,
         // Byte-range-scoped vertex reads (see `downloadSkeletonChunkScoped`);
         // `undefined` unless implicit_sequential AND offset reads supported.
         readArrayChunkScoped,
-        hasFragmentSegmentIds: levelRef.hasFragmentSegmentIds,
+        // Force off — see the single-level object-keyed backend: the segment
+        // id is the known `objectId`, so the per-vertex `segment_id` column is
+        // never used in pass-2 and reading it is a wasted request per chunk.
+        hasFragmentSegmentIds: false,
       },
       signal,
     );

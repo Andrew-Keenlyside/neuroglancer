@@ -572,6 +572,258 @@ describe("downloadSegmentSkeleton", () => {
     expect(Array.from(result!.indices)).toEqual([2, 0, 0, 1]);
   });
 
+  it("resolves a cross-chunk link whose endpoint is in an EARLIER of several fragments in the same chunk", async () => {
+    // Regression for the last-write-wins bug: an object owning MULTIPLE
+    // fragments in one chunk arrives as several `single`-mode manifest
+    // blocks sharing a chunk key. The cross-chunk resolver must accumulate
+    // every block's chunk-local→merged mapping — not just the last block's
+    // — or a cross-chunk endpoint landing in an earlier fragment resolves
+    // to -1 and the bridge silently drops (mouselight: dozens of gaps per
+    // neuron). Uses `implicit_sequential_with_branches` so there is NO
+    // manifest-order fallback to mask a dropped blob-based edge.
+    //
+    // Chunk [0,0,0]: 4 verts, TWO fragments (frag0: verts 0-1, frag1:
+    // verts 2-3), listed as two separate single blocks. Chunk [1,0,0]: 2
+    // verts, one fragment. Cross-chunk link joins [0,0,0] vert 0 (in the
+    // FIRST fragment / first block) to [1,0,0] vert 0.
+    const blocks: Array<[number[], number]> = [
+      [[0, 0, 0], 0], // frag 0 of chunk 0.0.0
+      [[0, 0, 0], 1], // frag 1 of chunk 0.0.0
+      [[1, 0, 0], 0], // frag 0 of chunk 1.0.0
+    ];
+    const manifestBytes = new Uint8Array(4 + (8 * 3 + 1 + 8) * blocks.length);
+    const mv = new DataView(manifestBytes.buffer);
+    mv.setUint32(0, blocks.length, true);
+    let off = 4;
+    for (const [cc, frag] of blocks) {
+      for (const c of cc) {
+        mv.setBigInt64(off, BigInt(c), true);
+        off += 8;
+      }
+      mv.setUint8(off, MANIFEST_MODE_SINGLE);
+      off += 1;
+      mv.setBigInt64(off, BigInt(frag), true);
+      off += 8;
+    }
+    const manifestChunk = buildVlenBytesChunk([manifestBytes]);
+    // Chunk 0.0.0 fragment index: two fragments over 4 vertices.
+    const twoFrags = packFragmentIndexBlob([
+      { range: { start: 0, count: 2 } },
+      { range: { start: 2, count: 2 } },
+    ]);
+    const oneFrag2 = packFragmentIndexBlob([{ range: { start: 0, count: 2 } }]);
+    const kvStoreRead = makeKvStore({
+      "object_index/manifests/c/0": manifestChunk,
+      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0]),
+      "vertex_fragments/0.0.0/c/0": twoFrags,
+      "vertices/1.0.0/c/0": verticesBlob([10, 0, 0, 11, 0, 0]),
+      "vertex_fragments/1.0.0/c/0": oneFrag2,
+    });
+    const crossChunkLinks: CrossChunkLinksTable = {
+      linkWidth: 2,
+      sidNdim: rank,
+      records: [
+        {
+          endpoints: [
+            { chunkCoords: [0, 0, 0], vertexIndex: 0 },
+            { chunkCoords: [1, 0, 0], vertexIndex: 0 },
+          ],
+        },
+      ],
+    };
+
+    const result = await downloadSegmentSkeleton(
+      0,
+      {
+        manifestReader: {
+          numObjects: 1,
+          chunkSize: 16384,
+          sidNdim: rank,
+          kvStoreRead,
+        },
+        rank,
+        linkDtype: "int64",
+        attributeNames,
+        attributeDtypes,
+        linksConvention: "implicit_sequential_with_branches",
+        geometryKind: "skeleton",
+        crossChunkLinks,
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
+      },
+      new AbortController().signal,
+    );
+
+    expect(result).toBeDefined();
+    // Merged order: frag0 → 0,1; frag1 → 2,3; chunk 1.0.0 → 4,5.
+    // Within-chunk sequential edges: (0,1) (2,3) (4,5).
+    // Cross-chunk: [0,0,0] vert 0 → merged 0; [1,0,0] vert 0 → merged 4.
+    // Pre-fix this bridge dropped (vert 0 lived in the first block, but
+    // only the LAST block's remap survived) → indices would be [0,1,2,3,4,5].
+    expect(Array.from(result!.indices)).toEqual([0, 1, 2, 3, 4, 5, 0, 4]);
+  });
+
+  it("keeps an inter-fragment branch link within a chunk (fragments filtered together)", async () => {
+    // Regression for the within-chunk gap: `implicit_sequential_with_branches`
+    // stores fragment-to-fragment connectivity as branch links in
+    // `links/0/<chunk>`. The manifest lists one `single` block per fragment,
+    // so if each fragment is filtered on its own, a branch link (endpoints in
+    // two different fragments) is dropped by BOTH blocks → the neuron
+    // shatters into per-fragment pieces. Grouping the chunk's fragments into
+    // one filter call keeps the link.
+    //
+    // Chunk [0,0,0]: 4 verts, frag0 = verts 0,1 and frag1 = verts 2,3.
+    // `links/0` carries one branch link 1—2 (frag0 → frag1).
+    const blocks: Array<[number[], number]> = [
+      [[0, 0, 0], 0],
+      [[0, 0, 0], 1],
+    ];
+    const manifestBytes = new Uint8Array(4 + (8 * 3 + 1 + 8) * blocks.length);
+    const mv = new DataView(manifestBytes.buffer);
+    mv.setUint32(0, blocks.length, true);
+    let off = 4;
+    for (const [cc, frag] of blocks) {
+      for (const c of cc) {
+        mv.setBigInt64(off, BigInt(c), true);
+        off += 8;
+      }
+      mv.setUint8(off, MANIFEST_MODE_SINGLE);
+      off += 1;
+      mv.setBigInt64(off, BigInt(frag), true);
+      off += 8;
+    }
+    const manifestChunk = buildVlenBytesChunk([manifestBytes]);
+    const twoFrags = packFragmentIndexBlob([
+      { range: { start: 0, count: 2 } },
+      { range: { start: 2, count: 2 } },
+    ]);
+    // Branch link as a raw int64 [child, parent] pair (chunk-local): 1—2.
+    // Per-chunk arrays are served raw (like `verticesBlob`), not vlen-wrapped.
+    const linkPairs = new BigInt64Array([1n, 2n]);
+    const linksBytes = new Uint8Array(linkPairs.buffer.slice(0));
+    const kvStoreRead = makeKvStore({
+      "object_index/manifests/c/0": manifestChunk,
+      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0]),
+      "vertex_fragments/0.0.0/c/0": twoFrags,
+      "links/0/0.0.0/c/0": linksBytes,
+    });
+
+    const result = await downloadSegmentSkeleton(
+      0,
+      {
+        manifestReader: {
+          numObjects: 1,
+          chunkSize: 16384,
+          sidNdim: rank,
+          kvStoreRead,
+        },
+        rank,
+        linkDtype: "int64",
+        attributeNames,
+        attributeDtypes,
+        linksConvention: "implicit_sequential_with_branches",
+        geometryKind: "skeleton",
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
+      },
+      new AbortController().signal,
+    );
+
+    expect(result).toBeDefined();
+    // Sequential edges (0,1) and (2,3) plus the retained branch link (1,2).
+    // Pre-fix (per-fragment filtering) the branch link dropped → only
+    // [0,1,2,3]. Order within the merged edge list is not asserted.
+    const pairs = new Set<string>();
+    for (let i = 0; i < result!.indices.length; i += 2) {
+      pairs.add(`${result!.indices[i]}-${result!.indices[i + 1]}`);
+    }
+    expect(pairs.has("1-2")).toBe(true);
+    expect(pairs.has("0-1")).toBe(true);
+    expect(pairs.has("2-3")).toBe(true);
+  });
+
+  it("gives a cross-chunk-bridged singleton fragment a non-zero tangent (no black band)", async () => {
+    // Regression for the black cross-chunk transitions: an edge-adjacency
+    // tangent kind (skeleton) computes tangents PER CHUNK, so a fragment that
+    // is a single vertex is degree-0 in its chunk → zero tangent. Bridged to
+    // a neighbour chunk, the segment interpolates from a real tangent to zero
+    // → a black half-segment. Recomputing tangents from the MERGED graph gives
+    // that vertex its bridge neighbour → a real (non-zero) direction.
+    //
+    // Chunk [0,0,0]: verts (0,0,0),(1,0,0) as one fragment. Chunk [1,0,0]: a
+    // single vertex (2,0,0) — degree-0 in its own chunk. Cross-chunk link
+    // joins [0,0,0] vert 1 to [1,0,0] vert 0 (merged vert 2).
+    const blocks: Array<[number[], number]> = [
+      [[0, 0, 0], 0],
+      [[1, 0, 0], 0],
+    ];
+    const manifestBytes = new Uint8Array(4 + (8 * 3 + 1 + 8) * blocks.length);
+    const mv = new DataView(manifestBytes.buffer);
+    mv.setUint32(0, blocks.length, true);
+    let off = 4;
+    for (const [cc, frag] of blocks) {
+      for (const c of cc) {
+        mv.setBigInt64(off, BigInt(c), true);
+        off += 8;
+      }
+      mv.setUint8(off, MANIFEST_MODE_SINGLE);
+      off += 1;
+      mv.setBigInt64(off, BigInt(frag), true);
+      off += 8;
+    }
+    const manifestChunk = buildVlenBytesChunk([manifestBytes]);
+    const kvStoreRead = makeKvStore({
+      "object_index/manifests/c/0": manifestChunk,
+      "vertices/0.0.0/c/0": verticesBlob([0, 0, 0, 1, 0, 0]),
+      "vertex_fragments/0.0.0/c/0": packFragmentIndexBlob([
+        { range: { start: 0, count: 2 } },
+      ]),
+      "vertices/1.0.0/c/0": verticesBlob([2, 0, 0]),
+      "vertex_fragments/1.0.0/c/0": packFragmentIndexBlob([
+        { range: { start: 0, count: 1 } },
+      ]),
+    });
+    const crossChunkLinks: CrossChunkLinksTable = {
+      linkWidth: 2,
+      sidNdim: rank,
+      records: [
+        {
+          endpoints: [
+            { chunkCoords: [0, 0, 0], vertexIndex: 1 },
+            { chunkCoords: [1, 0, 0], vertexIndex: 0 },
+          ],
+        },
+      ],
+    };
+
+    const result = await downloadSegmentSkeleton(
+      0,
+      {
+        manifestReader: {
+          numObjects: 1,
+          chunkSize: 16384,
+          sidNdim: rank,
+          kvStoreRead,
+        },
+        rank,
+        linkDtype: "int64",
+        attributeNames,
+        attributeDtypes,
+        linksConvention: "implicit_sequential_with_branches",
+        geometryKind: "skeleton",
+        crossChunkLinks,
+        readArrayChunk: makeReadArrayChunk(kvStoreRead),
+      },
+      new AbortController().signal,
+    );
+
+    expect(result).toBeDefined();
+    // Tangent is attribute slot 0 for a synthesised-tangent kind; 3 verts × 3.
+    const tangents = result!.vertexAttributes[0] as Float32Array;
+    expect(tangents.length).toBe(9);
+    // The bridged singleton (merged vertex 2) must have a non-zero tangent.
+    const mag = Math.hypot(tangents[6], tangents[7], tangents[8]);
+    expect(mag).toBeCloseTo(1, 5);
+  });
+
   it("uses queryCrossChunkLinksForChunks (scoped) instead of decoding a whole-level table", async () => {
     // Same fixture as the previous test, but via the scoped query
     // callback rather than a pre-fetched whole-level table -- this is
@@ -899,11 +1151,16 @@ describe("collectOwnedCrossChunkEdges", () => {
     };
   }
 
-  function chunk(
-    remap: number[],
-    offset: number,
-  ): { vertexRemap: Int32Array; vertexOffset: number } {
-    return { vertexRemap: Int32Array.from(remap), vertexOffset: offset };
+  // Build the accumulated chunk-local-vertex → merged-index map that
+  // `collectOwnedCrossChunkEdges` now consumes, from a legacy
+  // `(remap, offset)` fixture: `remap[vi]` is the block-filtered position
+  // (< 0 = filtered out), `offset` the block's merged-index base.
+  function chunk(remap: number[], offset: number): Map<number, number> {
+    const m = new Map<number, number>();
+    for (let vi = 0; vi < remap.length; ++vi) {
+      if (remap[vi] >= 0) m.set(vi, remap[vi] + offset);
+    }
+    return m;
   }
 
   it("emits one edge per fully-owned record", () => {
