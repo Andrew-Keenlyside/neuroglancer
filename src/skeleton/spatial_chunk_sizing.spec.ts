@@ -20,6 +20,7 @@ import {
   buildSpatialSkeletonGridLevels,
   getDefaultSpatiallyIndexedSkeletonChunkSize,
   getSpatialSkeletonGridSpacing,
+  selectSpatialSkeletonGridLevelByBudget,
   sortSpatialSkeletonGridSizes,
   type SpatialSkeletonGridSize,
 } from "#src/skeleton/spatial_chunk_sizing.js";
@@ -198,5 +199,47 @@ describe("buildSpatialSkeletonGridLevels", () => {
     );
     expect(levels.map((l) => l.size.x)).toEqual([100, 10, 1]);
     expect(levels.map((l) => l.lod)).toEqual([0, 0.5, 1]);
+  });
+});
+
+describe("selectSpatialSkeletonGridLevelByBudget", () => {
+  // Costs are parallel to the level list: coarsest (cheapest) first.
+  const costs = [0.12e6, 1.2e6, 12e6, 122e6, 1224e6]; // ~HCP1065, bytes
+
+  it("takes the finest level that fits", () => {
+    expect(selectSpatialSkeletonGridLevelByBudget(costs, 1e9)).toBe(3);
+  });
+
+  it("takes the finest level outright when everything fits", () => {
+    expect(selectSpatialSkeletonGridLevelByBudget(costs, 1e12)).toBe(4);
+  });
+
+  it("falls back to the coarsest rather than showing nothing", () => {
+    // Even the sparsest level is over budget: sparse data beats no data.
+    expect(selectSpatialSkeletonGridLevelByBudget(costs, 1)).toBe(0);
+  });
+
+  it("treats a level exactly on budget as affordable", () => {
+    expect(selectSpatialSkeletonGridLevelByBudget([10, 20, 30], 20)).toBe(1);
+  });
+
+  it("does not assume an unknown cost fits", () => {
+    // A level whose footprint could not be estimated must not be selected on
+    // the strength of not having a number.
+    expect(
+      selectSpatialSkeletonGridLevelByBudget([10, Number.NaN, 30], 1e9),
+    ).toBe(2);
+    expect(selectSpatialSkeletonGridLevelByBudget([10, Number.NaN], 1e9)).toBe(
+      0,
+    );
+  });
+
+  it("returns 0 for no levels", () => {
+    expect(selectSpatialSkeletonGridLevelByBudget([], 1e9)).toBe(0);
+  });
+
+  it("picks the finest affordable level even if costs are not monotonic", () => {
+    // Ordering is the caller's contract; do not silently re-rank.
+    expect(selectSpatialSkeletonGridLevelByBudget([10, 5000, 20], 100)).toBe(2);
   });
 });

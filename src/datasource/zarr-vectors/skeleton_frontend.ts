@@ -87,6 +87,17 @@ interface ZvVertexAttributeRenderInfo {
   glslDataType: string;
 }
 
+/** On-GPU width of each attribute dtype, for the level cost estimate. */
+const ATTR_DTYPE_BYTES: Record<ZarrVectorsAttributeDtype, number> = {
+  float32: 4,
+  uint8: 1,
+  uint16: 2,
+  uint32: 4,
+  int8: 1,
+  int16: 2,
+  int32: 4,
+};
+
 const ATTR_DTYPE_TO_DATA_TYPE: Record<ZarrVectorsAttributeDtype, DataType> = {
   float32: DataType.FLOAT32,
   uint8: DataType.UINT8,
@@ -382,6 +393,16 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
    */
   readonly perLevelObjectCount: (number | undefined)[];
   /**
+   * ``zarr_vectors_level.vertex_count`` per level, finest-first; `undefined`
+   * where the writer did not stamp it.
+   *
+   * Distinct from `perLevelObjectCount`, and both are needed: object count is
+   * the *detail* axis (how many complete streamlines a level holds), while
+   * vertex count is the *cost* axis (what actually lands on the GPU). They
+   * only track each other while vertices-per-object stays constant.
+   */
+  readonly perLevelVertexCount: (number | undefined)[];
+  /**
    * Meters per coordinate unit, per axis (from the store's NGFF
    * scale + unit).  Used to report grid sizes in physical meters so the
    * resolution widget + auto-LOD picker are unit-consistent regardless of
@@ -447,6 +468,40 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
   }
 
   /**
+   * Estimated bytes each level puts on the GPU if fully resident, **coarsest
+   * first** to match `getSpatialSkeletonGridSizes()`. `NaN` for a level whose
+   * vertex count the writer did not stamp — an unknown cost must not read as
+   * an affordable one.
+   *
+   * Counts what the backend actually packs per vertex (see `download()` in
+   * `skeleton_backend.ts`): positions, the synthesised tangent where the
+   * geometry kind has one, each declared 1-component attribute, and the
+   * synthesised uint64 segment column. Edges are implicit `i -> i+1` for a
+   * streamline, so there is ~1 edge per vertex, each a `uvec2` index pair.
+   *
+   * This is an upper bound on a fully-resident level, not a live measurement:
+   * only chunks in view are actually fetched. It is used to refuse a level
+   * that could not fit even in principle -- for this store level 0 estimates
+   * ~4 GB against a 1 GB budget -- rather than to predict real usage.
+   */
+  getSpatialSkeletonLevelCostsBytes(): number[] {
+    const finestFirst = this.levels.map((level, k) => {
+      const count = this.perLevelVertexCount[k];
+      if (count === undefined) return Number.NaN;
+      const p = level.parameters;
+      let bytesPerVertex = p.rank * 4; // positions, float32
+      if (hasSynthesisedTangent(p.geometryKind)) bytesPerVertex += 3 * 4;
+      for (const dtype of p.attributeDtypes) {
+        bytesPerVertex += ATTR_DTYPE_BYTES[dtype];
+      }
+      bytesPerVertex += 8; // synthesised segment column, uvec2
+      bytesPerVertex += 8; // ~1 implicit edge per vertex, uvec2 index pair
+      return count * bytesPerVertex;
+    });
+    return finestFirst.reverse();
+  }
+
+  /**
    * Per-level multiplier that spreads levels the chunk-shape signal cannot
    * separate. All 1 when vertex counts are unavailable, when every level has
    * the same count, or when chunk growth already reflects the vertex drop.
@@ -502,6 +557,7 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
       levels: ReadonlyArray<ZarrVectorsSkeletonSpatialLevel>;
       perLevelChunkShape: Float32Array[];
       perLevelObjectCount?: (number | undefined)[];
+      perLevelVertexCount?: (number | undefined)[];
       metersPerUnit: Float64Array;
       lowerBounds: Float32Array;
       upperBounds: Float32Array;
@@ -512,6 +568,11 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     this.perLevelChunkShape = options.perLevelChunkShape;
     this.perLevelObjectCount =
       options.perLevelObjectCount ??
+      new Array<number | undefined>(options.perLevelChunkShape.length).fill(
+        undefined,
+      );
+    this.perLevelVertexCount =
+      options.perLevelVertexCount ??
       new Array<number | undefined>(options.perLevelChunkShape.length).fill(
         undefined,
       );

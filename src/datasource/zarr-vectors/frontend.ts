@@ -1185,6 +1185,12 @@ interface SkeletonMetadata {
      */
     perLevelObjectCount: (number | undefined)[];
     /**
+     * ``zarr_vectors_level.vertex_count`` per level -- the *cost* axis, as
+     * distinct from `perLevelObjectCount`'s *detail* axis.  See
+     * `getSpatialSkeletonLevelCostsBytes`.
+     */
+    perLevelVertexCount: (number | undefined)[];
+    /**
      * World-space lower bound of the data.  Can be negative — zarr-vectors
      * chunks are indexed around world origin `(0,0,0)`, NOT around
      * `lowerBounds`.  `makeSliceViewChunkSpecification` consumes this as
@@ -1404,6 +1410,7 @@ async function buildSkeletonMetadata(
     | {
         perLevelChunkShape: Float32Array[];
         perLevelObjectCount: (number | undefined)[];
+        perLevelVertexCount: (number | undefined)[];
         lowerBounds: Float32Array;
         upperBounds: Float32Array;
       }
@@ -1494,6 +1501,7 @@ async function buildSkeletonMetadata(
     );
     const perLevelChunkShape = perLevelMeta.map((m) => m.chunkShape);
     const perLevelObjectCount = computePerLevelObjectCount(perLevelMeta);
+    const perLevelVertexCount = perLevelMeta.map((m) => m.vertexCount);
 
     // Per-level parameter blobs.  Each level gets its own chunkShape
     // (may differ when the writer used ``chunk_scale_factors``).
@@ -1530,6 +1538,7 @@ async function buildSkeletonMetadata(
     spatialGrid = {
       perLevelChunkShape,
       perLevelObjectCount,
+      perLevelVertexCount,
       lowerBounds: lowerBoundsF32,
       upperBounds: upperBoundsF32,
     };
@@ -1614,6 +1623,7 @@ function getSkeletonDataSource(
             levels: metadata.pass1Levels,
             perLevelChunkShape: metadata.spatialGrid.perLevelChunkShape,
             perLevelObjectCount: metadata.spatialGrid.perLevelObjectCount,
+            perLevelVertexCount: metadata.spatialGrid.perLevelVertexCount,
             metersPerUnit: Float64Array.from(metadata.coordinateSpace.scales),
             lowerBounds: metadata.spatialGrid.lowerBounds,
             upperBounds: metadata.spatialGrid.upperBounds,

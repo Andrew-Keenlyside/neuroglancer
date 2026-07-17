@@ -145,6 +145,7 @@ import {
 import {
   buildSpatialSkeletonGridLevels,
   getSpatialSkeletonGridSpacing,
+  selectSpatialSkeletonGridLevelByBudget,
   type SpatialSkeletonGridLevel,
   type SpatialSkeletonGridSize,
 } from "#src/skeleton/spatial_chunk_sizing.js";
@@ -802,7 +803,7 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
 
     this.spatialSkeletonGridResolutionTarget2d.changed.add(() => {
       const levels = this.spatialSkeletonGridLevels.value;
-      if (levels.length > 0) {
+      if (levels.length > 0 && this.spatialSkeletonBudgetLevel === undefined) {
         this.setSpatialSkeletonGridLevel(
           "2d",
           findClosestSpatialSkeletonGridLevelBySpacing(
@@ -814,7 +815,12 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
     });
     this.spatialSkeletonGridResolutionTarget3d.changed.add(() => {
       const levels = this.spatialSkeletonGridLevels.value;
-      if (levels.length > 0) {
+      // The camera recomputes this target every frame, so without the guard it
+      // would immediately undo a budget-driven choice — which is exactly what
+      // it did: the level picked at load survived in 2d (whose target is
+      // static in a 3d layout) but was overwritten back to the finest level in
+      // 3d on the first frame.
+      if (levels.length > 0 && this.spatialSkeletonBudgetLevel === undefined) {
         this.setSpatialSkeletonGridLevel(
           "3d",
           findClosestSpatialSkeletonGridLevelBySpacing(
@@ -912,7 +918,32 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
     this.layer.moveToSegment(id);
   };
 
-  setSpatialSkeletonGridSizes(gridSizes: SpatialSkeletonGridSize[]) {
+  /**
+   * Publish the pyramid's levels, coarsest first, and choose one.
+   *
+   * `levelCostsBytes` (parallel to `gridSizes`) and `budgetBytes` opt a source
+   * into budget-driven selection: the finest level that fits is chosen, rather
+   * than the one closest to the camera-derived resolution target. That matters
+   * where levels differ in *how many complete objects* they hold rather than
+   * in resolution — detail-per-pixel then says nothing about whether a level
+   * will fit, and on a whole-brain tractogram the camera target asks for the
+   * finest level, ~10^8 vertices and several times the GPU budget. Sources
+   * that omit them keep the camera-driven behaviour.
+   */
+  /**
+   * Level chosen by memory budget, or `undefined` when the source did not opt
+   * in. While set, the camera-driven resolution target does not re-select:
+   * "the finest level that fits" and "the level matching the screen" are
+   * different questions, and the camera's answer would otherwise win every
+   * frame.
+   */
+  private spatialSkeletonBudgetLevel: number | undefined;
+
+  setSpatialSkeletonGridSizes(
+    gridSizes: SpatialSkeletonGridSize[],
+    levelCostsBytes?: number[],
+    budgetBytes?: number,
+  ) {
     const levels = buildSpatialSkeletonGridLevels(gridSizes);
     const { origin: histogramOrigin, binSize: histogramBinSize } =
       getSpatialSkeletonGridHistogramConfig(levels);
@@ -942,15 +973,27 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
     }
     this.spatialSkeletonGridLevels.value = levels;
     if (levels.length === 0) return;
-    const target3dIndex = findClosestSpatialSkeletonGridLevelBySpacing(
-      levels,
-      this.spatialSkeletonGridResolutionTarget3d.value,
-    );
+    const budgeted =
+      levelCostsBytes !== undefined &&
+      levelCostsBytes.length === levels.length &&
+      budgetBytes !== undefined &&
+      Number.isFinite(budgetBytes)
+        ? selectSpatialSkeletonGridLevelByBudget(levelCostsBytes, budgetBytes)
+        : undefined;
+    this.spatialSkeletonBudgetLevel = budgeted;
+    const target3dIndex =
+      budgeted ??
+      findClosestSpatialSkeletonGridLevelBySpacing(
+        levels,
+        this.spatialSkeletonGridResolutionTarget3d.value,
+      );
     this.setSpatialSkeletonGridLevel("3d", target3dIndex);
-    const target2dIndex = findClosestSpatialSkeletonGridLevelBySpacing(
-      levels,
-      this.spatialSkeletonGridResolutionTarget2d.value,
-    );
+    const target2dIndex =
+      budgeted ??
+      findClosestSpatialSkeletonGridLevelBySpacing(
+        levels,
+        this.spatialSkeletonGridResolutionTarget2d.value,
+      );
     this.setSpatialSkeletonGridLevel("2d", target2dIndex);
   }
 
@@ -1769,6 +1812,8 @@ export class SegmentationUserLayer extends Base {
     let updatedGraph: SegmentationGraphSource | undefined;
     let hasVolume = false;
     let spatialSkeletonGridSizes: SpatialSkeletonGridSize[] | undefined;
+    let spatialSkeletonLevelCostsBytes: number[] | undefined;
+    let spatialSkeletonBudgetBytes: number | undefined;
     for (const loadedSubsource of subsources) {
       if (this.addStaticAnnotations(loadedSubsource)) continue;
       const { volume, mesh, segmentPropertyMap, segmentationGraph, local } =
@@ -1825,6 +1870,19 @@ export class SegmentationUserLayer extends Base {
           }
           spatialSkeletonGridSizes =
             mesh.getSpatialSkeletonGridSizes(liveScale);
+          // A source that can estimate what each level costs opts into
+          // budget-driven selection; see `setSpatialSkeletonGridSizes`.
+          const costs = (
+            mesh as {
+              getSpatialSkeletonLevelCostsBytes?: () => number[];
+            }
+          ).getSpatialSkeletonLevelCostsBytes?.();
+          if (costs !== undefined) {
+            spatialSkeletonLevelCostsBytes = costs;
+            spatialSkeletonBudgetBytes =
+              this.manager.chunkManager.chunkQueueManager.capacities.gpuMemory
+                .sizeLimit.value;
+          }
         }
         loadedSubsource.activate(() => {
           const displayState = {
@@ -2020,6 +2078,8 @@ export class SegmentationUserLayer extends Base {
     this.displayState.originalSegmentationGroupState.graph.value = updatedGraph;
     this.displayState.setSpatialSkeletonGridSizes(
       spatialSkeletonGridSizes ?? [],
+      spatialSkeletonLevelCostsBytes,
+      spatialSkeletonBudgetBytes,
     );
     this.displayState.hasVolume.value = hasVolume;
     this.updateSpatialSkeletonChunkLoadState();

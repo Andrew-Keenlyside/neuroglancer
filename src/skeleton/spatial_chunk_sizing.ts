@@ -78,6 +78,39 @@ export function buildSpatialSkeletonGridLevels(
   }));
 }
 
+/**
+ * Index of the finest level a memory budget can afford: the last level whose
+ * estimated footprint fits, given `costsBytes` parallel to the level list and
+ * therefore ascending (coarsest first).
+ *
+ * This is the "load as much as fits" rule, and it is deliberately not the same
+ * question the camera-driven resolution target answers. That target asks how
+ * much detail the screen can show, which is the right question for a pyramid
+ * whose levels differ in *resolution*. Where levels instead differ in *how
+ * many complete objects* they hold, detail-per-pixel says nothing about
+ * whether the level will fit: on a whole-brain tractogram the camera target
+ * lands on the finest level and asks for ~10^8 vertices, which the budget
+ * cannot hold and the renderer cannot survive.
+ *
+ * Returns 0 -- the coarsest level -- when nothing fits, since showing the
+ * sparsest available data beats showing none. A caller with no budget
+ * information should not call this at all.
+ */
+export function selectSpatialSkeletonGridLevelByBudget(
+  costsBytes: readonly number[],
+  budgetBytes: number,
+): number {
+  if (costsBytes.length === 0) return 0;
+  let best = 0;
+  for (let i = 0; i < costsBytes.length; ++i) {
+    const cost = costsBytes[i];
+    // An unknown cost is not evidence that the level fits.
+    if (!Number.isFinite(cost)) continue;
+    if (cost <= budgetBytes) best = i;
+  }
+  return best;
+}
+
 function validateFiniteOptions(
   options: DefaultSpatiallyIndexedSkeletonChunkSizeOptions,
 ) {
