@@ -321,3 +321,43 @@ export function streamlinePassesRois(
   }
   return verdict;
 }
+
+/**
+ * The same left-fold as {@link streamlinePassesRois}, but over a pre-computed
+ * per-region crossing vector rather than the geometry.
+ *
+ * `crossed[i]` is whether the streamline crosses `rois[i]` (under its
+ * predicate). Splitting the crossing test from the fold is what makes the
+ * per-chunk filter correct: a streamline that spans several chunks may cross
+ * region A in one chunk and region B in another, so `crossed[]` must be OR-ed
+ * across all of its fragments *before* the fold is applied. Evaluating the
+ * whole `AND` fold against a single fragment would wrongly drop it.
+ *
+ * `crossed.length` must equal `rois.length`. An empty list passes everything.
+ */
+export function combineRoiVerdicts(
+  crossed: readonly boolean[],
+  rois: readonly Roi[],
+): boolean {
+  if (rois.length === 0) return true;
+  if (crossed.length !== rois.length) {
+    throw new Error(
+      `combineRoiVerdicts: crossed has ${crossed.length} entries, expected ${rois.length}`,
+    );
+  }
+  let verdict = crossed[0];
+  for (let i = 1; i < rois.length; ++i) {
+    switch (rois[i].operator) {
+      case RoiOperator.AND:
+        verdict = verdict && crossed[i];
+        break;
+      case RoiOperator.OR:
+        verdict = verdict || crossed[i];
+        break;
+      case RoiOperator.ANDNOT:
+        verdict = verdict && !crossed[i];
+        break;
+    }
+  }
+  return verdict;
+}

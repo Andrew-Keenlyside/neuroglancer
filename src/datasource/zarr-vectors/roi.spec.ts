@@ -16,6 +16,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  combineRoiVerdicts,
   RoiOperator,
   RoiPredicate,
   streamlinePassesRoi,
@@ -343,5 +344,61 @@ describe("streamlinePassesRois — composition", () => {
     );
     // Crosses both but terminates beyond x=10.
     expect(streamlinePassesRois(line(-5, 0, 0, 15, 0, 0), rois)).toBe(false);
+  });
+});
+
+describe("combineRoiVerdicts — agrees with streamlinePassesRois (no drift)", () => {
+  const atOrigin = sphere(0, 0, 0, 1);
+  const atTen = sphere(10, 0, 0, 1);
+  const roi = (shape: RoiShape, operator: RoiOperator): Roi => ({
+    shape,
+    operator,
+    predicate: RoiPredicate.ANY_SEGMENT,
+  });
+
+  const cases: Roi[][] = [
+    [],
+    [roi(atOrigin, RoiOperator.AND)],
+    [roi(atOrigin, RoiOperator.AND), roi(atTen, RoiOperator.AND)],
+    [roi(atOrigin, RoiOperator.AND), roi(atTen, RoiOperator.OR)],
+    [roi(atOrigin, RoiOperator.AND), roi(atTen, RoiOperator.ANDNOT)],
+  ];
+  const streams: StreamlineRef[] = [
+    line(-5, 0, 0, 5, 0, 0), // crosses origin only
+    line(5, 0, 0, 15, 0, 0), // crosses ten only
+    line(-5, 0, 0, 15, 0, 0), // crosses both
+    line(0, 5, 0, 0, 15, 0), // crosses neither
+  ];
+
+  it("folding a per-region crossing vector matches the geometry fold", () => {
+    for (const rois of cases) {
+      for (const s of streams) {
+        const crossed = rois.map((r) =>
+          streamlinePassesRoi(s, r.shape, r.predicate),
+        );
+        expect(combineRoiVerdicts(crossed, rois)).toBe(
+          streamlinePassesRois(s, rois),
+        );
+      }
+    }
+  });
+
+  it("OR-ing crossings across fragments recovers a spanning AND", () => {
+    // The whole point: a streamline that crosses A in one fragment and B in
+    // another passes `A AND B`, even though no single fragment crosses both.
+    const rois = [roi(atOrigin, RoiOperator.AND), roi(atTen, RoiOperator.AND)];
+    const fragmentA = line(-5, 0, 0, 5, 0, 0); // crosses origin, not ten
+    const fragmentB = line(5, 0, 0, 15, 0, 0); // crosses ten, not origin
+    const crossedA = rois.map((r) =>
+      streamlinePassesRoi(fragmentA, r.shape, r.predicate),
+    );
+    const crossedB = rois.map((r) =>
+      streamlinePassesRoi(fragmentB, r.shape, r.predicate),
+    );
+    const merged = crossedA.map((v, i) => v || crossedB[i]);
+    expect(combineRoiVerdicts(merged, rois)).toBe(true);
+    // Neither fragment alone passes the AND.
+    expect(combineRoiVerdicts(crossedA, rois)).toBe(false);
+    expect(combineRoiVerdicts(crossedB, rois)).toBe(false);
   });
 });
