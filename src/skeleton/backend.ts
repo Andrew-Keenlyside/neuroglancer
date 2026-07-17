@@ -731,11 +731,12 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
           // always true), including in 2D views where this is the only
           // code path (the grid-anchor arbitration path below only runs
           // for 3D views).
-          const ordered = selectSpatiallyIndexedSkeletonEntriesByGridWithFallback(
-            scales.map((tsource, scaleIndex) => ({ tsource, scaleIndex })),
-            skeletonGridLevel,
-            ({ tsource }) => getSpatiallyIndexedSkeletonGridIndex(tsource),
-          );
+          const ordered =
+            selectSpatiallyIndexedSkeletonEntriesByGridWithFallback(
+              scales.map((tsource, scaleIndex) => ({ tsource, scaleIndex })),
+              skeletonGridLevel,
+              ({ tsource }) => getSpatiallyIndexedSkeletonGridIndex(tsource),
+            );
           return ordered.length > 0 ? [ordered[0]] : [];
         }
         if (resolvedPixelSize === undefined) {
@@ -811,12 +812,19 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
               getSpatiallyIndexedSkeletonGridIndex(scale) !== undefined,
           )
         ) {
+          // `fallbackRank` is the position in the returned preference order:
+          // the selected grid level first, then the fallbacks. That order is
+          // the ONLY thing carrying the level selection, and the arbitration
+          // sort below would otherwise discard it -- see the tie-break there.
           const orderedCandidates =
             selectSpatiallyIndexedSkeletonEntriesByGridWithFallback(
               scales.map((tsource, scaleIndex) => ({ tsource, scaleIndex })),
               skeletonGridLevel,
               ({ tsource }) => getSpatiallyIndexedSkeletonGridIndex(tsource),
-            );
+            ).map((candidate, fallbackRank) => ({
+              ...candidate,
+              fallbackRank,
+            }));
           if (orderedCandidates.length > 0) {
             const metersPerUnit = getMetersPerUnit(projectionParameters);
             const spacingMeters = (candidate: {
@@ -836,8 +844,11 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
             // distance-based LOD per tiny finest-grid cell -- fragmenting
             // what should be one coarse-level selection into many different
             // levels scattered across the view.
-            const fallbackAnchor = orderedCandidates.reduce((best, candidate) =>
-              spacingMeters(candidate) < spacingMeters(best) ? candidate : best,
+            const fallbackAnchor = orderedCandidates.reduce(
+              (best, candidate) =>
+                spacingMeters(candidate) < spacingMeters(best)
+                  ? candidate
+                  : best,
             );
             const targetSpacingMeters =
               Number.isFinite(this.skeletonGridResolutionTarget3d.value) &&
@@ -912,7 +923,17 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
                     const da = Math.abs(spacingMeters(a) - desiredSpacing);
                     const db = Math.abs(spacingMeters(b) - desiredSpacing);
                     if (da !== db) return da - db;
-                    return a.scaleIndex - b.scaleIndex;
+                    // Ties broken by preference, matching the frontend's
+                    // identical arbitration (`skeleton/frontend.ts`). Breaking
+                    // on `scaleIndex` -- a position in the finest-first
+                    // `getSources()` array -- silently discarded the level
+                    // selection and always chose the finest level, because on
+                    // an object-sparsity pyramid every level shares one
+                    // chunk_shape, so every spacing is equal and this branch
+                    // is always reached. The frontend then drew the selected
+                    // level while the backend fetched the finest, so nothing
+                    // ever fetched what was drawn.
+                    return a.fallbackRank - b.fallbackRank;
                   },
                 );
 
