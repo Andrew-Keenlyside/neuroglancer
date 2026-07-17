@@ -47,4 +47,18 @@ with viewer.txn() as s:
     s.layers["tracts"] = neuroglancer.SegmentationLayer(source=TEST_TRACTOGRAM)
     s.layout = "4panel"
 
+    # Load sparse-first. The pyramid holds ~503k / 50k / 5k / 503 / 50 whole
+    # streamlines at levels 0..4; the GPU-memory budget picks the finest level
+    # that fits. Keep it small so a coarse *whole-brain* level loads (raise it
+    # to show more, lower it to show fewer):
+    #   ~20 MB -> level 3 (~503 tracts, fastest),  ~50 MB -> level 2 (~5k),
+    #   large budgets pick the finest level (10^8 vertices) and stall.
+    s.gpu_memory_limit = 50_000_000
+
+    # In the 3-d view, the cross-section planes otherwise draw as opaque grey
+    # quads that hide the tracts. Discard their empty background so the tracts
+    # show through, and outline each plane so its position is still visible.
+    s.hide_cross_section_background_3d = True
+    s.show_cross_section_outline_3d = True
+
 print("Viewer ready:", viewer.get_viewer_url())
