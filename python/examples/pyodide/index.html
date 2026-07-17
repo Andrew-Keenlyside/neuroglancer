@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Neuroglancer – Linear Registration (Pyodide)</title>
+  <title>Streamline Filter — zarr-vectors tractography</title>
   <style>
     html, body {
       margin: 0;
@@ -109,21 +109,23 @@
 </head>
 <body>
   <div id="neuroglancer-pyodide-overlay">
-    <h1>Neuroglancer – Linear Registration</h1>
+    <h1>Streamline Filter</h1>
     <div id="neuroglancer-pyodide-spinner"></div>
     <div id="neuroglancer-pyodide-loading">Initialising…</div>
     <div id="neuroglancer-pyodide-note">
-      Powered by <a href="https://pyodide.org" target="_blank">Pyodide</a>.
-      First load downloads ~40 MB of Python packages; subsequent loads use the
-      browser cache and are much faster.
+      Interactive TrackVis-style ROI filtering for zarr-vectors tractography.
+      Powered by <a href="https://pyodide.org" target="_blank">Pyodide</a> —
+      the first load downloads ~40&nbsp;MB of Python packages; later loads use
+      the browser cache.
     </div>
     <div id="neuroglancer-pyodide-url-section">
-      <p>Optionally paste a Neuroglancer URL to use as the starting state,<br>or click <em>Use demo data</em> to load a built-in example.</p>
+      <p>Load the <em>HCP1065</em> test tractogram, or paste your own
+        <code>gs://…zarrvectors/</code> source as a Neuroglancer URL.</p>
       <input id="neuroglancer-pyodide-url-input" type="text"
-             placeholder="https://neuroglancer-demo.appspot.com/#!{…}" />
+             placeholder="https://…/#!{…}  (a Neuroglancer link)" />
       <div class="neuroglancer-pyodide-url-buttons">
         <button id="neuroglancer-pyodide-btn-url">Load URL</button>
-        <button id="neuroglancer-pyodide-btn-demo">Use demo data</button>
+        <button id="neuroglancer-pyodide-btn-demo">Use test data (HCP1065)</button>
       </div>
     </div>
   </div>
