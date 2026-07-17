@@ -1503,13 +1503,29 @@ export class SegmentationUserLayer extends Base {
       getter: () => new SpatialSkeletonEditTab(this),
       hidden: hideSpatialSkeletonEditTab,
     });
-    // The ROI streamline filter applies to exactly the same zarr-vectors
-    // spatially-indexed tract sources the Skeleton tab gates on.
+    // Show the Filter tab whenever a spatially-indexed skeleton render layer is
+    // present -- i.e. whenever a tractogram is drawn. Unlike the Skeleton *edit*
+    // tab, this must NOT also require the source to implement the skeleton-
+    // editing API (`getSpatiallyIndexedSkeletonSource`): zarr-vectors tracts are
+    // read-only render sources that don't, so gating on it wrongly hid the
+    // filter for exactly the layers it targets. The filter only needs the
+    // streamlines to be rendering.
+    const hideFilterTab = this.registerDisposer(
+      makeCachedLazyDerivedWatchableValue(
+        (layers) =>
+          !layers.some(
+            (layer) =>
+              layer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
+              layer instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer,
+          ),
+        { changed: this.layersChanged, value: this.renderLayers },
+      ),
+    );
     this.tabs.add("filter", {
       label: "Filter",
       order: -40,
       getter: () => new StreamlineFilterTab(this),
-      hidden: hideSpatialSkeletonEditTab,
+      hidden: hideFilterTab,
     });
     const hideGraphTab = this.registerDisposer(
       makeCachedDerivedWatchableValue(
