@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
-import { requestAsyncComputation } from "#src/async_computation/request.js";
 import type { AnnotationGeometryChunkSpecification } from "#src/annotation/base.js";
 import {
   AnnotationGeometryChunkSource,
@@ -26,6 +24,8 @@ import {
   AnnotationType,
   parseAnnotationPropertySpecs,
 } from "#src/annotation/index.js";
+import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
+import { requestAsyncComputation } from "#src/async_computation/request.js";
 import type { ChunkManager } from "#src/chunk_manager/frontend.js";
 import { WithParameters } from "#src/chunk_manager/frontend.js";
 import {
@@ -82,6 +82,14 @@ import { allSiPrefixes, supportedUnits } from "#src/util/si_units.js";
 // zstd decompression helper (object_attributes chunks may be zstd-compressed)
 
 const ZSTD_MAGIC = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]);
+
+/** Keys already warned about, so one diagnostic does not repeat per level. */
+const warnedOnceKeys = new Set<string>();
+function warnOnceFe(key: string, message: string): void {
+  if (warnedOnceKeys.has(key)) return;
+  warnedOnceKeys.add(key);
+  console.warn(message);
+}
 
 function looksLikeZstdFe(bytes: Uint8Array): boolean {
   return (
@@ -302,71 +310,31 @@ function buildCoordinateSpaceFromMultiscales(
   });
 }
 
-/**
- * Read the per-level NGFF ``translation`` transform (datasets[0]) as a
- * length-``rank`` offset in coordinate units, or ``undefined`` when
- * absent / all-zero.  zarr-vectors skeleton stores written with a
- * coordinate shift (chunk-grid alignment) record the world offset here
- * so the layer renders at absolute coordinates.
- */
-function extractNgffTranslation(
-  multiscales: any,
-  rank: number,
-): Float64Array | undefined {
-  const entry = Array.isArray(multiscales) ? multiscales[0] : undefined;
-  const dataset = entry?.datasets?.[0];
-  const t = dataset?.coordinateTransformations?.find(
-    (x: any) => x?.type === "translation",
-  );
-  const arr = t?.translation;
-  if (!Array.isArray(arr)) return undefined;
-  const out = new Float64Array(rank);
-  let nonzero = false;
-  for (let i = 0; i < rank; ++i) {
-    const v = arr[i] !== undefined ? Number(arr[i]) : 0;
-    out[i] = v;
-    if (v !== 0) nonzero = true;
-  }
-  return nonzero ? out : undefined;
-}
-
-/**
- * Identity transform plus a per-axis ``translation`` in the source
- * coordinate units (translation lives in the last column of the
- * column-major homogeneous matrix).  Maps stored positions to world
- * positions, e.g. shifted skeleton vertices back to absolute coords.
- */
-function makeTranslatedTransform(
-  inputSpace: ReturnType<typeof makeCoordinateSpace>,
-  translation: Float64Array,
-) {
-  const rank = inputSpace.rank;
-  const transform = matrix.createIdentity(Float64Array, rank + 1);
-  for (let i = 0; i < rank; ++i) {
-    transform[rank * (rank + 1) + i] = Number(translation[i]);
-  }
-  return {
-    rank,
-    sourceRank: rank,
-    inputSpace,
-    outputSpace: inputSpace,
-    transform,
-  };
-}
-
 async function listAttributeNames(
   sharedKvStoreContext: SharedKvStoreContext,
   levelUrl: string,
   options: Partial<ProgressOptions>,
 ): Promise<string[]> {
   const attributesUrl = joinBaseUrlAndPath(levelUrl, "vertex_attributes/");
-  const response = await sharedKvStoreContext.kvStoreContext
-    .list(attributesUrl, {
+  let response;
+  try {
+    response = await sharedKvStoreContext.kvStoreContext.list(attributesUrl, {
       responseKeys: "suffix",
       ...options,
-    })
-    .catch(() => undefined);
-  if (response === undefined) return [];
+    });
+  } catch (e) {
+    // A genuinely-absent directory lists as empty (no throw); a throw here means
+    // listing failed or is denied (e.g. a bucket without objects.list). Warn
+    // rather than silently reporting "no attributes", which would drop
+    // attribute-based colouring with no diagnostic.
+    warnOnceFe(
+      "vertex-attributes-list",
+      "zarr-vectors: could not list vertex_attributes/ (object listing may be " +
+        "denied on this store); per-vertex attribute-based colouring will be " +
+        `unavailable even if attributes exist. ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return [];
+  }
   // Each subdirectory under vertex_attributes/ is one property.  Strip the
   // trailing "/" if present.
   return response.directories
@@ -564,13 +532,24 @@ async function listObjectAttributeNames(
   options: Partial<ProgressOptions>,
 ): Promise<string[]> {
   const dirUrl = joinBaseUrlAndPath(levelUrl, "object_attributes/");
-  const response = await sharedKvStoreContext.kvStoreContext
-    .list(dirUrl, {
+  let response;
+  try {
+    response = await sharedKvStoreContext.kvStoreContext.list(dirUrl, {
       responseKeys: "suffix",
       ...options,
-    })
-    .catch(() => undefined);
-  if (response === undefined) return [];
+    });
+  } catch (e) {
+    // See listAttributeNames: a throw is a listing failure/denial, not an
+    // absent directory, so warn rather than silently dropping the
+    // segment-properties panel.
+    warnOnceFe(
+      "object-attributes-list",
+      "zarr-vectors: could not list object_attributes/ (object listing may be " +
+        "denied on this store); the segment-properties panel will be unavailable " +
+        `even if object attributes exist. ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return [];
+  }
   return response.directories
     .map((d) => (d.endsWith("/") ? d.slice(0, -1) : d))
     .filter((d) => d.length > 0)
@@ -899,6 +878,59 @@ function computeLevelLimit(
   return level0Limit;
 }
 
+/**
+ * The on-disk format version this reader targets. ZVF 0.9.0 was a breaking
+ * change (connectivity moved to the `links/<delta>/<offsets>/` family and the
+ * single-array chunk layout landed); the spec states pre-0.9 stores are not
+ * readable by 0.9+ readers.
+ */
+const SUPPORTED_ZV_MAJOR = 0;
+const MIN_SUPPORTED_ZV_MINOR = 9;
+
+/**
+ * Gate on `zarr_vectors.zv_version` so a version-driven layout change surfaces a
+ * diagnostic instead of failing silently downstream (as the 0.9 links move did
+ * before this reader was migrated). Throws for a store older than this reader
+ * supports; warns for a missing or newer-than-target version and proceeds.
+ */
+function checkZvVersion(zv: any): void {
+  const raw = zv?.zv_version;
+  if (raw === undefined) {
+    console.warn(
+      "zarr-vectors: store does not declare zv_version; assuming a ZVF " +
+        `${SUPPORTED_ZV_MAJOR}.${MIN_SUPPORTED_ZV_MINOR}-compatible layout.`,
+    );
+    return;
+  }
+  const match = /^(\d+)\.(\d+)(?:\.\d+)?$/.exec(String(raw));
+  if (match === null) {
+    console.warn(
+      `zarr-vectors: unrecognised zv_version ${JSON.stringify(raw)}; ` +
+        "proceeding as if it were the supported version.",
+    );
+    return;
+  }
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  if (
+    major < SUPPORTED_ZV_MAJOR ||
+    (major === SUPPORTED_ZV_MAJOR && minor < MIN_SUPPORTED_ZV_MINOR)
+  ) {
+    throw new Error(
+      `zarr-vectors: store zv_version ${raw} predates the ${SUPPORTED_ZV_MAJOR}.` +
+        `${MIN_SUPPORTED_ZV_MINOR}.0 layout this reader requires (connectivity and ` +
+        "chunk layout changed in 0.9.0). Rewrite the store from source with a current " +
+        "zarr-vectors writer.",
+    );
+  }
+  if (major > SUPPORTED_ZV_MAJOR || minor > MIN_SUPPORTED_ZV_MINOR) {
+    console.warn(
+      `zarr-vectors: store zv_version ${raw} is newer than this reader's target ` +
+        `${SUPPORTED_ZV_MAJOR}.${MIN_SUPPORTED_ZV_MINOR}; newer features may not render.`,
+    );
+  }
+}
+
 async function buildAnnotationMetadata(
   sharedKvStoreContext: SharedKvStoreContext,
   storeUrl: string,
@@ -920,6 +952,7 @@ async function buildAnnotationMetadata(
       "Not a zarr-vectors store: root attributes lack a 'zarr_vectors' block",
     );
   }
+  checkZvVersion(zv);
   // Geometry-type validation lives at the dispatch layer
   // (`ZarrVectorsDataSource.get`) — by the time `buildAnnotationMetadata`
   // is called, the dispatcher has already verified that `geometry_types`
@@ -1128,12 +1161,6 @@ function getAnnotationDataSource(
 interface SkeletonMetadata {
   rank: number;
   coordinateSpace: ReturnType<typeof makeCoordinateSpace>;
-  /**
-   * NGFF world translation (coordinate units), or undefined.  Applied to
-   * the model transform so stored (grid-aligned, shifted) vertices render
-   * at absolute world coordinates.
-   */
-  translation?: Float64Array;
   /** Parameters for the per-segment (pass-2) chunk source. */
   pass2Params: ZarrVectorsObjectKeyedSkeletonSourceParameters;
   /**
@@ -1235,6 +1262,7 @@ async function buildSkeletonMetadata(
       "Not a zarr-vectors store: root attributes lack a 'zarr_vectors' block",
     );
   }
+  checkZvVersion(zv);
   const geometryTypes: string[] = Array.isArray(zv.geometry_types)
     ? zv.geometry_types
     : [];
@@ -1300,6 +1328,21 @@ async function buildSkeletonMetadata(
   const level0Url = kvstoreEnsureDirectoryPipelineUrl(
     pipelineUrlJoin(storeUrl, levelPaths[0]),
   );
+
+  // Whether the store carries a per-fragment `segment_id` attribute. Probed by
+  // a direct GET of its array metadata rather than trusted from each level's
+  // `arrays_present`, which the 0.9 writer leaves incomplete at coarse levels
+  // (it can omit arrays — links, vertex_fragments — that physically exist). The
+  // fragment-attribute schema is store-wide, so level 0's answer holds for every
+  // level. `arrays_present` is kept only as a fallback for pre-0.9 stores that
+  // do not materialise this array.
+  const segmentIdMeta = await getJsonResource(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(level0Url, "fragment_attributes/segment_id/zarr.json"),
+    "fragment_attributes/segment_id metadata",
+    options,
+  );
+  const hasFragmentSegmentIds = segmentIdMeta !== undefined;
 
   // Per-vertex attribute discovery — reuse the annotation-path machinery
   // verbatim; the resulting (attributeNames, attributeDtypes) feed the
@@ -1393,9 +1436,7 @@ async function buildSkeletonMetadata(
   pass2Params.linksConvention = linksConvention;
   pass2Params.geometryKind = geometryKind;
   pass2Params.linkDtype = linkDtype;
-  // Filled in below after per-level metadata is fetched; default true so
-  // older stores (which don't stamp arrays_present) keep their existing behavior.
-  pass2Params.hasFragmentSegmentIds = true;
+  pass2Params.hasFragmentSegmentIds = hasFragmentSegmentIds;
 
   // Pass-1 (spatially-indexed) wiring — only when the store is 3-D.
   // Neuroglancer's spatially-indexed skeleton machinery hardcodes a
@@ -1465,15 +1506,9 @@ async function buildSkeletonMetadata(
                   return arr;
                 })()
               : new Float32Array(rootChunkShapeF32);
-          const arraysPresent: string[] = Array.isArray(
-            lvlAttrs?.arrays_present,
-          )
-            ? lvlAttrs.arrays_present
-            : [];
-          // When arrays_present is not stamped (older stores), assume present.
-          const hasFragmentSegmentIds =
-            arraysPresent.length === 0 ||
-            arraysPresent.includes("fragment_attributes");
+          // `hasFragmentSegmentIds` comes from the store-wide direct probe
+          // above, not this level's `arrays_present` (unreliable at coarse
+          // levels); the fragment-attribute schema does not vary by level.
           const vc = Number(lvlAttrs?.vertex_count);
           const vertexCount = Number.isFinite(vc) && vc > 0 ? vc : undefined;
           const sp = Number(lvlAttrs?.object_sparsity);
@@ -1558,20 +1593,19 @@ async function buildSkeletonMetadata(
     options,
   );
 
-  // Do NOT apply the NGFF per-level `translation` to skeleton/streamline/
-  // polyline/graph vertices.  zarr-vectors writers store vertices in exact
-  // physical coordinates; the per-level NGFF translation is a bin-center
-  // convention (`bin_shape / 2`, written by `create_resolution_level` and
-  // also used to round-trip `bin_shape`) that describes the chunk *grid*, not
-  // the vertex positions.  Applying it shifts every vertex by half a chunk off
-  // its true coordinate (a uniform misregistration — e.g. ~3.2 mm at
-  // chunk_shape ≈ 6.4 mm), which breaks coordinate-based navigation.  All
-  // spatial-index calculations (chunk assignment, cull bounds) are already done
-  // in raw coordinates, so the layer transform must be identity here.
+  // The model transform is identity: zarr-vectors writers store vertices in
+  // exact physical coordinates.  The NGFF per-level `translation` on
+  // `datasets[0]` is a bin-center convention (`chunk_shape / 2`, written by the
+  // resolution-level writer to round-trip `bin_shape`) that describes the chunk
+  // *grid*, not the vertex positions — this store carries [15.5, 16, 17].
+  // Applying it shifts every vertex half a chunk off its true coordinate
+  // (verified by decoding `0/vertices/c/0/0/0`: chunk (0,0,0)'s vertices already
+  // lie within its absolute [0,31)×[0,32)×[0,34) range), which breaks
+  // coordinate-based navigation and alignment with any reference volume.  All
+  // spatial-index calculations already run in raw coordinates.
   return {
     rank,
     coordinateSpace,
-    translation: extractNgffTranslation(rootAttrs.multiscales, rank),
     pass2Params,
     pass1Levels,
     spatialGrid,
@@ -1665,13 +1699,7 @@ function getSkeletonDataSource(
   }
 
   return {
-    modelTransform:
-      metadata.translation !== undefined
-        ? makeTranslatedTransform(
-            metadata.coordinateSpace,
-            metadata.translation,
-          )
-        : makeIdentityTransform(metadata.coordinateSpace),
+    modelTransform: makeIdentityTransform(metadata.coordinateSpace),
     subsources,
   };
 }
@@ -1790,14 +1818,21 @@ export class ZarrVectorsDataSource implements KvStoreBasedDataSourceProvider {
 
         let dataSource: DataSource;
         if (hasSkeletonLike) {
+          // The spec defines two object-index conventions. "standard" maps a
+          // selected segment id to a dense object index via
+          // `object_attributes/segment_id`; "identity" means the selected id IS
+          // the dense index. The backend already degrades to identity when that
+          // attribute is absent (see `resolveObjectIndex`), so both conventions
+          // are supported here.
           const objectIndexConvention = zv.object_index_convention;
           if (
             objectIndexConvention !== "standard" &&
+            objectIndexConvention !== "identity" &&
             objectIndexConvention !== undefined
           ) {
             throw new Error(
               `zarr-vectors datasource: skeleton/polyline/streamline geometry ` +
-                `requires object_index_convention='standard' (got ` +
+                `requires object_index_convention 'standard' or 'identity' (got ` +
                 `${JSON.stringify(objectIndexConvention)})`,
             );
           }
