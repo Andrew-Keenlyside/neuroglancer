@@ -32,11 +32,16 @@ import {
   type Roi,
   type RoiShape,
 } from "#src/datasource/zarr-vectors/roi.js";
-import type {
+import {
   RoiFilterState,
-  RoiGroup,
+  type RoiGroup,
 } from "#src/datasource/zarr-vectors/roi_filter_state.js";
+import { deleteLayer, makeLayer } from "#src/layer/index.js";
 import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
+import {
+  LINKED_SEGMENTATION_GROUP_JSON_KEY,
+  ROI_FILTER_JSON_KEY,
+} from "#src/layer/segmentation/json_keys.js";
 import { TrackableBooleanCheckbox } from "#src/trackable_boolean.js";
 import type { WatchableValueInterface } from "#src/trackable_value.js";
 import type { Uint64Set } from "#src/uint64_set.js";
@@ -321,8 +326,134 @@ export class StreamlineFilterTab extends Tab {
         this.onChanged();
       },
     });
-    addGroup.classList.add("neuroglancer-streamline-filter-add-group");
-    el.appendChild(addGroup);
+    const addGroupAsLayer = makeIcon({
+      text: "+ New group as layer",
+      title:
+        "Create a new tract group in a layer of its own, on the same data. " +
+        "The new layer has its own visibility, ordering and render controls.",
+      onClick: () => this.addGroupAsLayer(),
+    });
+    addGroupAsLayer.classList.add("neuroglancer-streamline-filter-add-group");
+
+    const addRow = document.createElement("div");
+    addRow.classList.add("neuroglancer-streamline-filter-add-row");
+    addRow.appendChild(addGroup);
+    addRow.appendChild(addGroupAsLayer);
+    el.appendChild(addRow);
+  }
+
+  /**
+   * Create a sibling layer on the same data, carrying one empty group.
+   *
+   * The group is created ONLY in the new layer. Each layer runs its own
+   * dissection -- the recompute lives on the render-layer backend, not on the
+   * shared chunk source -- so duplicating a group into both would evaluate the
+   * same regions twice against the same geometry for no benefit. Moving the
+   * work rather than copying it keeps the total roughly constant.
+   *
+   * The underlying data is not re-fetched: chunk sources are memoised by their
+   * parameters on the viewer-wide chunk manager, so both layers share the
+   * resolved data source, its metadata and its decoded chunks.
+   */
+  private addGroupAsLayer(existing?: RoiGroup) {
+    const { layer } = this;
+    const { managedLayer, manager } = layer;
+
+    // A throwaway state seeds the group, so the new layer's group gets exactly
+    // the same defaults, palette colour and JSON shape as `addGroup()` would --
+    // or, when separating an existing group, carries it across verbatim.
+    const seed = new RoiFilterState();
+    if (existing === undefined) {
+      seed.addGroup();
+    } else {
+      seed.insertGroup(existing);
+    }
+    seed.active = true;
+    // The tractogram's ghost context is the ORIGINAL layer's job. Both layers
+    // draw every streamline, so leaving the default ghost alpha here would
+    // stack two ghost passes and read as a uniformly darker, denser brain.
+    seed.ghostAlpha = 0;
+
+    const spec = layer.toJSON();
+    spec[ROI_FILTER_JSON_KEY] = seed.toJSON();
+    // Cloning tool state would let the copy steal the original's bindings.
+    delete spec.tool;
+    delete spec.toolBindings;
+
+    // Link the new layer's segmentation group to the one it came from, so the
+    // two are views of a single segmentation rather than two that merely happen
+    // to share a URL: selecting or hiding a tract in either is reflected in
+    // both. `??=` preserves an existing link -- if the parent is already linked
+    // to some other layer, the copy joins that same group rather than starting
+    // a competing one -- and otherwise points at the parent itself.
+    //
+    // The colour group follows automatically: `restoreState` defaults it to the
+    // segmentation group's name whenever the colour key is absent, and the key
+    // is only written when the two roots differ. Per-group ROI colours are
+    // unaffected either way, since those ride a dedicated per-layer map rather
+    // than the shared stated-colour map.
+    spec[LINKED_SEGMENTATION_GROUP_JSON_KEY] ??= managedLayer.name;
+
+    const groupName = seed.groups[0]?.name ?? "Group 1";
+    const newLayer = makeLayer(
+      manager,
+      `${managedLayer.name} / ${groupName}`,
+      spec,
+    );
+    // Adjacent to its parent; `add` uniquifies the name.
+    const parentIndex =
+      manager.layerManager.managedLayers.indexOf(managedLayer);
+    manager.add(newLayer, parentIndex !== -1 ? parentIndex + 1 : undefined);
+
+    const { selectedLayer } = manager.root;
+    selectedLayer.layer = newLayer;
+    selectedLayer.visible = true;
+
+    // Separating MOVES the group: it now lives in the new layer. Leaving a copy
+    // behind would evaluate the same dissection twice against the same geometry
+    // (each layer runs its own), and both copies would draw.
+    if (existing !== undefined) {
+      this.roiFilter.removeGroup(existing.id);
+    }
+  }
+
+  /**
+   * The layer this one's segmentation group is linked to, if it is not itself
+   * the root -- i.e. the "main" layer a separated group can be merged back into.
+   *
+   * The link group's own predicate guarantees members are segmentation layers,
+   * so this needs no `instanceof`: importing the class for one would create a
+   * cycle, since the segmentation layer imports this tab.
+   */
+  private mergeTarget(): SegmentationUserLayer | undefined {
+    const root = this.layer.displayState.linkedSegmentationGroup.root.value as
+      | SegmentationUserLayer
+      | undefined;
+    if (root === undefined || root === this.layer) return undefined;
+    return root.displayState?.roiFilter === undefined ? undefined : root;
+  }
+
+  /**
+   * Move a group back into the layer this one is linked to.
+   *
+   * The inverse of separating. If that empties this layer, it is removed: an
+   * ROI-filter layer with no groups has an inactive filter, which means it stops
+   * ghosting and draws the whole tractogram at full strength — so a leftover
+   * empty layer would silently double the tractogram rather than being merely
+   * redundant.
+   */
+  private mergeGroupInto(group: RoiGroup, target: SegmentationUserLayer) {
+    target.displayState.roiFilter.insertGroup(group);
+    target.displayState.roiFilter.active = true;
+    this.roiFilter.removeGroup(group.id);
+
+    if (this.roiFilter.groups.length === 0) {
+      const { managedLayer, manager } = this.layer;
+      const { selectedLayer } = manager.root;
+      selectedLayer.layer = target.managedLayer;
+      selectedLayer.visible = true;
+      deleteLayer(managedLayer);
+    }
   }
 
   private makeGroupRow(group: RoiGroup, expanded: boolean): HTMLElement {
@@ -381,6 +512,43 @@ export class StreamlineFilterTab extends Tab {
       this.roiFilter.updateGroup(group.id, { visible: visible.checked }),
     );
     row.appendChild(visible);
+
+    // Separate / merge. The row's background click toggles expansion unless the
+    // target is an input or button, and `makeIcon` returns a div — so both of
+    // these must stop propagation or clicking them would also collapse the
+    // group out from under the user.
+    const target = this.mergeTarget();
+    if (target === undefined) {
+      const separate = makeIcon({
+        text: "⇗",
+        title:
+          "Move this group into a layer of its own, linked to this one. " +
+          "Its tracts get their own visibility, ordering and render controls.",
+        onClick: (e) => {
+          e.stopPropagation();
+          // Re-read by id: `group` was captured when this row was built, and
+          // moving an ROI does not change the structural signature that would
+          // have rebuilt it, so the captured object can be stale.
+          const current = this.currentGroup(group.id);
+          if (current !== undefined) this.addGroupAsLayer(current);
+        },
+      });
+      separate.classList.add("neuroglancer-streamline-filter-group-action");
+      row.appendChild(separate);
+    } else {
+      const merge = makeIcon({
+        text: "⇙",
+        title: `Move this group back into “${target.managedLayer.name}”`,
+        onClick: (e) => {
+          e.stopPropagation();
+          // Re-read by id; see the note on the separate action above.
+          const current = this.currentGroup(group.id);
+          if (current !== undefined) this.mergeGroupInto(current, target);
+        },
+      });
+      merge.classList.add("neuroglancer-streamline-filter-group-action");
+      row.appendChild(merge);
+    }
 
     row.appendChild(
       makeDeleteButton({

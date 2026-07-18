@@ -330,6 +330,22 @@ export class RoiFilterState {
     return id;
   }
 
+  /**
+   * Append an existing group's contents as a new group; returns its new id.
+   *
+   * Used to move a group between layers. `addGroup` + `updateGroup` cannot do
+   * this -- `updateGroup` deliberately does not take `rois`, and rebuilding the
+   * ROIs one `addRoi` at a time would dispatch `changed` per ROI, firing a
+   * filter recompute for each intermediate state. The id is reassigned because
+   * ids are only unique within one state.
+   */
+  insertGroup(group: Omit<RoiGroup, "id">): number {
+    const id = this.nextGroupId_++;
+    this.groups_ = [...this.groups_, { ...group, id }];
+    this.changed.dispatch();
+    return id;
+  }
+
   removeGroup(id: number): void {
     const next = this.groups_.filter((g) => g.id !== id);
     if (next.length === this.groups_.length) return;

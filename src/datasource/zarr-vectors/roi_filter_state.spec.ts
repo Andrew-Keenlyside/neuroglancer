@@ -230,3 +230,89 @@ describe("RoiFilterState serialization", () => {
     expect(s.groups[0].name).toBe("Group 1");
   });
 });
+
+const f32 = (...xs: number[]) => Float32Array.from(xs);
+
+describe("insertGroup", () => {
+  it("carries a group's contents across states intact", () => {
+    // Separating a group to its own layer, and merging it back, both move a
+    // group between two independent RoiFilterStates. Nothing about it may be
+    // lost in transit except the id, which is only unique within one state.
+    const source = new RoiFilterState();
+    const id = source.addGroup();
+    source.updateGroup(id, {
+      name: "Corticospinal",
+      color: vec3.fromValues(0.25, 0.5, 0.75),
+      visible: false,
+      opacity: 0.4,
+    });
+    source.addRoi(id, {
+      shape: { kind: "ellipsoid", center: f32(1, 2, 3), radii: f32(4, 5, 6) },
+      predicate: RoiPredicate.ANY_VERTEX,
+      operator: RoiOperator.ANDNOT,
+    });
+    source.addRoi(id, {
+      shape: { kind: "box", lower: f32(0, 0, 0), upper: f32(9, 9, 9) },
+      predicate: RoiPredicate.ANY_SEGMENT,
+      operator: RoiOperator.OR,
+    });
+    const original = source.groups[0];
+
+    const target = new RoiFilterState();
+    const newId = target.insertGroup(original);
+
+    const moved = target.groups[0];
+    expect(target.groups).toHaveLength(1);
+    expect(moved.id).toBe(newId);
+    expect(moved.name).toBe("Corticospinal");
+    expect(moved.visible).toBe(false);
+    expect(moved.opacity).toBe(0.4);
+    expect(Array.from(moved.color)).toEqual(Array.from(original.color));
+    expect(moved.rois).toEqual(original.rois);
+
+    // The two states are now independent: the source still holds its copy
+    // until the caller removes it, and editing one must not touch the other.
+    source.removeGroup(id);
+    expect(source.groups).toHaveLength(0);
+    expect(target.groups).toHaveLength(1);
+    expect(target.groups[0].rois).toHaveLength(2);
+  });
+
+  it("survives a round trip through JSON", () => {
+    // Separating goes via toJSON/restoreState (the new layer is built from a
+    // spec), so a moved group must also survive serialisation.
+    const source = new RoiFilterState();
+    const id = source.addGroup();
+    source.updateGroup(id, { name: "Arcuate", opacity: 0.6 });
+    source.addRoi(id, {
+      shape: { kind: "box", lower: f32(-1, -2, -3), upper: f32(1, 2, 3) },
+      predicate: RoiPredicate.ANY_SEGMENT,
+      operator: RoiOperator.AND,
+    });
+
+    const carrier = new RoiFilterState();
+    carrier.insertGroup(source.groups[0]);
+    carrier.active = true;
+    carrier.ghostAlpha = 0;
+
+    const restored = new RoiFilterState();
+    restored.restoreState(carrier.toJSON());
+
+    expect(restored.groups).toHaveLength(1);
+    expect(restored.groups[0].name).toBe("Arcuate");
+    expect(restored.groups[0].opacity).toBeCloseTo(0.6);
+    expect(restored.groups[0].rois).toHaveLength(1);
+    expect(restored.ghostAlpha).toBe(0);
+    expect(restored.active).toBe(true);
+  });
+
+  it("assigns ids that do not collide with existing groups", () => {
+    const target = new RoiFilterState();
+    const existing = target.addGroup();
+    const source = new RoiFilterState();
+    source.addGroup();
+    const moved = target.insertGroup(source.groups[0]);
+    expect(moved).not.toBe(existing);
+    expect(new Set(target.groups.map((g) => g.id)).size).toBe(2);
+  });
+});

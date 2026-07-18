@@ -196,3 +196,21 @@
   opacity: 0.3;
   pointer-events: none;
 }
+
+/* The two group-creation actions sit on one row: in this layer, or in its own. */
+.neuroglancer-streamline-filter-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Separate-to-layer / merge-back action on a group row. */
+.neuroglancer-streamline-filter-group-action {
+  flex: 0 0 auto;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.neuroglancer-streamline-filter-group-action:hover {
+  opacity: 1;
+}
