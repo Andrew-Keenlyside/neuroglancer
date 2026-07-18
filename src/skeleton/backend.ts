@@ -23,6 +23,16 @@ import {
   withChunkManager,
 } from "#src/chunk_manager/backend.js";
 import { ChunkState } from "#src/chunk_manager/base.js";
+import type { Roi } from "#src/datasource/zarr-vectors/roi.js";
+// Pure ROI geometry (no zarr/render deps) drives the streamline filter's
+// backend recompute for zarr-vectors spatially-indexed skeleton (tract) layers.
+// Inert for every other skeleton layer: the whole feature is guarded on the
+// per-layer `roiPassingSegments` shared set being present (undefined here).
+import {
+  computePassingSet,
+  diffPassingSet,
+  type RoiFilterableChunk,
+} from "#src/datasource/zarr-vectors/roi_filter_backend.js";
 import { decodeVertexPositionsAndIndices } from "#src/mesh/backend.js";
 import {
   type DisplayDimensionRenderInfo,
@@ -68,6 +78,7 @@ import {
   type SliceViewProjectionParameters,
   type TransformedSource,
 } from "#src/sliceview/base.js";
+import type { Uint64Set } from "#src/uint64_set.js";
 import type { TypedNumberArray } from "#src/util/array.js";
 import type { Endianness } from "#src/util/endian.js";
 import { vec3 } from "#src/util/geom.js";
@@ -454,6 +465,18 @@ export class SpatiallyIndexedSkeletonChunk
   nodeIds: Int32Array | undefined;
   nodeSourceStates: Array<SpatialSkeletonSourceState | undefined> | undefined;
 
+  /**
+   * Slim view of this chunk's decoded geometry retained for the ROI streamline
+   * filter (zarr-vectors tract layers only; `undefined` for every other
+   * source). Set by the zarr-vectors pass-1 `download()`. It aliases the same
+   * `positions`/`segmentIds` buffers the chunk decoded: `serializeSkeletonChunkData`
+   * packs a *copy* of those into the transferred message and only transfers
+   * `indices.buffer`, so these references stay valid (un-detached) after
+   * serialize + `freeSkeletonChunkSystemMemory`, letting the render-layer
+   * backend re-filter within memory when the ROI list changes — no refetch.
+   */
+  roiFilterableChunk?: RoiFilterableChunk;
+
   freeSystemMemory() {
     freeSkeletonChunkSystemMemory(this);
   }
@@ -522,6 +545,21 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   skeletonGridResolutionTarget3d: SharedWatchableValue<number>;
   private pendingLodCleanup = false;
 
+  // ROI streamline filter (zarr-vectors tract layers only). All three are set
+  // together, or all left undefined for every other skeleton layer — in which
+  // case the recompute is a no-op and this layer behaves exactly as before.
+  //   - roiPassingSegments: shared set of object ids that pass the filter; this
+  //     backend mutates it, the frontend's twin drives the ghosting shader.
+  //   - roiConfig: the ordered ROI list (plain serialisable geometry).
+  //   - roiFilterActive: whether the filter is applied.
+  roiPassingSegments?: Uint64Set;
+  roiConfig?: SharedWatchableValue<readonly Roi[]>;
+  roiFilterActive?: SharedWatchableValue<boolean>;
+  /** Set when an ROI edit / toggle needs a recompute even if chunks are unchanged. */
+  private roiRecomputePending = false;
+  /** Signature of the last resident-chunk set filtered over, to skip redundant recomputes. */
+  private roiLastChunkSignature = "";
+
   constructor(rpc: RPC, options: any) {
     super(rpc, options);
     this.renderScaleTarget = rpc.get(options.renderScaleTarget);
@@ -583,6 +621,10 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     );
     this.registerDisposer(
       this.chunkManager.recomputeChunkPrioritiesLate.add(() => {
+        // Re-run the ROI filter after chunk priorities settle, so the passing
+        // set reflects exactly the chunks now resident at the current level.
+        // A no-op unless this is an ROI-filtered (zarr-vectors tract) layer.
+        this.maybeRecomputeRoiPassingSet();
         if (!this.pendingLodCleanup) return;
         const sources = new Set<SpatiallyIndexedSkeletonSourceBackend>();
         for (const attachment of this.attachments.values()) {
@@ -606,6 +648,107 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         this.pendingLodCleanup = false;
       }),
     );
+
+    // ROI streamline filter channel (present only for zarr-vectors tract
+    // layers). An ROI edit or an active toggle needs a recompute even when the
+    // resident chunk set is unchanged; schedule one and let the late-priorities
+    // hook run it. The changed handlers on `roiConfig`/`roiFilterActive` also
+    // fire when the LOD sliders debounce the level, keeping the two in step.
+    if (options.roiPassingSegments !== undefined) {
+      this.roiPassingSegments = rpc.get(options.roiPassingSegments);
+      const roiConfig = (this.roiConfig = rpc.get(options.roiConfig));
+      const roiFilterActive = (this.roiFilterActive = rpc.get(
+        options.roiFilterActive,
+      ));
+      const scheduleRoiRecompute = () => {
+        this.roiRecomputePending = true;
+        this.chunkManager.scheduleUpdateChunkPriorities();
+      };
+      this.registerDisposer(roiConfig.changed.add(scheduleRoiRecompute));
+      this.registerDisposer(roiFilterActive.changed.add(scheduleRoiRecompute));
+    }
+  }
+
+  /**
+   * Object-id sources this layer can ROI-filter: the pass-1 skeleton sources
+   * behind every attachment, de-duplicated (the same source backs both the 2-d
+   * and 3-d views).
+   */
+  private *roiFilterableSources(): Iterable<SpatiallyIndexedSkeletonSourceBackend> {
+    const seen = new Set<SpatiallyIndexedSkeletonSourceBackend>();
+    for (const attachment of this.attachments.values()) {
+      const attachmentState = attachment.state as
+        | SpatiallyIndexedSkeletonRenderLayerAttachmentState
+        | undefined;
+      if (attachmentState === undefined) continue;
+      for (const scales of attachmentState.transformedSources) {
+        for (const tsource of scales) {
+          const source = tsource.source as SpatiallyIndexedSkeletonSourceBackend;
+          if (!seen.has(source)) {
+            seen.add(source);
+            yield source;
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Recompute which loaded streamlines pass the ROI filter and push the delta
+   * to the shared passing set. A no-op for non-ROI (non-tract) layers.
+   *
+   * Full recompute over the resident chunks at the current 2-d/3-d levels
+   * (chunk ids are level-specific, so restricting to the live levels avoids a
+   * stale coarser level's ids polluting the set). One backend serves both the
+   * perspective and slice views of a tract layer, so its attachments span both
+   * — the recompute sees every resident source. Skipped when neither the ROI
+   * list nor the resident chunk set has changed since the last run, so a plain
+   * camera move (which also fires this hook) costs only the cheap signature
+   * scan. The delta is applied to the passing set as an add batch and a remove
+   * batch, since the frontend's GPU hash table re-uploads wholesale per change.
+   */
+  private maybeRecomputeRoiPassingSet() {
+    const passingSet = this.roiPassingSegments;
+    if (
+      passingSet === undefined ||
+      this.roiConfig === undefined ||
+      this.roiFilterActive === undefined
+    ) {
+      return;
+    }
+    const active = this.roiFilterActive.value;
+    const rois = active ? this.roiConfig.value : [];
+    const liveLods = new Set<number>([
+      this.skeletonLod.value,
+      this.skeletonLod2d.value,
+    ]);
+    const chunks: RoiFilterableChunk[] = [];
+    const keys: string[] = [];
+    if (rois.length !== 0) {
+      for (const source of this.roiFilterableSources()) {
+        for (const chunk of source.chunks.values()) {
+          const c = chunk as SpatiallyIndexedSkeletonChunk;
+          if (c.roiFilterableChunk !== undefined && liveLods.has(c.lod)) {
+            chunks.push(c.roiFilterableChunk);
+            keys.push(c.key ?? "");
+          }
+        }
+      }
+    }
+    const signature = active ? keys.sort().join(",") : "inactive";
+    if (!this.roiRecomputePending && signature === this.roiLastChunkSignature) {
+      return;
+    }
+    this.roiRecomputePending = false;
+    this.roiLastChunkSignature = signature;
+
+    const target = computePassingSet(chunks, rois);
+    const current = new Set<bigint>(passingSet.keys());
+    const { added, removed } = diffPassingSet(target, current);
+    // Batch each direction into one RPC mutation (the GPU hash table re-uploads
+    // wholesale per mutation, so two calls beat 2N).
+    if (removed.length !== 0) passingSet.delete(removed);
+    if (added.length !== 0) passingSet.add(added);
   }
 
   attach(

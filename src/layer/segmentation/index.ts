@@ -29,6 +29,7 @@ import {
   LocalDataSource,
   localEquivalencesUrl,
 } from "#src/datasource/local.js";
+import type { Roi } from "#src/datasource/zarr-vectors/roi.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import { StreamlineFilterTab } from "#src/datasource/zarr-vectors/streamline_filter_tab.js";
 import type {
@@ -850,6 +851,20 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   skeletonLod = trackableFiniteFloat(0.0);
   /** TrackVis-style ROI streamline filter (zarr-vectors); persists to the URL. */
   roiFilter = new RoiFilterState();
+  /**
+   * ROI-filter data channel, created lazily by {@link ensureRoiFilterChannel}
+   * only when a zarr-vectors spatially-indexed skeleton (tract) source loads;
+   * left undefined otherwise, so the skeleton shader's ROI tier stays inert for
+   * every other segmentation layer. Mirror the persisted {@link roiFilter}
+   * (URL truth) into non-persisted watchables the render layer / backend read:
+   * `roiConfig`/`roiFilterActive` feed the worker's passing-set recompute,
+   * `roiFilterActive`/`roiGhostAlpha` drive the shader uniforms, and the worker
+   * mutates `roiPassingSegments` to say which streamlines survive.
+   */
+  roiPassingSegments?: Uint64Set;
+  roiFilterActive?: WatchableValue<boolean>;
+  roiGhostAlpha?: WatchableValue<number>;
+  roiConfig?: WatchableValue<readonly Roi[]>;
   spatialSkeletonGridLevel2d = new TrackableValue<number>(
     0,
     verifyNonnegativeInt,
@@ -1835,6 +1850,46 @@ export class SegmentationUserLayer extends Base {
     this.spatialSkeletonState.markNodeDataChanged(options);
   }
 
+  /**
+   * Create the ROI streamline-filter data channel once, on first sight of a
+   * zarr-vectors spatially-indexed (tract) source. Idempotent — later calls
+   * return immediately.
+   *
+   * Bridges the persisted {@link RoiFilterState} (URL truth) to the render
+   * layer / worker: `roiConfig`, `roiFilterActive`, and `roiGhostAlpha` mirror
+   * it into plain watchables (the render layer wraps the first two as shared
+   * objects for the worker's passing-set recompute, and the shader reads
+   * active/ghostAlpha as uniforms); `roiPassingSegments` is the shared set the
+   * worker fills with the ids that survive the filter and the shader ghosts the
+   * rest against. All four are disposed with the layer.
+   */
+  private ensureRoiFilterChannel() {
+    const displayState = this.displayState;
+    if (displayState.roiPassingSegments !== undefined) return;
+    const rpc = this.manager.chunkManager.rpc!;
+    const roiFilter = displayState.roiFilter;
+    const passingSegments = this.registerDisposer(
+      Uint64Set.makeWithCounterpart(rpc),
+    );
+    const active = new WatchableValue<boolean>(roiFilter.active);
+    const ghostAlpha = new WatchableValue<number>(roiFilter.ghostAlpha);
+    const config = new WatchableValue<readonly Roi[]>(roiFilter.rois);
+    // Push URL-truth changes into the non-persisted watchables. Each setter
+    // only dispatches when its value actually changed, so an unrelated edit
+    // (e.g. colour-by-group) does not needlessly re-trigger a worker recompute.
+    this.registerDisposer(
+      roiFilter.changed.add(() => {
+        active.value = roiFilter.active;
+        ghostAlpha.value = roiFilter.ghostAlpha;
+        config.value = roiFilter.rois;
+      }),
+    );
+    displayState.roiPassingSegments = passingSegments;
+    displayState.roiFilterActive = active;
+    displayState.roiGhostAlpha = ghostAlpha;
+    displayState.roiConfig = config;
+  }
+
   activateDataSubsources(subsources: Iterable<LoadedDataSubsource>) {
     const updatedSegmentPropertyMaps: SegmentPropertyMap[] = [];
     const isGroupRoot =
@@ -1931,6 +1986,16 @@ export class SegmentationUserLayer extends Base {
           );
         }
         loadedSubsource.activate(() => {
+          // A zarr-vectors tract source enables the ROI streamline filter:
+          // create the data channel on the real display state *before* the
+          // spread below copies it into the per-activation display state the
+          // render layers receive (which is what lights up the shader tier).
+          if (
+            mesh instanceof MultiscaleSpatiallyIndexedSkeletonSource ||
+            mesh instanceof SpatiallyIndexedSkeletonSource
+          ) {
+            this.ensureRoiFilterChannel();
+          }
           const displayState = {
             ...this.displayState,
             transform: loadedSubsource.getRenderLayerTransform(),

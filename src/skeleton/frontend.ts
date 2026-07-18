@@ -21,6 +21,7 @@ import {
   ChunkRenderLayerFrontend,
   ChunkSource,
 } from "#src/chunk_manager/frontend.js";
+import type { Roi } from "#src/datasource/zarr-vectors/roi.js";
 import { hashCombine } from "#src/gpu_hash/hash_function.js";
 import type { HashMapUint64, HashSetUint64 } from "#src/gpu_hash/hash_table.js";
 import { GPUHashTable, HashSetShaderManager } from "#src/gpu_hash/shader.js";
@@ -1357,6 +1358,12 @@ export interface SkeletonLayerDisplayState extends SegmentationDisplayState3D {
   roiPassingSegments?: Uint64Set;
   roiFilterActive?: WatchableValueInterface<boolean>;
   roiGhostAlpha?: WatchableValueInterface<number>;
+  /**
+   * The ordered ROI list, threaded to the backend (which recomputes
+   * `roiPassingSegments` from it). Plain serialisable geometry — carried here
+   * only to hand to the render layer's shared-object counterpart.
+   */
+  roiConfig?: WatchableValueInterface<readonly Roi[]>;
 }
 
 export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
@@ -3065,7 +3072,7 @@ export class SpatiallyIndexedSkeletonLayer
       ),
     );
 
-    sharedObject.initializeCounterpart(rpc, {
+    const counterpartOptions: { [key: string]: any } = {
       chunkManager: chunkManager.rpcId,
       localPosition: this.registerDisposer(
         SharedWatchableValue.makeFromExisting(rpc, this.localPosition),
@@ -3077,7 +3084,42 @@ export class SpatiallyIndexedSkeletonLayer
       skeletonGridLevel2d: skeletonGridLevel2dWatchable.rpcId,
       skeletonGridResolutionTarget3d:
         skeletonGridResolutionTarget3dWatchable.rpcId,
-    });
+    };
+
+    // ROI streamline filter channel (zarr-vectors tract layers only): hand the
+    // backend the ROI list + active flag (so it recomputes the passing set) and
+    // the shared passing set it mutates. `roiPassingSegments` is already a
+    // shared object (it drives this layer's shader too); `roiConfig` /
+    // `roiFilterActive` are wrapped from the plain display-state watchables the
+    // way `skeletonLod` is. When the backend mutates the passing set, redraw so
+    // the ghosting shader picks up the newly (un)passing segments.
+    if (
+      displayState.roiPassingSegments !== undefined &&
+      displayState.roiConfig !== undefined &&
+      displayState.roiFilterActive !== undefined
+    ) {
+      counterpartOptions.roiPassingSegments =
+        displayState.roiPassingSegments.rpcId;
+      counterpartOptions.roiConfig = this.registerDisposer(
+        SharedWatchableValue.makeFromExisting(rpc, displayState.roiConfig),
+      ).rpcId;
+      counterpartOptions.roiFilterActive = this.registerDisposer(
+        SharedWatchableValue.makeFromExisting(rpc, displayState.roiFilterActive),
+      ).rpcId;
+      const roiRedraw = () => this.redrawNeeded.dispatch();
+      // The passing set changing means different segments (un)ghost; the active
+      // flag and ghost opacity feed shader uniforms directly. All three need a
+      // redraw.
+      this.registerDisposer(
+        displayState.roiPassingSegments.changed.add(roiRedraw),
+      );
+      this.registerDisposer(displayState.roiFilterActive.changed.add(roiRedraw));
+      if (displayState.roiGhostAlpha !== undefined) {
+        this.registerDisposer(displayState.roiGhostAlpha.changed.add(roiRedraw));
+      }
+    }
+
+    sharedObject.initializeCounterpart(rpc, counterpartOptions);
     this.backend = sharedObject;
     this.gpuBrowseExcludedSegmentsHashTable = this.registerDisposer(
       GPUHashTable.get(this.gl, this.browseExcludedSegments.hashTable),

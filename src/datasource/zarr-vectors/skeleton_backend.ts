@@ -605,6 +605,23 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
       attrs.push(withBridges.segmentIds);
     }
     chunk.vertexAttributes = attrs;
+
+    // Retain a slim view of this chunk's geometry for the ROI streamline
+    // filter: the render-layer backend re-tests it whenever the ROI list
+    // changes, so the filter runs within memory without refetching. Only when
+    // a segment column exists — otherwise geometry cannot be attributed to an
+    // object and there is nothing to test. The decoded `SkeletonChunk` already
+    // has exactly the `RoiFilterableChunk` shape, and these references stay
+    // valid after serialize (see `roiFilterableChunk`'s docstring).
+    if (withBridges.segmentIds !== undefined) {
+      chunk.roiFilterableChunk = {
+        rank,
+        numVertices: withBridges.numVertices,
+        positions: withBridges.positions,
+        segmentIds: withBridges.segmentIds,
+        fragmentIndex: withBridges.fragmentIndex,
+      };
+    }
   }
 }
 

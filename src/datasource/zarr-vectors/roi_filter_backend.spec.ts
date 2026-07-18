@@ -25,6 +25,8 @@ import {
 } from "#src/datasource/zarr-vectors/roi.js";
 import {
   computeChunkCrossings,
+  computePassingSet,
+  diffPassingSet,
   RoiFilterAccumulator,
   type RoiFilterableChunk,
 } from "#src/datasource/zarr-vectors/roi_filter_backend.js";
@@ -252,5 +254,75 @@ describe("RoiFilterAccumulator", () => {
     expect([...acc.passingSet]).toEqual([]);
     // After reset the same object can be re-added cleanly.
     expect(acc.addChunk(new Map([[1n, [true]]])).added).toEqual([1n]);
+  });
+});
+
+describe("computePassingSet", () => {
+  // Two chunks of one object (id 42): frag in chunk 1 crosses A, frag in
+  // chunk 2 crosses B. Under "A AND B", the object passes only when both
+  // chunks are folded in — the whole point of recomputing over the batch.
+  const rois = [roi(sphere(0, 0, 0, 1), RoiOperator.AND), roi(sphere(10, 0, 0, 1), RoiOperator.AND)];
+  const chunkCrossesA: RoiFilterableChunk = {
+    rank: 3,
+    numVertices: 2,
+    positions: Float32Array.from([-5, 0, 0, 5, 0, 0]),
+    segmentIds: segColumn([42n, 42n]),
+    fragmentIndex: rangeIndex([[0, 2]]),
+  };
+  const chunkCrossesB: RoiFilterableChunk = {
+    rank: 3,
+    numVertices: 2,
+    positions: Float32Array.from([5, 0, 0, 15, 0, 0]),
+    segmentIds: segColumn([42n, 42n]),
+    fragmentIndex: rangeIndex([[0, 2]]),
+  };
+
+  it("passes an object only when the whole batch satisfies the fold", () => {
+    expect([...computePassingSet([chunkCrossesA], rois)]).toEqual([]);
+    expect([...computePassingSet([chunkCrossesA, chunkCrossesB], rois)]).toEqual([
+      42n,
+    ]);
+  });
+
+  it("is order-independent across chunks", () => {
+    const a = computePassingSet([chunkCrossesA, chunkCrossesB], rois);
+    const b = computePassingSet([chunkCrossesB, chunkCrossesA], rois);
+    expect([...a].sort()).toEqual([...b].sort());
+  });
+
+  it("returns an empty set for an empty ROI list (no filter)", () => {
+    expect(computePassingSet([chunkCrossesA, chunkCrossesB], []).size).toBe(0);
+  });
+
+  it("forgets chunks not in the batch (unlike the accumulator)", () => {
+    // Recomputing over only chunk B drops object 42, which a never-forgetting
+    // accumulator would still report from a prior addChunk of chunk A.
+    const single = [roi(sphere(0, 0, 0, 1), RoiOperator.AND)];
+    expect([...computePassingSet([chunkCrossesA], single)]).toEqual([42n]);
+    expect([...computePassingSet([chunkCrossesB], single)]).toEqual([]);
+  });
+});
+
+describe("diffPassingSet", () => {
+  it("reports adds and removes to turn current into target", () => {
+    const diff = diffPassingSet(new Set([1n, 2n, 3n]), new Set([2n, 3n, 4n]));
+    expect(diff.added.sort()).toEqual([1n]);
+    expect(diff.removed.sort()).toEqual([4n]);
+  });
+
+  it("is empty when the sets already match (makes a redundant recompute free)", () => {
+    const diff = diffPassingSet(new Set([5n, 6n]), new Set([6n, 5n]));
+    expect(diff).toEqual({ added: [], removed: [] });
+  });
+
+  it("adds everything against an empty current, removes everything against an empty target", () => {
+    expect(diffPassingSet(new Set([1n, 2n]), new Set()).added.sort()).toEqual([
+      1n,
+      2n,
+    ]);
+    expect(diffPassingSet(new Set(), new Set([1n, 2n])).removed.sort()).toEqual([
+      1n,
+      2n,
+    ]);
   });
 });

@@ -188,3 +188,52 @@ export class RoiFilterAccumulator {
     this.passing.clear();
   }
 }
+
+/**
+ * Full recompute of the passing-object set from a batch of chunks.
+ *
+ * Unlike {@link RoiFilterAccumulator}, which folds chunks in incrementally and
+ * cannot forget a chunk, this recomputes from scratch over exactly the chunks
+ * given. The render layer uses it when it cannot cheaply diff the resident set
+ * (an ROI edit, an LOD switch, an eviction): it is simpler and robustly correct
+ * to rebuild from the current residents than to track per-chunk removals, and
+ * at the interactive (coarse-LOD) operating point the chunk count is small.
+ *
+ * An empty ROI list yields an empty set (the caller treats "no ROIs" as "no
+ * filter" — every streamline passes, so nothing is ghosted, so no id need be
+ * listed as passing).
+ */
+export function computePassingSet(
+  chunks: Iterable<RoiFilterableChunk>,
+  rois: readonly Roi[],
+): Set<bigint> {
+  const accumulator = new RoiFilterAccumulator(rois);
+  if (rois.length !== 0) {
+    for (const chunk of chunks) {
+      accumulator.addChunk(computeChunkCrossings(chunk, rois));
+    }
+  }
+  return new Set(accumulator.passingSet);
+}
+
+/**
+ * The add/remove delta to turn `current` into `target`. Returned as arrays so
+ * the caller can apply them to a shared {@link Uint64Set} in two batched RPC
+ * mutations rather than one per id. Empty arrays mean the sets already match —
+ * the caller then does nothing, which is what makes a redundant recompute (e.g.
+ * the second of two render-layer backends sharing one passing set) free.
+ */
+export function diffPassingSet(
+  target: ReadonlySet<bigint>,
+  current: ReadonlySet<bigint>,
+): { added: bigint[]; removed: bigint[] } {
+  const added: bigint[] = [];
+  const removed: bigint[] = [];
+  for (const id of target) {
+    if (!current.has(id)) added.push(id);
+  }
+  for (const id of current) {
+    if (!target.has(id)) removed.push(id);
+  }
+  return { added, removed };
+}
