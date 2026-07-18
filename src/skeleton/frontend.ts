@@ -3087,12 +3087,14 @@ export class SpatiallyIndexedSkeletonLayer
     };
 
     // ROI streamline filter channel (zarr-vectors tract layers only): hand the
-    // backend the ROI list + active flag (so it recomputes the passing set) and
-    // the shared passing set it mutates. `roiPassingSegments` is already a
-    // shared object (it drives this layer's shader too); `roiConfig` /
-    // `roiFilterActive` are wrapped from the plain display-state watchables the
-    // way `skeletonLod` is. When the backend mutates the passing set, redraw so
-    // the ghosting shader picks up the newly (un)passing segments.
+    // backend the ROI list (so it recomputes the passing set) and the shared
+    // passing set it mutates. `roiPassingSegments` is already a shared object
+    // (it drives this layer's shader too); `roiConfig` is wrapped from the plain
+    // display-state watchable the way `skeletonLod` is. The active flag and
+    // ghost opacity are NOT sent to the backend — they only feed shader uniforms
+    // here (the backend keeps the passing set current whenever ROIs exist, so
+    // enabling the filter is instant). Redraw when the passing set, the active
+    // flag, or the ghost opacity changes.
     if (
       displayState.roiPassingSegments !== undefined &&
       displayState.roiConfig !== undefined &&
@@ -3103,13 +3105,7 @@ export class SpatiallyIndexedSkeletonLayer
       counterpartOptions.roiConfig = this.registerDisposer(
         SharedWatchableValue.makeFromExisting(rpc, displayState.roiConfig),
       ).rpcId;
-      counterpartOptions.roiFilterActive = this.registerDisposer(
-        SharedWatchableValue.makeFromExisting(rpc, displayState.roiFilterActive),
-      ).rpcId;
       const roiRedraw = () => this.redrawNeeded.dispatch();
-      // The passing set changing means different segments (un)ghost; the active
-      // flag and ghost opacity feed shader uniforms directly. All three need a
-      // redraw.
       this.registerDisposer(
         displayState.roiPassingSegments.changed.add(roiRedraw),
       );

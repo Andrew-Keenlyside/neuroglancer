@@ -357,6 +357,17 @@ export interface ZarrVectorsSkeletonSpatialLevel {
  */
 export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends MultiscaleSpatiallyIndexedSkeletonSource {
   /**
+   * Opt this source into the ROI streamline filter. Its pass-1 chunks carry a
+   * per-vertex segment column and retain a `roiFilterableChunk`, so the render-
+   * layer backend can attribute geometry to objects and compute a passing set.
+   * Other spatially-indexed skeleton sources (e.g. CATMAID) share these base
+   * classes but emit no segment column, so the filter would ghost everything —
+   * the segmentation layer gates the whole ROI channel on this flag rather than
+   * on the shared source class.
+   */
+  readonly supportsRoiStreamlineFilter = true;
+
+  /**
    * Opt in to camera-driven LOD picking ONLY when there are ≥2 pyramid
    * levels for the picker to choose between.  With a single level, auto-LOD
    * is meaningless: `maybeUpdateAutoSpatialSkeletonGridResolutionTarget`

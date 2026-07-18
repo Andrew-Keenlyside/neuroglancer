@@ -88,6 +88,16 @@ export class FragmentIndex {
     this.csrIndices = csrIndices;
   }
 
+  /** Total bytes of the backing typed arrays, for memory accounting. */
+  get byteLength(): number {
+    return (
+      this.bitmap.byteLength +
+      this.rangeTable.byteLength +
+      this.csrOffsets.byteLength +
+      this.csrIndices.byteLength
+    );
+  }
+
   get numRangeFragments(): number {
     return this.rangeTable.length >> 1;
   }

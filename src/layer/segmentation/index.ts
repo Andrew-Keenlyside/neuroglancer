@@ -1519,15 +1519,16 @@ export class SegmentationUserLayer extends Base {
       hidden: hideSpatialSkeletonEditTab,
     });
     // Show the Filter tab whenever a spatially-indexed skeleton render layer is
-    // present -- i.e. whenever a tractogram is drawn. Unlike the Skeleton *edit*
-    // tab, this must NOT also require the source to implement the skeleton-
-    // editing API (`getSpatiallyIndexedSkeletonSource`): zarr-vectors tracts are
-    // read-only render sources that don't, so gating on it wrongly hid the
-    // filter for exactly the layers it targets. The filter only needs the
-    // streamlines to be rendering.
+    // present AND the ROI channel was created for it. The channel is created
+    // (setting displayState.roiPassingSegments) only for sources that opt into
+    // the filter, so this also excludes other spatially-indexed skeleton
+    // sources (e.g. CATMAID) that render tracts but cannot be filtered. Unlike
+    // the Skeleton *edit* tab, it does NOT require the skeleton-editing API,
+    // which read-only zarr-vectors tracts lack.
     const hideFilterTab = this.registerDisposer(
       makeCachedLazyDerivedWatchableValue(
         (layers) =>
+          this.displayState.roiPassingSegments === undefined ||
           !layers.some(
             (layer) =>
               layer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
@@ -1871,7 +1872,13 @@ export class SegmentationUserLayer extends Base {
     const passingSegments = this.registerDisposer(
       Uint64Set.makeWithCounterpart(rpc),
     );
-    const active = new WatchableValue<boolean>(roiFilter.active);
+    // Effective-active: the shader ghosts non-passing streamlines only when the
+    // user has the filter on AND there is at least one ROI. With zero ROIs an
+    // empty passing set would otherwise ghost EVERY streamline (nothing is
+    // "passing"), whereas "no ROIs" means "no filter". Folding the ROI count in
+    // here keeps that case correct without the shader needing to know it.
+    const effectiveActive = () => roiFilter.active && roiFilter.rois.length > 0;
+    const active = new WatchableValue<boolean>(effectiveActive());
     const ghostAlpha = new WatchableValue<number>(roiFilter.ghostAlpha);
     const config = new WatchableValue<readonly Roi[]>(roiFilter.rois);
     // Push URL-truth changes into the non-persisted watchables. Each setter
@@ -1879,7 +1886,7 @@ export class SegmentationUserLayer extends Base {
     // (e.g. colour-by-group) does not needlessly re-trigger a worker recompute.
     this.registerDisposer(
       roiFilter.changed.add(() => {
-        active.value = roiFilter.active;
+        active.value = effectiveActive();
         ghostAlpha.value = roiFilter.ghostAlpha;
         config.value = roiFilter.rois;
       }),
@@ -1986,13 +1993,17 @@ export class SegmentationUserLayer extends Base {
           );
         }
         loadedSubsource.activate(() => {
-          // A zarr-vectors tract source enables the ROI streamline filter:
-          // create the data channel on the real display state *before* the
-          // spread below copies it into the per-activation display state the
-          // render layers receive (which is what lights up the shader tier).
+          // A tract source that opts into the ROI streamline filter enables the
+          // data channel. Gate on the source capability, NOT the shared
+          // spatially-indexed skeleton base class: other datasources (e.g.
+          // CATMAID) use the same base but emit no per-vertex segment column, so
+          // their passing set could never be populated and the filter would
+          // ghost every streamline. Create the channel on the real display state
+          // *before* the spread below copies it into the per-activation display
+          // state the render layers receive (which is what lights up the shader).
           if (
-            mesh instanceof MultiscaleSpatiallyIndexedSkeletonSource ||
-            mesh instanceof SpatiallyIndexedSkeletonSource
+            (mesh as { supportsRoiStreamlineFilter?: boolean })
+              .supportsRoiStreamlineFilter === true
           ) {
             this.ensureRoiFilterChannel();
           }
