@@ -298,6 +298,15 @@ export class ZarrVectorsObjectKeyedSkeletonSource extends WithParameters(
   ZarrVectorsObjectKeyedSkeletonSourceParameters,
 ) {
   /**
+   * Marks this as the zarr-vectors pass-2 source the ROI filter repurposes as
+   * its full-detail render layer: the segmentation layer gives its render layer
+   * a dedicated visible set (`roiHighDetailSegments`) instead of the user's
+   * selection, so a group's "high detail" toggle draws its tracts at full
+   * resolution on top of the coarse pass-1 bulk.
+   */
+  readonly isRoiHighDetailSource = true;
+
+  /**
    * Vertex positions are physical coordinates (NGFF
    * `multiscales[0].axes` units), NOT voxel indices.  The render layer
    * uses this flag to skip the implicit voxel→world transform.

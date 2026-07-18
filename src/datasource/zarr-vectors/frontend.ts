@@ -1667,13 +1667,15 @@ function getSkeletonDataSource(
     });
   }
 
-  // Pass-2 (per-segment) source is opt-in.  The segmentation layer's
-  // standard subsource toggle lets the user enable it when they want the
-  // visible-segments-set to drive a second render layer drawn on top of
-  // pass 1.  Matches catmaid's default-flag convention.
+  // Pass-2 (per-segment, full-detail) source. When there is a pass-1 bulk to
+  // draw it on top of, it defaults ON so the ROI filter's per-group "high
+  // detail" toggle just works (the segmentation layer repurposes it as the
+  // high-detail render layer, driven by roiHighDetailSegments; it renders
+  // nothing until a group is marked high-detail). Without pass-1 (e.g. 2-d or
+  // higher-rank stores) it stays the opt-in per-segment source.
   subsources.push({
     id: "skeleton",
-    default: false,
+    default: metadata.pass1Levels !== undefined,
     subsource: {
       mesh: sharedKvStoreContext.chunkManager.getChunkSource(
         ZarrVectorsObjectKeyedSkeletonSource,

@@ -956,6 +956,12 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   roiGroups?: WatchableValue<readonly RoiGroupConfig[]>;
   roiSegmentColors?: Uint64Map;
   roiColorByGroup?: WatchableValue<boolean>;
+  /**
+   * Shared set of object ids the pass-1 backend fills = union of visible +
+   * high-detail groups' passing tracts. Drives the object-keyed pass-2 render
+   * layer (its dedicated visible set), which redraws those at full detail.
+   */
+  roiHighDetailSegments?: Uint64Set;
   spatialSkeletonGridLevel2d = new TrackableValue<number>(
     0,
     verifyNonnegativeInt,
@@ -1963,6 +1969,9 @@ export class SegmentationUserLayer extends Base {
     const passingSegments = this.registerDisposer(
       Uint64Set.makeWithCounterpart(rpc),
     );
+    const highDetailSegments = this.registerDisposer(
+      Uint64Set.makeWithCounterpart(rpc),
+    );
     // Effective-active: the shader ghosts non-passing streamlines only when the
     // user has the filter on AND some visible group has an ROI. With no ROIs an
     // empty passing set would otherwise ghost EVERY streamline (nothing is
@@ -1989,6 +1998,7 @@ export class SegmentationUserLayer extends Base {
     displayState.roiFilterActive = active;
     displayState.roiGhostAlpha = ghostAlpha;
     displayState.roiGroups = groups;
+    displayState.roiHighDetailSegments = highDetailSegments;
 
     // Colour-by-group: the worker fills `segmentColors` (id -> packed group
     // colour) for passing tracts, which a dedicated ROI colour shader tier reads
@@ -2268,10 +2278,39 @@ export class SegmentationUserLayer extends Base {
               ),
             );
           } else {
+            // The zarr-vectors pass-2 source is the ROI filter's full-detail
+            // render layer: give it a DEDICATED visible set
+            // (roiHighDetailSegments) via a proxy group state, so it draws only
+            // the high-detail groups' tracts and never touches the user's
+            // selection. Coefficient consumers of the group state read fields
+            // (the 6 shared visible-segment objects, hideSegmentZero, …), never
+            // methods, so a spread proxy is safe; colouring uses the separate
+            // segmentationColorGroupState, which is unchanged.
+            let skeletonDisplayState = displayState;
+            const highDetail = displayState.roiHighDetailSegments;
+            if (
+              highDetail !== undefined &&
+              (mesh as { isRoiHighDetailSource?: boolean })
+                .isRoiHighDetailSource === true
+            ) {
+              const realGroupState =
+                this.displayState.segmentationGroupState.value;
+              // Structural proxy: all fields of the real group state, but with
+              // `visibleSegments` swapped. Cast back to the class type — the
+              // consumers only read the (present) fields, never call methods.
+              const proxyGroupState = {
+                ...realGroupState,
+                visibleSegments: highDetail,
+              } as unknown as SegmentationUserLayerGroupState;
+              skeletonDisplayState = {
+                ...displayState,
+                segmentationGroupState: new WatchableValue(proxyGroupState),
+              };
+            }
             const base = new SkeletonLayer(
               this.manager.chunkManager,
               mesh,
-              displayState,
+              skeletonDisplayState,
             );
             loadedSubsource.addRenderLayer(
               new PerspectiveViewSkeletonLayer(base.addRef()),

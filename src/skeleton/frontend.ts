@@ -1437,6 +1437,12 @@ export interface SkeletonLayerDisplayState extends SegmentationDisplayState3D {
   roiSegmentColors?: Uint64Map;
   /** Whether to apply `roiSegmentColors` (the colour-by-group shader uniform). */
   roiColorByGroup?: WatchableValueInterface<boolean>;
+  /**
+   * Shared set the pass-1 backend fills = passing tracts of visible high-detail
+   * groups. This layer (pass-1) only mutates it; the object-keyed pass-2 layer
+   * reads it as its visible set. Threaded to the backend counterpart.
+   */
+  roiHighDetailSegments?: Uint64Set;
 }
 
 export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
@@ -3183,6 +3189,10 @@ export class SpatiallyIndexedSkeletonLayer
       if (displayState.roiSegmentColors !== undefined) {
         counterpartOptions.roiSegmentColors =
           displayState.roiSegmentColors.rpcId;
+      }
+      if (displayState.roiHighDetailSegments !== undefined) {
+        counterpartOptions.roiHighDetailSegments =
+          displayState.roiHighDetailSegments.rpcId;
       }
       counterpartOptions.roiGroups = this.registerDisposer(
         SharedWatchableValue.makeFromExisting(rpc, displayState.roiGroups),

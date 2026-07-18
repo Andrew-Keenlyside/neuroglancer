@@ -590,6 +590,8 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   roiGroups?: SharedWatchableValue<readonly RoiGroupConfig[]>;
   /** Shared id -> packed group colour for passing tracts (colour-by-group). */
   roiSegmentColors?: Uint64Map;
+  /** Shared set of passing tracts of visible high-detail groups (drives pass-2). */
+  roiHighDetailSegments?: Uint64Set;
   /** Set when an ROI edit needs a recompute even if the resident chunk set is unchanged. */
   private roiRecomputePending = false;
   /** Signature of the last resident-chunk set filtered over, to skip redundant recomputes. */
@@ -693,6 +695,9 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
       this.roiPassingSegments = rpc.get(options.roiPassingSegments);
       if (options.roiSegmentColors !== undefined) {
         this.roiSegmentColors = rpc.get(options.roiSegmentColors);
+      }
+      if (options.roiHighDetailSegments !== undefined) {
+        this.roiHighDetailSegments = rpc.get(options.roiHighDetailSegments);
       }
       const roiGroups = (this.roiGroups = rpc.get(options.roiGroups));
       const scheduleRoiRecompute = () => {
@@ -801,12 +806,24 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     this.roiLastChunkSignature = signature;
 
     // Union of every visible group's passing tracts drives the ghost shader;
-    // colorById attributes each passing tract its group's colour.
-    const { passing, colorById } = computeGroupedPassingSet(chunks, groups);
+    // colorById attributes each passing tract its group's colour; highDetail is
+    // the subset in high-detail groups (drives the object-keyed pass-2 layer).
+    const { passing, colorById, highDetail } = computeGroupedPassingSet(
+      chunks,
+      groups,
+    );
     const current = new Set<bigint>(passingSet.keys());
     const { added, removed } = diffPassingSet(passing, current);
     if (removed.length !== 0) passingSet.delete(removed);
     if (added.length !== 0) passingSet.add(added);
+
+    const highDetailSet = this.roiHighDetailSegments;
+    if (highDetailSet !== undefined) {
+      const currentHd = new Set<bigint>(highDetailSet.keys());
+      const hdDiff = diffPassingSet(highDetail, currentHd);
+      if (hdDiff.removed.length !== 0) highDetailSet.delete(hdDiff.removed);
+      if (hdDiff.added.length !== 0) highDetailSet.add(hdDiff.added);
+    }
 
     // Push the colour attribution to the shared map as a minimal diff (the
     // frontend mirrors it into segmentStatedColors when colour-by-group is on).

@@ -256,9 +256,16 @@ export function diffPassingSet(
 export function computeGroupedPassingSet(
   chunks: Iterable<RoiFilterableChunk>,
   groups: readonly RoiGroupConfig[],
-): { passing: Set<bigint>; colorById: Map<bigint, number> } {
+): {
+  passing: Set<bigint>;
+  colorById: Map<bigint, number>;
+  highDetail: Set<bigint>;
+} {
   const passing = new Set<bigint>();
   const colorById = new Map<bigint, number>();
+  // Union of the passing tracts of visible groups marked `highDetail`; the
+  // render layer loads exactly these via the object-keyed pass-2 source.
+  const highDetail = new Set<bigint>();
   // The chunk iterable may be single-use (a generator); materialise it once so
   // every group sees the same batch.
   const chunkArray = Array.isArray(chunks) ? chunks : [...chunks];
@@ -268,7 +275,8 @@ export function computeGroupedPassingSet(
       passing.add(id);
       // First group in list order wins the colour (topmost, deterministic).
       if (!colorById.has(id)) colorById.set(id, group.colorPacked);
+      if (group.highDetail) highDetail.add(id);
     }
   }
-  return { passing, colorById };
+  return { passing, colorById, highDetail };
 }

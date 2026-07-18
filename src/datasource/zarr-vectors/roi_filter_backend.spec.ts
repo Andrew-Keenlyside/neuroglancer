@@ -391,6 +391,25 @@ describe("computeGroupedPassingSet", () => {
     expect(passing.size).toBe(0);
     expect(colorById.size).toBe(0);
   });
+
+  it("unions only visible high-detail groups' passing ids into highDetail", () => {
+    const { highDetail } = computeGroupedPassingSet(
+      [chunk],
+      [
+        { ...groupA, highDetail: true }, // object 1
+        groupB, // object 2, not high-detail
+      ],
+    );
+    expect([...highDetail]).toEqual([1n]);
+  });
+
+  it("excludes an invisible high-detail group from highDetail", () => {
+    const { highDetail } = computeGroupedPassingSet(
+      [chunk],
+      [{ ...groupA, highDetail: true, visible: false }],
+    );
+    expect(highDetail.size).toBe(0);
+  });
 });
 
 describe("diffPassingSet", () => {
