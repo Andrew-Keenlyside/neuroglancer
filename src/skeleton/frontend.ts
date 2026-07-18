@@ -119,6 +119,7 @@ import {
   WatchableValue,
   registerNested,
 } from "#src/trackable_value.js";
+import type { Uint64Map } from "#src/uint64_map.js";
 import { Uint64Set } from "#src/uint64_set.js";
 import { gatherUpdate } from "#src/util/array.js";
 import { hsvToRgb } from "#src/util/colorspace.js";
@@ -1364,6 +1365,12 @@ export interface SkeletonLayerDisplayState extends SegmentationDisplayState3D {
    * to hand to the render layer's shared-object counterpart.
    */
   roiGroups?: WatchableValueInterface<readonly RoiGroupConfig[]>;
+  /**
+   * Shared id -> packed group colour the backend fills for passing tracts; the
+   * segmentation layer mirrors it into `segmentStatedColors` (colour-by-group).
+   * Carried here only to thread its rpcId to the backend counterpart.
+   */
+  roiSegmentColors?: Uint64Map;
 }
 
 export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
@@ -3102,6 +3109,10 @@ export class SpatiallyIndexedSkeletonLayer
     ) {
       counterpartOptions.roiPassingSegments =
         displayState.roiPassingSegments.rpcId;
+      if (displayState.roiSegmentColors !== undefined) {
+        counterpartOptions.roiSegmentColors =
+          displayState.roiSegmentColors.rpcId;
+      }
       counterpartOptions.roiGroups = this.registerDisposer(
         SharedWatchableValue.makeFromExisting(rpc, displayState.roiGroups),
       ).rpcId;

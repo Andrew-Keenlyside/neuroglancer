@@ -950,6 +950,7 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   roiFilterActive?: WatchableValue<boolean>;
   roiGhostAlpha?: WatchableValue<number>;
   roiGroups?: WatchableValue<readonly RoiGroupConfig[]>;
+  roiSegmentColors?: Uint64Map;
   spatialSkeletonGridLevel2d = new TrackableValue<number>(
     0,
     verifyNonnegativeInt,
@@ -1983,6 +1984,29 @@ export class SegmentationUserLayer extends Base {
     displayState.roiFilterActive = active;
     displayState.roiGhostAlpha = ghostAlpha;
     displayState.roiGroups = groups;
+
+    // Colour-by-group: the worker fills `segmentColors` (id -> packed group
+    // colour) for passing tracts. Mirror it into `segmentStatedColors` — which
+    // the dynamic skeleton shader already resolves per object, winning over the
+    // hash colour — when colour-by-group is on; clear it when off (directional
+    // RGB returns). Debounced so a worker colour batch or an ROI edit triggers
+    // one rebuild, not one per id.
+    const segmentColors = this.registerDisposer(
+      Uint64Map.makeWithCounterpart(rpc),
+    );
+    const applyRoiColors = () => {
+      const stated = displayState.segmentStatedColors.value;
+      if (roiFilter.colorByGroup) {
+        stated.assignFrom(segmentColors);
+      } else if (stated.size !== 0) {
+        stated.clear();
+      }
+    };
+    const debouncedApplyRoiColors = debounce(applyRoiColors, 0);
+    this.registerDisposer(() => debouncedApplyRoiColors.cancel());
+    this.registerDisposer(segmentColors.changed.add(debouncedApplyRoiColors));
+    this.registerDisposer(roiFilter.changed.add(debouncedApplyRoiColors));
+    displayState.roiSegmentColors = segmentColors;
   }
 
   /**

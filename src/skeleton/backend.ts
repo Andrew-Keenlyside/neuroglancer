@@ -78,6 +78,7 @@ import {
   type SliceViewProjectionParameters,
   type TransformedSource,
 } from "#src/sliceview/base.js";
+import type { Uint64Map } from "#src/uint64_map.js";
 import type { Uint64Set } from "#src/uint64_set.js";
 import type { TypedNumberArray } from "#src/util/array.js";
 import type { Endianness } from "#src/util/endian.js";
@@ -587,10 +588,14 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   // ghost-alpha while an async recompute catches up.
   roiPassingSegments?: Uint64Set;
   roiGroups?: SharedWatchableValue<readonly RoiGroupConfig[]>;
+  /** Shared id -> packed group colour for passing tracts (colour-by-group). */
+  roiSegmentColors?: Uint64Map;
   /** Set when an ROI edit needs a recompute even if the resident chunk set is unchanged. */
   private roiRecomputePending = false;
   /** Signature of the last resident-chunk set filtered over, to skip redundant recomputes. */
   private roiLastChunkSignature = "";
+  /** The colour attribution last pushed to `roiSegmentColors`, for diffing. */
+  private roiLastColorById = new Map<bigint, number>();
 
   constructor(rpc: RPC, options: any) {
     super(rpc, options);
@@ -686,6 +691,9 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     // is unchanged; schedule one and let the late-priorities hook run it.
     if (options.roiPassingSegments !== undefined) {
       this.roiPassingSegments = rpc.get(options.roiPassingSegments);
+      if (options.roiSegmentColors !== undefined) {
+        this.roiSegmentColors = rpc.get(options.roiSegmentColors);
+      }
       const roiGroups = (this.roiGroups = rpc.get(options.roiGroups));
       const scheduleRoiRecompute = () => {
         this.roiRecomputePending = true;
@@ -792,13 +800,27 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     this.roiRecomputePending = false;
     this.roiLastChunkSignature = signature;
 
-    // Union of every visible group's passing tracts drives the ghost shader.
-    // (Per-group colour attribution is applied in a later step.)
-    const { passing } = computeGroupedPassingSet(chunks, groups);
+    // Union of every visible group's passing tracts drives the ghost shader;
+    // colorById attributes each passing tract its group's colour.
+    const { passing, colorById } = computeGroupedPassingSet(chunks, groups);
     const current = new Set<bigint>(passingSet.keys());
     const { added, removed } = diffPassingSet(passing, current);
     if (removed.length !== 0) passingSet.delete(removed);
     if (added.length !== 0) passingSet.add(added);
+
+    // Push the colour attribution to the shared map as a minimal diff (the
+    // frontend mirrors it into segmentStatedColors when colour-by-group is on).
+    const colors = this.roiSegmentColors;
+    if (colors !== undefined) {
+      const last = this.roiLastColorById;
+      for (const [id, color] of colorById) {
+        if (last.get(id) !== color) colors.set(id, BigInt(color));
+      }
+      for (const id of last.keys()) {
+        if (!colorById.has(id)) colors.delete(id);
+      }
+      this.roiLastColorById = colorById;
+    }
   }
 
   attach(
