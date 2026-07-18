@@ -238,6 +238,7 @@ export class RoiFilterState {
   private active_ = false;
   private ghostAlpha_ = DEFAULT_GHOST_ALPHA;
   private colorByGroup_ = true;
+  private hideOverlays2d_ = false;
   private groups_: RoiGroup[] = [];
   private nextGroupId_ = 1;
 
@@ -269,6 +270,16 @@ export class RoiFilterState {
   set colorByGroup(value: boolean) {
     if (value === this.colorByGroup_) return;
     this.colorByGroup_ = value;
+    this.changed.dispatch();
+  }
+
+  /** Whether to hide the ROI region overlays in the 2-d slice views. */
+  get hideOverlays2d(): boolean {
+    return this.hideOverlays2d_;
+  }
+  set hideOverlays2d(value: boolean) {
+    if (value === this.hideOverlays2d_) return;
+    this.hideOverlays2d_ = value;
     this.changed.dispatch();
   }
 
@@ -396,6 +407,7 @@ export class RoiFilterState {
     if (this.ghostAlpha_ !== DEFAULT_GHOST_ALPHA)
       json.ghostAlpha = this.ghostAlpha_;
     if (!this.colorByGroup_) json.colorByGroup = false;
+    if (this.hideOverlays2d_) json.hideOverlays2d = true;
     return json;
   }
 
@@ -436,6 +448,9 @@ export class RoiFilterState {
       DEFAULT_GHOST_ALPHA;
     this.colorByGroup_ =
       verifyOptionalObjectProperty(x, "colorByGroup", (v) => v === true) ?? true;
+    this.hideOverlays2d_ =
+      verifyOptionalObjectProperty(x, "hideOverlays2d", (v) => v === true) ??
+      false;
     this.changed.dispatch();
   }
 
@@ -443,11 +458,13 @@ export class RoiFilterState {
     const wasDefault =
       !this.active_ &&
       this.colorByGroup_ &&
+      !this.hideOverlays2d_ &&
       this.groups_.length === 0 &&
       this.ghostAlpha_ === DEFAULT_GHOST_ALPHA;
     this.active_ = false;
     this.ghostAlpha_ = DEFAULT_GHOST_ALPHA;
     this.colorByGroup_ = true;
+    this.hideOverlays2d_ = false;
     this.groups_ = [];
     this.nextGroupId_ = 1;
     if (!wasDefault) this.changed.dispatch();

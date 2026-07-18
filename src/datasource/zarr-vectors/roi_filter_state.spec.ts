@@ -150,8 +150,10 @@ describe("RoiFilterState serialization", () => {
     s.active = true;
     s.ghostAlpha = 0.25;
     s.colorByGroup = false;
+    s.hideOverlays2d = true;
 
     const json = s.toJSON();
+    expect(json.hideOverlays2d).toBe(true);
     expect(json.groups).toHaveLength(1);
     expect(json.groups[0].name).toBe("Motor");
     expect(json.groups[0].color).toBe("#ff0000");
@@ -169,6 +171,7 @@ describe("RoiFilterState serialization", () => {
     expect(restored.active).toBe(true);
     expect(restored.ghostAlpha).toBe(0.25);
     expect(restored.colorByGroup).toBe(false);
+    expect(restored.hideOverlays2d).toBe(true);
   });
 
   it("omits ghostAlpha/colorByGroup from JSON at their defaults", () => {

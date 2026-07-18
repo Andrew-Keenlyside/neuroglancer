@@ -22,6 +22,15 @@ import svg_minus from "ikonate/icons/minus.svg?raw";
 import svg_origin from "ikonate/icons/origin.svg?raw";
 import svg_share_android from "ikonate/icons/share-android.svg?raw";
 import { debounce } from "lodash-es";
+import type {
+  Annotation,
+  AnnotationPropertySpec,
+  AnnotationReference,
+} from "#src/annotation/index.js";
+import {
+  AnnotationType,
+  LocalAnnotationSource,
+} from "#src/annotation/index.js";
 import type { CoordinateTransformSpecification } from "#src/coordinate_transform.js";
 import { emptyValidCoordinateSpace } from "#src/coordinate_transform.js";
 import type { DataSourceSpecification } from "#src/datasource/index.js";
@@ -77,6 +86,7 @@ import {
   renderScaleHistogramOrigin,
   trackableRenderScaleTarget,
 } from "#src/render_scale_statistics.js";
+import { RenderLayerRole } from "#src/renderlayer.js";
 import { getCssColor, SegmentColorHash } from "#src/segment_color.js";
 import {
   addSegmentToVisibleSets,
@@ -201,7 +211,8 @@ import {
 } from "#src/util/color.js";
 import type { Borrowed, Owned } from "#src/util/disposable.js";
 import { RefCounted } from "#src/util/disposable.js";
-import type { vec3, vec4 } from "#src/util/geom.js";
+import type { vec4 } from "#src/util/geom.js";
+import { vec3 } from "#src/util/geom.js";
 import {
   parseArray,
   parseUint64,
@@ -694,6 +705,66 @@ function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
     colorPacked: packColor(g.color),
     visible: g.visible,
   }));
+}
+
+// The ROI overlay annotation shader: colour each region by its per-annotation
+// `color` property (set to its group's colour). Box/plane ROIs render as a
+// coloured wireframe; sphere ROIs as a translucent fill.
+const ROI_OVERLAY_SHADER = "void main() {\n  setColor(prop_color());\n}\n";
+// Same, but discard in the 2-d slice views (hide-overlays-in-2d toggle).
+const ROI_OVERLAY_SHADER_HIDE_2D =
+  "void main() {\n  if (!PROJECTION_VIEW) { discard; }\n  setColor(prop_color());\n}\n";
+
+/**
+ * Mirror the ROI groups into a local annotation source so the regions draw as
+ * overlays, each in its group's colour (via the source's `color` property).
+ * One-way — the `RoiFilterState` is the truth; this only reflects it.
+ *
+ * Updates annotations in place when the ROI count is unchanged (so a slider
+ * drag moves a region without a delete/re-add flicker), and rebuilds from
+ * scratch on a structural change. `refs` is the running annotation list.
+ */
+function rebuildRoiAnnotations(
+  source: LocalAnnotationSource,
+  roiFilter: RoiFilterState,
+  refs: AnnotationReference[],
+): void {
+  const desired: Annotation[] = [];
+  for (const group of roiFilter.groups) {
+    const color = packColor(group.color);
+    for (const roi of group.rois) {
+      const shape = roi.shape;
+      if (shape.kind === "box") {
+        desired.push({
+          type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
+          id: "",
+          pointA: Float32Array.from(shape.lower),
+          pointB: Float32Array.from(shape.upper),
+          properties: [color],
+        });
+      } else if (shape.kind === "ellipsoid") {
+        desired.push({
+          type: AnnotationType.ELLIPSOID,
+          id: "",
+          center: Float32Array.from(shape.center),
+          radii: Float32Array.from(shape.radii),
+          properties: [color],
+        });
+      }
+      // halfspace ROIs are not drawn (axis-aligned regions only).
+    }
+  }
+  if (refs.length === desired.length) {
+    for (let i = 0; i < desired.length; ++i) {
+      desired[i].id = refs[i].id;
+      source.update(refs[i], desired[i]);
+      source.commit(refs[i]);
+    }
+  } else {
+    for (const ref of refs) source.delete(ref);
+    refs.length = 0;
+    for (const annotation of desired) refs.push(source.add(annotation));
+  }
 }
 
 class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
@@ -1914,6 +1985,46 @@ export class SegmentationUserLayer extends Base {
     displayState.roiGroups = groups;
   }
 
+  /**
+   * Draw the ROI regions as annotation overlays on the tract subsource: box /
+   * plane ROIs as a coloured wireframe box, sphere ROIs as a coloured fill, each
+   * in its group's colour. Attached via the annotation mixin, so it renders in
+   * both the 2-d and 3-d views. The overlays mirror {@link RoiFilterState} and
+   * are read-only (placement/editing is via the Filter tab's sliders).
+   */
+  private addRoiOverlays(loadedSubsource: LoadedDataSubsource) {
+    const refCounted = loadedSubsource.activated;
+    if (refCounted === undefined) return;
+    const roiFilter = this.displayState.roiFilter;
+    const properties = new WatchableValue<AnnotationPropertySpec[]>([
+      {
+        identifier: "color",
+        type: "rgb",
+        default: packColor(vec3.fromValues(1, 1, 0)),
+        description: undefined,
+      },
+    ]);
+    const source = new LocalAnnotationSource(
+      loadedSubsource.loadedDataSource.transform,
+      properties,
+      [],
+    );
+    this.addLocalAnnotations(
+      loadedSubsource,
+      source,
+      RenderLayerRole.DEFAULT_ANNOTATION,
+    );
+    const refs: AnnotationReference[] = [];
+    const sync = () => {
+      this.annotationDisplayState.shader.value = roiFilter.hideOverlays2d
+        ? ROI_OVERLAY_SHADER_HIDE_2D
+        : ROI_OVERLAY_SHADER;
+      rebuildRoiAnnotations(source, roiFilter, refs);
+    };
+    refCounted.registerDisposer(roiFilter.changed.add(sync));
+    sync();
+  }
+
   activateDataSubsources(subsources: Iterable<LoadedDataSubsource>) {
     const updatedSegmentPropertyMaps: SegmentPropertyMap[] = [];
     const isGroupRoot =
@@ -2023,6 +2134,7 @@ export class SegmentationUserLayer extends Base {
               .supportsRoiStreamlineFilter === true
           ) {
             this.ensureRoiFilterChannel();
+            this.addRoiOverlays(loadedSubsource);
           }
           const displayState = {
             ...this.displayState,

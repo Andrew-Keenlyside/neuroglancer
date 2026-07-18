@@ -216,6 +216,17 @@ export class StreamlineFilterTab extends Tab {
     );
     header.appendChild(labelled("Colour by group", colorByGroup.element));
 
+    const hide2d = this.registerDisposer(
+      new TrackableBooleanCheckbox(
+        fieldWatchable(
+          this.roiFilter.changed,
+          () => this.roiFilter.hideOverlays2d,
+          (v) => (this.roiFilter.hideOverlays2d = v),
+        ),
+      ),
+    );
+    header.appendChild(labelled("Hide regions in 2-d", hide2d.element));
+
     const ghost = this.registerDisposer(
       new RangeWidget(
         fieldWatchable(
