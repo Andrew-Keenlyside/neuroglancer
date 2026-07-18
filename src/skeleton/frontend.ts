@@ -127,7 +127,7 @@ import { DataType } from "#src/util/data_type.js";
 import { RefCounted } from "#src/util/disposable.js";
 import type { ValueOrError } from "#src/util/error.js";
 import { makeValueOrError, valueOrThrow } from "#src/util/error.js";
-import { kOneVec4, mat4, vec3, type vec4 } from "#src/util/geom.js";
+import { kOneVec4, mat4, vec3, vec4 } from "#src/util/geom.js";
 import { verifyFinitePositiveFloat } from "#src/util/json.js";
 import * as matrix from "#src/util/matrix.js";
 import { getObjectId } from "#src/util/object_id.js";
@@ -194,6 +194,9 @@ const DEBUG_SPATIAL_SKELETON_CHUNKS = false;
 const tempChunkKeyToColorMap = new Map<string, Float32Array>();
 
 const tempMat4 = mat4.create();
+// Scratch for the per-object ROI group colour/opacity handed to setColor() in
+// the legacy pass-2 draw loop (unpacked from roiSegmentColors).
+const tempRoiColor = vec4.create();
 const OVERLAY_SELECTED_FLOAT_ZERO = new Float32Array([0]);
 const OVERLAY_SELECTED_FLOAT_ONE = new Float32Array([1]);
 const DEFAULT_FRAGMENT_MAIN = `void main() {
@@ -235,6 +238,11 @@ interface SkeletonShaderParameters {
   hasRoiFilter: boolean;
   /** Compile the ROI colour-by-group tier (zarr-vectors tract layers). */
   hasRoiSegmentColors: boolean;
+  /**
+   * Compile the pass-1 high-detail-hide tier: transparent-out streamlines that
+   * pass-2 draws at full geometry so the coarse bulk does not double-draw.
+   */
+  hasRoiHighDetail: boolean;
   hasSegmentStatedColors: boolean;
   hasSegmentDefaultColor: boolean;
   hoverHighlight: boolean;
@@ -307,6 +315,12 @@ class RenderHelper extends RefCounted {
   private roiPassingSegmentsShaderManager = new HashSetShaderManager(
     "roiPassingSegments",
   );
+  // Streamlines a high-detail group loads at full geometry via pass-2. Pass-1
+  // (this dynamic path) makes them fully transparent so the coarse bulk does
+  // not double-draw under pass-2's full-detail lines.
+  private roiHighDetailSegmentsShaderManager = new HashSetShaderManager(
+    "roiHighDetailSegments",
+  );
   private segmentColorShaderManager = new SegmentColorShaderManager(
     "segmentColorHash",
   );
@@ -324,6 +338,9 @@ class RenderHelper extends RefCounted {
   private gpuTemporaryVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuEmptySegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuRoiPassingSegmentsHashTable: GPUHashTable<HashSetUint64> | undefined;
+  private gpuRoiHighDetailSegmentsHashTable:
+    | GPUHashTable<HashSetUint64>
+    | undefined;
   private gpuRoiSegmentColorHashTable: GPUHashTable<HashMapUint64> | undefined;
   // Lazily acquired and re-checked each draw; see getSegmentStatedColorHashTable.
   private gpuSegmentStatedColorHashTable:
@@ -350,6 +367,13 @@ class RenderHelper extends RefCounted {
     this.defineAttributeAccess(builder);
     if (skeletonParams.dynamicSegmentAppearance) {
       this.defineDynamicSegmentAppearance(builder, skeletonParams);
+    } else if (skeletonParams.hasRoiSegmentColors) {
+      // Legacy path (pass-2 object-keyed high-detail streamlines) ROI
+      // colour-by-group: the per-object group colour arrives in `uColor`
+      // (set on the CPU from roiSegmentColors), and this flag selects it over
+      // the shader-computed colour (e.g. colour-by-direction). Per-group
+      // opacity always rides `uColor.a` and needs no flag.
+      builder.addUniform("highp float", "uRoiColorByGroup");
     }
     if (skeletonParams.spatialChunkCulling) {
       builder.addUniform("highp vec3", "uChunkOrigin");
@@ -486,6 +510,19 @@ void spatialChunkCull() {
   }`
       : "";
 
+    // High-detail hide: a passing streamline that a high-detail group loads via
+    // pass-2 is drawn there at full geometry, so pass-1 makes it transparent to
+    // avoid overdrawing the coarse copy underneath. Placed after the ghost tier
+    // (high-detail ids are always in the passing set) and before the opacity
+    // tier (which would otherwise give them the group's "on" alpha).
+    const roiHighDetailFragment = params.hasRoiHighDetail
+      ? `
+  if (uRoiFilterActive > 0.5 &&
+      ${this.roiHighDetailSegmentsShaderManager.hasFunctionName}(segmentId)) {
+    return 0.0;
+  }`
+      : "";
+
     // Per-group "on" opacity: a passing tract takes the alpha byte of its
     // group's colour (packed into roiSegmentColors). Independent of
     // colour-by-group (that only gates the RGB override, below); applied only
@@ -510,6 +547,9 @@ void spatialChunkCull() {
       this.roiPassingSegmentsShaderManager.defineShader(builder);
       builder.addUniform("highp float", "uRoiFilterActive");
       builder.addUniform("highp float", "uRoiGhostAlpha");
+    }
+    if (params.hasRoiHighDetail) {
+      this.roiHighDetailSegmentsShaderManager.defineShader(builder);
     }
     if (params.hasRoiSegmentColors) {
       this.roiSegmentColorShaderManager.defineShader(builder);
@@ -567,7 +607,7 @@ ${hoverAdjustFragment}
 float getSegmentLookupAlpha(uint64_t segmentId) {
   if (${this.excludedSegmentsShaderManager.hasFunctionName}(segmentId)) {
     return ${excludedSegmentAlpha};
-  }${roiFilterFragment}${roiOpacityFragment}
+  }${roiFilterFragment}${roiHighDetailFragment}${roiOpacityFragment}
   bool isVisible = ${this.visibleSegmentsShaderManager.hasFunctionName}(segmentId);
   ${alphaExpression}
 }
@@ -613,6 +653,14 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
       gl.uniform1f(
         shader.uniform("uRoiGhostAlpha"),
         dss.roiGhostAlpha?.value ?? 0,
+      );
+    }
+    if (skeletonParams.hasRoiHighDetail) {
+      this.roiHighDetailSegmentsShaderManager.enable(
+        gl,
+        shader,
+        this.gpuRoiHighDetailSegmentsHashTable ??
+          this.gpuEmptySegmentsHashTable,
       );
     }
     // 3D (perspective) uses objectAlpha/hiddenObjectAlpha; 2D (slice) uses
@@ -758,6 +806,12 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
         GPUHashTable.get(this.gl, roiPassingSegments.hashTable),
       );
     }
+    const roiHighDetailSegments = base.displayState.roiHighDetailSegments;
+    if (roiHighDetailSegments !== undefined) {
+      this.gpuRoiHighDetailSegmentsHashTable = this.registerDisposer(
+        GPUHashTable.get(this.gl, roiHighDetailSegments.hashTable),
+      );
+    }
     const roiSegmentColors = base.displayState.roiSegmentColors;
     if (roiSegmentColors !== undefined) {
       this.gpuRoiSegmentColorHashTable = this.registerDisposer(
@@ -851,12 +905,16 @@ void emitDefault() {
             // Legacy path (non-spatial skeletons): one skeleton drawn per call;
             // uColor is set per-skeleton by the CPU via getObjectColor(), which
             // already incorporates saturation and hover highlighting.
+            const roiLegacyColorAssign = skeletonParams.hasRoiSegmentColors
+              ? "\n  if (uRoiColorByGroup > 0.5) { rgb = uColor.rgb; }"
+              : "";
             builder.addFragmentCode(`
 vec4 segmentColor() {
   return ${segmentColorExpression};
 }
 void emitRGB(vec3 color) {
-  emit(vec4(color * uColor.a, uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), vPickID);
+  vec3 rgb = color;${roiLegacyColorAssign}
+  emit(vec4(rgb * uColor.a, uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), vPickID);
 }
 void emitDefault() {
   emit(vec4(uColor.rgb, uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), vPickID);
@@ -992,6 +1050,15 @@ void emitDefault() {
             // Legacy path (non-spatial skeletons): one skeleton drawn per call;
             // uColor is set per-skeleton by the CPU via getObjectColor(), which
             // already incorporates saturation and hover highlighting.
+            const roiLegacyColorAssign = skeletonParams.hasRoiSegmentColors
+              ? "\n  if (uRoiColorByGroup > 0.5) { rgb = uColor.rgb; }"
+              : "";
+            // For ROI high-detail streamline nodes the per-group opacity rides
+            // uColor.a (matching the edges); other legacy skeletons keep the
+            // historical fully-opaque node behaviour.
+            const roiLegacyNodeAlpha = skeletonParams.hasRoiSegmentColors
+              ? "uColor.a"
+              : "1.0";
             builder.addFragmentCode(`
 vec4 segmentColor() {
   return ${segmentColorExpression};
@@ -1001,7 +1068,8 @@ void emitRGBA(vec4 color) {
   emit(getCircleColor(color, borderColor), vPickID);
 }
 void emitRGB(vec3 color) {
-  emitRGBA(vec4(color, 1.0));
+  vec3 rgb = color;${roiLegacyColorAssign}
+  emitRGBA(vec4(rgb, ${roiLegacyNodeAlpha}));
 }
 void emitDefault() {
   emitRGBA(uColor);
@@ -1460,6 +1528,7 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
       dynamicSegmentAppearance: false,
       hasRoiFilter: false,
       hasRoiSegmentColors: false,
+      hasRoiHighDetail: false,
       hasSegmentStatedColors: false,
       hasSegmentDefaultColor: false,
       hoverHighlight: false,
@@ -1500,6 +1569,18 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
     sharedObject.initializeCounterpartWithChunkManager({
       source: source.addCounterpartRef(),
     });
+
+    // The ROI high-detail pass-2 layer receives roiSegmentColors in its
+    // displayState (threaded from the tract layer). Compile the legacy shader's
+    // colour-by-group branch for it so a group's colour/opacity apply to its
+    // full-detail streamlines just as they do on the coarse pass-1 bulk. Plain
+    // (non-ROI) skeletons never get this map, so their shader is unchanged.
+    if (displayState.roiSegmentColors !== undefined) {
+      this.skeletonShaderParameters.value = {
+        ...this.skeletonShaderParameters.value,
+        hasRoiSegmentColors: true,
+      };
+    }
 
     const vertexAttributes = (this.vertexAttributes = [
       vertexPositionAttribute,
@@ -1586,6 +1667,23 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
       nodeShaderParameters.parseResult.controls,
     );
 
+    // ROI high-detail pass-2: this streamline's group colour/opacity is packed
+    // into roiSegmentColors (id -> RGBA). Opacity always rides uColor.a below;
+    // uRoiColorByGroup selects uColor.rgb (the group colour) over the shader's
+    // colour-by-direction, matching the coarse pass-1 bulk. Only meaningful
+    // while the filter is active (pass-2 draws nothing otherwise).
+    const roiColors = displayState.roiSegmentColors;
+    const roiColorActive =
+      roiColors !== undefined && displayState.roiFilterActive?.value === true;
+    if (roiColors !== undefined) {
+      const colorByGroup =
+        roiColorActive && displayState.roiColorByGroup?.value === true ? 1 : 0;
+      edgeShader.bind();
+      gl.uniform1f(edgeShader.uniform("uRoiColorByGroup"), colorByGroup);
+      nodeShader.bind();
+      gl.uniform1f(nodeShader.uniform("uRoiColorByGroup"), colorByGroup);
+    }
+
     const skeletons = source.chunks;
 
     forEachVisibleSegmentToDraw(
@@ -1603,10 +1701,25 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
           return;
         }
         if (color !== undefined) {
+          // Swap in the group's colour/opacity (straight RGBA) for this tract;
+          // the shader premultiplies. Falls back to `color` for any object not
+          // yet in the map (transient during a filter recompute).
+          let drawColor = color;
+          if (roiColorActive) {
+            const packed = roiColors!.get(objectId);
+            if (packed !== undefined) {
+              const p = Number(packed) >>> 0;
+              tempRoiColor[0] = (p & 0xff) / 255;
+              tempRoiColor[1] = ((p >>> 8) & 0xff) / 255;
+              tempRoiColor[2] = ((p >>> 16) & 0xff) / 255;
+              tempRoiColor[3] = ((p >>> 24) & 0xff) / 255;
+              drawColor = tempRoiColor;
+            }
+          }
           edgeShader.bind();
-          renderHelper.setColor(gl, edgeShader, color);
+          renderHelper.setColor(gl, edgeShader, drawColor);
           nodeShader.bind();
-          renderHelper.setColor(gl, nodeShader, color);
+          renderHelper.setColor(gl, nodeShader, drawColor);
         }
         if (pickIndex !== undefined) {
           edgeShader.bind();
@@ -3032,11 +3145,14 @@ export class SpatiallyIndexedSkeletonLayer
     const hasRoiFilter = this.displayState.roiPassingSegments !== undefined;
     const hasRoiSegmentColors =
       this.displayState.roiSegmentColors !== undefined;
+    const hasRoiHighDetail =
+      this.displayState.roiHighDetailSegments !== undefined;
     this.skeletonShaderParameters =
       new WatchableValue<SkeletonShaderParameters>({
         dynamicSegmentAppearance: true,
         hasRoiFilter,
         hasRoiSegmentColors,
+        hasRoiHighDetail,
         hasSegmentStatedColors: false,
         hasSegmentDefaultColor: false,
         hoverHighlight: false,
@@ -3049,6 +3165,7 @@ export class SpatiallyIndexedSkeletonLayer
         dynamicSegmentAppearance: true,
         hasRoiFilter,
         hasRoiSegmentColors,
+        hasRoiHighDetail,
         hasSegmentStatedColors: colorGroupState.segmentStatedColors.size !== 0,
         hasSegmentDefaultColor:
           colorGroupState.segmentDefaultColor.value !== undefined ||
