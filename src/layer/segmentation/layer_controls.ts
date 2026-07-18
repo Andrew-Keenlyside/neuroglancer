@@ -81,9 +81,12 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
   {
     label: "Opacity (off)",
     toolJson: json_keys.NOT_SELECTED_ALPHA_JSON_KEY,
+    // Hidden for spatially-indexed (tract) layers: those fold cross-section off
+    // opacity into the unified "Off opacity" control below, so users see one
+    // background-opacity slider instead of three.
     isValid: (layer) =>
       makeCachedDerivedWatchableValue(
-        (has2d, hasSpatialSkeletons) => has2d || hasSpatialSkeletons,
+        (has2d, hasSpatialSkeletons) => has2d && !hasSpatialSkeletons,
         [layer.has2dLayer, layer.hasSpatiallyIndexedSkeletonsLayer],
       ),
     title:
@@ -94,23 +97,29 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     })),
   },
   {
-    label: "Non-passing opacity",
+    label: "Off opacity",
     toolJson: json_keys.ROI_NONPASSING_ALPHA_JSON_KEY,
     isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
     title:
-      "Opacity of streamlines that do NOT pass the ROI filter (the 'off' / " +
-      "ghost opacity). The per-group 'on' opacity is set in the Filter tab.",
+      "Opacity of the background tractogram — one control for the 3-d hidden " +
+      "opacity, the cross-section 'off' opacity, and (when the ROI filter is " +
+      "active) the non-passing 'ghost' streamlines, kept in sync. The per-group " +
+      "'on' opacity is set in the Filter tab.",
     ...rangeLayerControl((layer) => ({
-      // The value lives on RoiFilterState (round-trips inside `roiFilter`); adapt
-      // it to the WatchableValueInterface the range control expects.
+      // A single control driving the three background-opacity trackables at
+      // once. Reads the 3-d hidden alpha (the main perspective tractogram) and
+      // writes all three so they stay equal. Each is a plain live trackable, so
+      // no stale-closure snap-back.
       value: {
         get value() {
-          return layer.displayState.roiFilter.ghostAlpha;
+          return layer.displayState.hiddenObjectAlpha.value;
         },
         set value(v: number) {
+          layer.displayState.hiddenObjectAlpha.value = v;
+          layer.displayState.notSelectedAlpha.value = v;
           layer.displayState.roiFilter.ghostAlpha = v;
         },
-        changed: layer.displayState.roiFilter.changed,
+        changed: layer.displayState.hiddenObjectAlpha.changed,
       },
       options: { min: 0, max: 1, step: 0.01 },
     })),
@@ -186,15 +195,6 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     title: "Opacity of meshes and skeletons",
     ...rangeLayerControl((layer) => ({
       value: layer.displayState.objectAlpha,
-    })),
-  },
-  {
-    label: "Hidden Opacity (3d)",
-    toolJson: json_keys.HIDDEN_OPACITY_3D_JSON_KEY,
-    isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
-    title: "Opacity of hidden (non-visible) skeleton nodes in 3D views",
-    ...rangeLayerControl((layer) => ({
-      value: layer.displayState.hiddenObjectAlpha,
     })),
   },
   {

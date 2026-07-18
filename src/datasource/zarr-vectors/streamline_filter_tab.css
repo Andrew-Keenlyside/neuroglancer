@@ -77,6 +77,21 @@
   cursor: pointer;
 }
 
+.neuroglancer-streamline-filter-group-caret {
+  display: inline-flex;
+  justify-content: center;
+  width: 14px;
+  flex: 0 0 auto;
+  color: #bbb;
+  cursor: pointer;
+  user-select: none;
+  font-size: 10px;
+}
+
+.neuroglancer-streamline-filter-group-caret:hover {
+  color: #fff;
+}
+
 .neuroglancer-streamline-filter-group-controls {
   display: flex;
   align-items: center;

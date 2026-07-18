@@ -153,9 +153,13 @@ export class StreamlineFilterTab extends Tab {
   /** The worker-maintained set of passing object ids (undefined if unwired). */
   private passingSegments: Uint64Set | undefined;
   private countEl: HTMLElement;
-  /** The group new ROIs are added to; the tab also shows this group's ROIs. */
-  private activeGroupId: number | undefined;
-  /** The structural (groups/ROIs/active) signature the body currently reflects. */
+  /**
+   * Which groups are expanded (showing their ROI section). Independent per
+   * group, so any group can be collapsed/re-expanded via its caret — collapsing
+   * one no longer hides the others. New groups start expanded.
+   */
+  private expandedGroupIds = new Set<number>();
+  /** The structural (groups/ROIs/expanded) signature the body currently reflects. */
   private structuralSig = "";
   private bodyEl: HTMLElement;
   /** Disposers for the widgets in the current body build. */
@@ -182,6 +186,12 @@ export class StreamlineFilterTab extends Tab {
       this.registerDisposer(
         this.passingSegments.changed.add(() => this.updateCount()),
       );
+    }
+    // Open with the last group expanded so its ROIs are immediately visible
+    // (others start collapsed; each has a caret to expand/collapse on demand).
+    const groups = this.roiFilter.groups;
+    if (groups.length > 0) {
+      this.expandedGroupIds.add(groups[groups.length - 1].id);
     }
     this.onChanged();
   }
@@ -235,25 +245,25 @@ export class StreamlineFilterTab extends Tab {
 
   private structuralSignature(): string {
     // Include each ROI's shape kind so a restore that keeps ids + counts but
-    // changes a kind still rebuilds (the sliders are wired per kind); exclude
-    // group colour/name/visibility (bound live to inputs — rebuilding on those
-    // would recreate an input mid-edit).
-    return (
-      `${this.activeGroupId}|` +
-      this.roiFilter.groups
-        .map((g) => `${g.id}:${g.rois.map((r) => r.shape.kind[0]).join("")}`)
-        .join(",")
-    );
+    // changes a kind still rebuilds (the sliders are wired per kind), and each
+    // group's expanded state (its ROI section is only in the DOM when open);
+    // exclude group colour/name/visibility/opacity (bound live to inputs —
+    // rebuilding on those would recreate an input mid-edit).
+    return this.roiFilter.groups
+      .map(
+        (g) =>
+          `${g.id}${this.expandedGroupIds.has(g.id) ? "+" : "-"}:` +
+          g.rois.map((r) => r.shape.kind[0]).join(""),
+      )
+      .join(",");
   }
 
   private onChanged(): void {
-    const groups = this.roiFilter.groups;
-    // Default / repair the active group.
-    if (
-      this.activeGroupId === undefined ||
-      !groups.some((g) => g.id === this.activeGroupId)
-    ) {
-      this.activeGroupId = groups.length > 0 ? groups[groups.length - 1].id : undefined;
+    // Drop expansion state for groups that no longer exist so the set does not
+    // leak ids across deletes/restores.
+    const liveIds = new Set(this.roiFilter.groups.map((g) => g.id));
+    for (const id of this.expandedGroupIds) {
+      if (!liveIds.has(id)) this.expandedGroupIds.delete(id);
     }
     const sig = this.structuralSignature();
     if (sig !== this.structuralSig) {
@@ -261,6 +271,17 @@ export class StreamlineFilterTab extends Tab {
       this.rebuildBody();
     }
     this.updateCount();
+  }
+
+  /** Re-read the current (immutable) group by id, or undefined if it is gone. */
+  private currentGroup(id: number): RoiGroup | undefined {
+    return this.roiFilter.groups.find((g) => g.id === id);
+  }
+
+  private toggleExpanded(id: number): void {
+    if (this.expandedGroupIds.has(id)) this.expandedGroupIds.delete(id);
+    else this.expandedGroupIds.add(id);
+    this.onChanged();
   }
 
   private rebuildBody(): void {
@@ -274,15 +295,12 @@ export class StreamlineFilterTab extends Tab {
     const groupList = document.createElement("div");
     groupList.classList.add("neuroglancer-streamline-filter-group-list");
     for (const group of this.roiFilter.groups) {
+      const expanded = this.expandedGroupIds.has(group.id);
       const container = document.createElement("div");
       container.classList.add("neuroglancer-streamline-filter-group");
-      if (group.id === this.activeGroupId) {
-        container.classList.add("neuroglancer-selected");
-      }
-      container.appendChild(this.makeGroupRow(group));
-      if (group.id === this.activeGroupId) {
-        container.appendChild(this.makeRoiSection(group));
-      }
+      if (expanded) container.classList.add("neuroglancer-selected");
+      container.appendChild(this.makeGroupRow(group, expanded));
+      if (expanded) container.appendChild(this.makeRoiSection(group));
       groupList.appendChild(container);
     }
     el.appendChild(groupList);
@@ -291,10 +309,10 @@ export class StreamlineFilterTab extends Tab {
       text: "+ New group",
       title: "Create a new tract group",
       onClick: () => {
-        // addGroup() dispatches `changed` (which rebuilds with the OLD active
-        // group) before returning the new id; re-run onChanged so the new group
-        // becomes active and its ROI-add buttons show.
-        this.activeGroupId = this.roiFilter.addGroup();
+        // addGroup() dispatches `changed` (rebuilding the list) before returning
+        // the new id; expand the new group and re-run onChanged so its ROI-add
+        // buttons show.
+        this.expandedGroupIds.add(this.roiFilter.addGroup());
         this.onChanged();
       },
     });
@@ -302,18 +320,34 @@ export class StreamlineFilterTab extends Tab {
     el.appendChild(addGroup);
   }
 
-  private makeGroupRow(group: RoiGroup): HTMLElement {
+  private makeGroupRow(group: RoiGroup, expanded: boolean): HTMLElement {
     const row = document.createElement("div");
     row.classList.add("neuroglancer-streamline-filter-group-row");
-    if (group.id === this.activeGroupId) row.classList.add("neuroglancer-selected");
+    if (expanded) row.classList.add("neuroglancer-selected");
 
-    // Selecting the row makes it the active (edited) group.
+    // Expand/collapse caret: toggles this group's ROI section. Clicking the row
+    // background (not a control) toggles too, but the caret is the obvious grip.
+    const caret = document.createElement("span");
+    caret.classList.add("neuroglancer-streamline-filter-group-caret");
+    caret.textContent = expanded ? "▾" : "▸"; // ▾ / ▸
+    caret.title = expanded ? "Collapse group" : "Expand group";
+    caret.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleExpanded(group.id);
+    });
+    row.appendChild(caret);
+
     row.addEventListener("click", (e) => {
-      if (e.target instanceof HTMLInputElement) return; // let inputs handle themselves
-      if (this.activeGroupId !== group.id) {
-        this.activeGroupId = group.id;
-        this.onChanged();
+      // Let the row's own inputs/buttons handle their own clicks.
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLButtonElement ||
+        (e.target instanceof HTMLElement &&
+          e.target.closest(".neuroglancer-delete-button") !== null)
+      ) {
+        return;
       }
+      this.toggleExpanded(group.id);
     });
 
     const swatch = document.createElement("input");
@@ -361,7 +395,10 @@ export class StreamlineFilterTab extends Tab {
       new RangeWidget(
         fieldWatchable(
           this.roiFilter.changed,
-          () => group.opacity,
+          // Live lookup: updateGroup replaces the group with a new immutable
+          // object, so reading the captured `group` would be stale and the
+          // widget would snap back to the build-time value on every drag.
+          () => this.currentGroup(group.id)?.opacity ?? 1,
           (v) => this.roiFilter.updateGroup(group.id, { opacity: v }),
         ),
         { min: 0, max: 1, step: 0.01 },

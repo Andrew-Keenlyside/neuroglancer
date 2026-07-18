@@ -881,8 +881,13 @@ highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexInde
   }`
               : "";
             // Dynamic path (spatial skeletons): per-segment color, visibility,
-            // saturation and hover highlight all resolved in the shader via
-            // getSegmentAppearance(). uColor is unused in this path.
+            // and hover highlight resolved in the shader via
+            // getSegmentAppearance(). uColor is unused in this path. Saturation
+            // is applied to the emitDefault (segment-colour) path inside
+            // getSegmentLookupColor, but a custom shader's emitRGB colour (e.g.
+            // the tract colour-by-direction default, or a group colour) bypasses
+            // it, so mix it in here too — otherwise the Saturation slider has no
+            // effect on directional/group-coloured streamlines.
             builder.addFragmentCode(`
 vec4 segmentColor() {
   return getSegmentAppearance(vSegmentValue);
@@ -892,6 +897,7 @@ void emitRGB(vec3 color) {
   highp float alpha = baseColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
   if (alpha <= 0.0) discard;
   vec3 rgb = color;${roiColorFragment}
+  rgb = mix(vec3(1.0), rgb, uSaturation);
   ${this.emitColorStatement("rgb", "alpha")}
 }
 void emitDefault() {
@@ -1040,7 +1046,9 @@ void emitRGBA(vec4 color) {
   ${this.emitColorStatement("circleColor.rgb", "circleColor.a")}
 }
 void emitRGB(vec3 color) {
-  emitRGBA(vec4(color, 1.0));
+  // Saturation for a custom shader's node colour (see the edge path); the
+  // emitDefault segment-colour path is already saturated via getSegmentLookupColor.
+  emitRGBA(vec4(mix(vec3(1.0), color, uSaturation), 1.0));
 }
 void emitDefault() {
   emitRGBA(vec4(segmentColor().rgb, 1.0));
@@ -1054,8 +1062,10 @@ void emitDefault() {
               ? "\n  if (uRoiColorByGroup > 0.5) { rgb = uColor.rgb; }"
               : "";
             // For ROI high-detail streamline nodes the per-group opacity rides
-            // uColor.a (matching the edges); other legacy skeletons keep the
-            // historical fully-opaque node behaviour.
+            // uColor.a and the rgb is premultiplied by it (matching the edge
+            // path and the perspective OIT premultiplied-alpha convention);
+            // other legacy skeletons keep the historical fully-opaque,
+            // straight-rgb node behaviour (rgb * 1.0 == rgb).
             const roiLegacyNodeAlpha = skeletonParams.hasRoiSegmentColors
               ? "uColor.a"
               : "1.0";
@@ -1069,7 +1079,7 @@ void emitRGBA(vec4 color) {
 }
 void emitRGB(vec3 color) {
   vec3 rgb = color;${roiLegacyColorAssign}
-  emitRGBA(vec4(rgb, ${roiLegacyNodeAlpha}));
+  emitRGBA(vec4(rgb * ${roiLegacyNodeAlpha}, ${roiLegacyNodeAlpha}));
 }
 void emitDefault() {
   emitRGBA(uColor);
@@ -1617,6 +1627,17 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
       // Skip drawing.
       return;
     }
+    if (
+      displayState.roiHighDetailSegments !== undefined &&
+      displayState.roiFilterActive?.value !== true
+    ) {
+      // ROI high-detail pass-2 layer: draw nothing while the filter is inactive.
+      // The worker also empties the visible set then, but this enforces the
+      // "coarse pass-1 shows those tracts instead" invariant even for the frame
+      // before that clear lands (pass-1's hide tier is likewise off when
+      // inactive, so nothing double-draws).
+      return;
+    }
     const modelMatrix = update3dRenderLayerAttachment(
       displayState.transform.value,
       renderContext.projectionParameters.displayDimensionRenderInfo,
@@ -1701,9 +1722,12 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
           return;
         }
         if (color !== undefined) {
-          // Swap in the group's colour/opacity (straight RGBA) for this tract;
-          // the shader premultiplies. Falls back to `color` for any object not
-          // yet in the map (transient during a filter recompute).
+          // Give the shader a STRAIGHT (non-premultiplied) rgba in uColor: the
+          // group's colour/opacity when this tract is in the map, else the
+          // object's own colour with its premultiply undone (a transient during
+          // a filter recompute). getObjectColor returns premultiplied rgb, so if
+          // that value reached uColor.rgb the colour-by-group branch would
+          // premultiply a second time (base*alpha^2).
           let drawColor = color;
           if (roiColorActive) {
             const packed = roiColors!.get(objectId);
@@ -1713,8 +1737,14 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
               tempRoiColor[1] = ((p >>> 8) & 0xff) / 255;
               tempRoiColor[2] = ((p >>> 16) & 0xff) / 255;
               tempRoiColor[3] = ((p >>> 24) & 0xff) / 255;
-              drawColor = tempRoiColor;
+            } else {
+              const a = color[3] > 0 ? color[3] : 1;
+              tempRoiColor[0] = color[0] / a;
+              tempRoiColor[1] = color[1] / a;
+              tempRoiColor[2] = color[2] / a;
+              tempRoiColor[3] = color[3];
             }
+            drawColor = tempRoiColor;
           }
           edgeShader.bind();
           renderHelper.setColor(gl, edgeShader, drawColor);

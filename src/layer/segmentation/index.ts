@@ -699,6 +699,13 @@ function getSpatialSkeletonGridHistogramConfig(
  * shader) and attributes each passing tract the colour of its group.
  */
 function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
+  // High detail drives the pass-2 layer, whose draw loop and pass-1 hide tier
+  // are only meaningful while the filter is effectively active. Zero it out when
+  // the filter is inactive so the worker empties `roiHighDetailSegments` — else
+  // pass-2 would keep drawing (and fetching) the high-detail tracts on top of
+  // the coarse pass-1 bulk (which pass-1 no longer hides once inactive),
+  // double-drawing them.
+  const active = roiFilter.active && roiFilter.hasVisibleRois();
   return roiFilter.groups.map((g) => ({
     rois: g.rois,
     // Pack RGBA: rgb = group colour, a = group opacity. The colour-by-group RGB
@@ -707,7 +714,7 @@ function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
       vec4.fromValues(g.color[0], g.color[1], g.color[2], g.opacity),
     ),
     visible: g.visible,
-    highDetail: g.highDetail,
+    highDetail: g.highDetail && active,
   }));
 }
 
@@ -2282,7 +2289,7 @@ export class SegmentationUserLayer extends Base {
             // render layer: give it a DEDICATED visible set
             // (roiHighDetailSegments) via a proxy group state, so it draws only
             // the high-detail groups' tracts and never touches the user's
-            // selection. Coefficient consumers of the group state read fields
+            // selection. Consumers of the group state read fields
             // (the 6 shared visible-segment objects, hideSegmentZero, …), never
             // methods, so a spread proxy is safe; colouring uses the separate
             // segmentationColorGroupState, which is unchanged.
