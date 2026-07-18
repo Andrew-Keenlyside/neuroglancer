@@ -21,7 +21,7 @@ import {
   ChunkRenderLayerFrontend,
   ChunkSource,
 } from "#src/chunk_manager/frontend.js";
-import type { Roi } from "#src/datasource/zarr-vectors/roi.js";
+import type { RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
 import { hashCombine } from "#src/gpu_hash/hash_function.js";
 import type { HashMapUint64, HashSetUint64 } from "#src/gpu_hash/hash_table.js";
 import { GPUHashTable, HashSetShaderManager } from "#src/gpu_hash/shader.js";
@@ -1359,11 +1359,11 @@ export interface SkeletonLayerDisplayState extends SegmentationDisplayState3D {
   roiFilterActive?: WatchableValueInterface<boolean>;
   roiGhostAlpha?: WatchableValueInterface<number>;
   /**
-   * The ordered ROI list, threaded to the backend (which recomputes
-   * `roiPassingSegments` from it). Plain serialisable geometry — carried here
-   * only to hand to the render layer's shared-object counterpart.
+   * The ordered ROI groups, threaded to the backend (which recomputes
+   * `roiPassingSegments` from them). Plain serialisable data — carried here only
+   * to hand to the render layer's shared-object counterpart.
    */
-  roiConfig?: WatchableValueInterface<readonly Roi[]>;
+  roiGroups?: WatchableValueInterface<readonly RoiGroupConfig[]>;
 }
 
 export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
@@ -3087,9 +3087,9 @@ export class SpatiallyIndexedSkeletonLayer
     };
 
     // ROI streamline filter channel (zarr-vectors tract layers only): hand the
-    // backend the ROI list (so it recomputes the passing set) and the shared
+    // backend the ROI groups (so it recomputes the passing set) and the shared
     // passing set it mutates. `roiPassingSegments` is already a shared object
-    // (it drives this layer's shader too); `roiConfig` is wrapped from the plain
+    // (it drives this layer's shader too); `roiGroups` is wrapped from the plain
     // display-state watchable the way `skeletonLod` is. The active flag and
     // ghost opacity are NOT sent to the backend — they only feed shader uniforms
     // here (the backend keeps the passing set current whenever ROIs exist, so
@@ -3097,13 +3097,13 @@ export class SpatiallyIndexedSkeletonLayer
     // flag, or the ghost opacity changes.
     if (
       displayState.roiPassingSegments !== undefined &&
-      displayState.roiConfig !== undefined &&
+      displayState.roiGroups !== undefined &&
       displayState.roiFilterActive !== undefined
     ) {
       counterpartOptions.roiPassingSegments =
         displayState.roiPassingSegments.rpcId;
-      counterpartOptions.roiConfig = this.registerDisposer(
-        SharedWatchableValue.makeFromExisting(rpc, displayState.roiConfig),
+      counterpartOptions.roiGroups = this.registerDisposer(
+        SharedWatchableValue.makeFromExisting(rpc, displayState.roiGroups),
       ).rpcId;
       const roiRedraw = () => this.redrawNeeded.dispatch();
       this.registerDisposer(

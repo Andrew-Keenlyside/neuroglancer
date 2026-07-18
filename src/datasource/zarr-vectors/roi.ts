@@ -96,6 +96,19 @@ export interface Roi {
   readonly operator: RoiOperator;
 }
 
+/**
+ * One group of ROIs, evaluated together as a single dissection, in the plain
+ * serialisable form the worker consumes. A streamline belongs to the group iff
+ * it passes the group's `rois` (the {@link streamlinePassesRois} include/or/
+ * exclude fold). Every visible group's members are shown; a member is coloured
+ * by `colorPacked` (packed RGBA), which is also its ROI overlays' colour.
+ */
+export interface RoiGroupConfig {
+  readonly rois: readonly Roi[];
+  readonly colorPacked: number;
+  readonly visible: boolean;
+}
+
 /** A streamline: `count` vertices from `start`, in a flat `rank`-strided array. */
 export interface StreamlineRef {
   readonly positions: Float32Array;

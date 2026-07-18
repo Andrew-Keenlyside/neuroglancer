@@ -17,13 +17,19 @@
 /**
  * @file Persisted state for the ROI streamline filter.
  *
- * Self-contained and serialisable: it holds the ordered ROI list (geometry +
- * predicate + operator) and the display options, and round-trips to the URL.
- * Per the design, the URL stores the ROIs and filter config only — never the
- * materialised passing-id set, which is recomputed from the loaded streamlines.
+ * The filter is organised into GROUPS: each group is one named, coloured
+ * dissection holding an ordered ROI list (geometry + predicate + operator,
+ * evaluated as the include/or/exclude fold). A streamline belongs to a group
+ * iff it passes that group's ROIs; every visible group's tracts are shown,
+ * coloured by the group's colour, and everything else is ghosted.
  *
- * `entries` is already a valid `Roi[]` (same field names), so `rois` is a
- * direct view fed to {@link buildRoiList}'s consumers / the per-chunk filter.
+ * Self-contained and serialisable: it round-trips to the URL. Per the design,
+ * the URL stores the groups + ROIs + config only — never the materialised
+ * passing-id set, which is recomputed from the loaded streamlines.
+ *
+ * The mutators reassign arrays (never mutate in place) so downstream mirrors can
+ * detect a change by array identity — treat everything returned here as
+ * immutable and edit via the mutators.
  */
 
 import type {
@@ -36,6 +42,8 @@ import {
   RoiOperator as Op,
   RoiPredicate as Pred,
 } from "#src/datasource/zarr-vectors/roi.js";
+import { serializeColor } from "#src/util/color.js";
+import { vec3 } from "#src/util/geom.js";
 import {
   parseArray,
   verifyFiniteFloat,
@@ -72,6 +80,39 @@ const JSON_TO_OPERATOR = new Map<string, RoiOperator>(
 );
 
 const DEFAULT_GHOST_ALPHA = 0.3;
+
+/** Distinct default group colours, cycled as groups are created. */
+const GROUP_PALETTE = [
+  "#ff3b30",
+  "#34c759",
+  "#0a84ff",
+  "#ffcc00",
+  "#af52de",
+  "#ff9500",
+  "#5ac8fa",
+  "#ff2d55",
+];
+
+/**
+ * Parse `#rrggbb` to an rgb vec3 in [0,1]. Canvas-free (unlike
+ * `parseRGBColorSpecification`, which needs a 2-d context) so this state stays
+ * unit-testable; ROI colours are always hex — from the palette, `serializeColor`,
+ * or an `<input type=color>`.
+ */
+function parseHexColor(hex: string): vec3 {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex.trim());
+  if (m === null) throw new Error(`Invalid hex colour: ${JSON.stringify(hex)}`);
+  const n = Number.parseInt(m[1], 16);
+  return vec3.fromValues(
+    ((n >> 16) & 0xff) / 255,
+    ((n >> 8) & 0xff) / 255,
+    (n & 0xff) / 255,
+  );
+}
+
+function paletteColor(index: number): vec3 {
+  return parseHexColor(GROUP_PALETTE[index % GROUP_PALETTE.length]);
+}
 
 function shapeToJson(shape: RoiShape): any {
   switch (shape.kind) {
@@ -154,8 +195,40 @@ function entryFromJson(obj: any): Roi {
   return { shape, predicate, operator };
 }
 
+/** One named, coloured dissection: an ordered ROI list evaluated as a fold. */
+export interface RoiGroup {
+  /** Stable within a session (not persisted); the tab references groups by it. */
+  readonly id: number;
+  readonly name: string;
+  readonly color: vec3;
+  readonly visible: boolean;
+  readonly rois: readonly Roi[];
+}
+
+function groupToJson(group: RoiGroup): any {
+  const json: any = {
+    name: group.name,
+    color: serializeColor(group.color),
+    rois: group.rois.map(entryToJson),
+  };
+  if (!group.visible) json.visible = false;
+  return json;
+}
+
+function groupFromJson(obj: any, id: number): RoiGroup {
+  verifyObject(obj);
+  return {
+    id,
+    name: verifyObjectProperty(obj, "name", verifyString),
+    color: verifyObjectProperty(obj, "color", (v) => parseHexColor(verifyString(v))),
+    visible:
+      verifyOptionalObjectProperty(obj, "visible", (v) => v === true) ?? true,
+    rois: verifyObjectProperty(obj, "rois", (v) => parseArray(v, entryFromJson)),
+  };
+}
+
 /**
- * The ordered ROI list plus display options, as persisted layer state.
+ * The ordered group list plus display options, as persisted layer state.
  * Implements the `Trackable` contract (`changed`/`toJSON`/`restoreState`/
  * `reset`) so it plugs into the segmentation layer's state under one JSON key.
  */
@@ -164,10 +237,11 @@ export class RoiFilterState {
 
   private active_ = false;
   private ghostAlpha_ = DEFAULT_GHOST_ALPHA;
-  private colorByGroup_ = false;
-  private entries_: Roi[] = [];
+  private colorByGroup_ = true;
+  private groups_: RoiGroup[] = [];
+  private nextGroupId_ = 1;
 
-  /** Whether the filter is applied (ghosting non-passing streamlines). */
+  /** Whether the filter is applied (colouring/ghosting streamlines). */
   get active(): boolean {
     return this.active_;
   }
@@ -188,7 +262,7 @@ export class RoiFilterState {
     this.changed.dispatch();
   }
 
-  /** Whether to recolour passing streamlines by their matched ROI group. */
+  /** Whether to recolour passing streamlines by their group's colour. */
   get colorByGroup(): boolean {
     return this.colorByGroup_;
   }
@@ -198,72 +272,130 @@ export class RoiFilterState {
     this.changed.dispatch();
   }
 
-  /**
-   * The ordered ROI list. Already a valid `Roi[]` for the filter.
-   *
-   * Treat the result as immutable. The render layer mirrors it to the worker by
-   * watching for a new array *reference* on each `changed` dispatch (all the
-   * mutators below reassign `entries_`), so mutating a returned `Roi`/`RoiShape`
-   * in place would silently fail to reach the backend. Edit via the mutators.
-   */
-  get rois(): readonly Roi[] {
-    return this.entries_;
+  /** The ordered group list. Treat as immutable; edit via the mutators. */
+  get groups(): readonly RoiGroup[] {
+    return this.groups_;
   }
 
-  /** Replace the ROI list (used by the authoring UI). */
-  setRois(rois: readonly Roi[]): void {
-    this.entries_ = rois.slice();
+  /** Whether any visible group has at least one ROI (i.e. the filter can act). */
+  hasVisibleRois(): boolean {
+    return this.groups_.some((g) => g.visible && g.rois.length > 0);
+  }
+
+  private groupIndex(id: number): number {
+    return this.groups_.findIndex((g) => g.id === id);
+  }
+
+  /** Append a new empty group with a default name + palette colour; returns its id. */
+  addGroup(): number {
+    const id = this.nextGroupId_++;
+    this.groups_ = [
+      ...this.groups_,
+      {
+        id,
+        name: `Group ${this.groups_.length + 1}`,
+        color: paletteColor(this.groups_.length),
+        visible: true,
+        rois: [],
+      },
+    ];
+    this.changed.dispatch();
+    return id;
+  }
+
+  removeGroup(id: number): void {
+    const next = this.groups_.filter((g) => g.id !== id);
+    if (next.length === this.groups_.length) return;
+    this.groups_ = next;
     this.changed.dispatch();
   }
 
-  /** Append one ROI; returns its index. */
-  addRoi(roi: Roi): number {
-    this.entries_ = [...this.entries_, roi];
-    this.changed.dispatch();
-    return this.entries_.length - 1;
-  }
-
-  /** Replace fields of the ROI at `index` (no-op if out of range). */
-  updateRoi(index: number, changes: Partial<Roi>): void {
-    if (index < 0 || index >= this.entries_.length) return;
-    const next = this.entries_.slice();
-    next[index] = { ...next[index], ...changes };
-    this.entries_ = next;
+  updateGroup(
+    id: number,
+    changes: { name?: string; color?: vec3; visible?: boolean },
+  ): void {
+    const idx = this.groupIndex(id);
+    if (idx < 0) return;
+    const next = this.groups_.slice();
+    next[idx] = { ...next[idx], ...changes };
+    this.groups_ = next;
     this.changed.dispatch();
   }
 
-  /** Remove the ROI at `index` (no-op if out of range). */
-  removeRoi(index: number): void {
-    if (index < 0 || index >= this.entries_.length) return;
-    const next = this.entries_.slice();
-    next.splice(index, 1);
-    this.entries_ = next;
-    this.changed.dispatch();
-  }
-
-  /**
-   * Move the ROI at `from` to position `to`. Order is the whole of the
-   * left-fold syntax, so this is the primary editing operation.
-   */
-  moveRoi(from: number, to: number): void {
-    const n = this.entries_.length;
+  moveGroup(from: number, to: number): void {
+    const n = this.groups_.length;
     if (from < 0 || from >= n || to < 0 || to >= n || from === to) return;
-    const next = this.entries_.slice();
+    const next = this.groups_.slice();
     const [item] = next.splice(from, 1);
     next.splice(to, 0, item);
-    this.entries_ = next;
+    this.groups_ = next;
+    this.changed.dispatch();
+  }
+
+  /** Append one ROI to the group; returns its index, or -1 if the group is gone. */
+  addRoi(groupId: number, roi: Roi): number {
+    const idx = this.groupIndex(groupId);
+    if (idx < 0) return -1;
+    const group = this.groups_[idx];
+    const rois = [...group.rois, roi];
+    const next = this.groups_.slice();
+    next[idx] = { ...group, rois };
+    this.groups_ = next;
+    this.changed.dispatch();
+    return rois.length - 1;
+  }
+
+  updateRoi(groupId: number, roiIndex: number, changes: Partial<Roi>): void {
+    const idx = this.groupIndex(groupId);
+    if (idx < 0) return;
+    const group = this.groups_[idx];
+    if (roiIndex < 0 || roiIndex >= group.rois.length) return;
+    const rois = group.rois.slice();
+    rois[roiIndex] = { ...rois[roiIndex], ...changes };
+    const next = this.groups_.slice();
+    next[idx] = { ...group, rois };
+    this.groups_ = next;
+    this.changed.dispatch();
+  }
+
+  removeRoi(groupId: number, roiIndex: number): void {
+    const idx = this.groupIndex(groupId);
+    if (idx < 0) return;
+    const group = this.groups_[idx];
+    if (roiIndex < 0 || roiIndex >= group.rois.length) return;
+    const rois = group.rois.slice();
+    rois.splice(roiIndex, 1);
+    const next = this.groups_.slice();
+    next[idx] = { ...group, rois };
+    this.groups_ = next;
+    this.changed.dispatch();
+  }
+
+  moveRoi(groupId: number, from: number, to: number): void {
+    const idx = this.groupIndex(groupId);
+    if (idx < 0) return;
+    const group = this.groups_[idx];
+    const n = group.rois.length;
+    if (from < 0 || from >= n || to < 0 || to >= n || from === to) return;
+    const rois = group.rois.slice();
+    const [item] = rois.splice(from, 1);
+    rois.splice(to, 0, item);
+    const next = this.groups_.slice();
+    next[idx] = { ...group, rois };
+    this.groups_ = next;
     this.changed.dispatch();
   }
 
   toJSON(): any {
-    if (!this.active_ && this.entries_.length === 0) {
+    if (!this.active_ && this.groups_.length === 0) {
       return undefined; // stays out of the URL when unused
     }
-    const json: any = { rois: this.entries_.map(entryToJson) };
+    const json: any = {};
+    if (this.groups_.length > 0) json.groups = this.groups_.map(groupToJson);
     if (this.active_) json.active = true;
     if (this.ghostAlpha_ !== DEFAULT_GHOST_ALPHA)
       json.ghostAlpha = this.ghostAlpha_;
-    if (this.colorByGroup_) json.colorByGroup = true;
+    if (!this.colorByGroup_) json.colorByGroup = false;
     return json;
   }
 
@@ -273,31 +405,51 @@ export class RoiFilterState {
       return;
     }
     verifyObject(x);
-    this.entries_ =
-      verifyOptionalObjectProperty(x, "rois", (v) =>
+    this.nextGroupId_ = 1;
+    const groupsJson = verifyOptionalObjectProperty(x, "groups", (v) => v);
+    if (groupsJson !== undefined) {
+      this.groups_ = parseArray(groupsJson, (obj) =>
+        groupFromJson(obj, this.nextGroupId_++),
+      );
+    } else {
+      // Back-compat: an older flat `rois` list restores as one default group.
+      const flatRois = verifyOptionalObjectProperty(x, "rois", (v) =>
         parseArray(v, entryFromJson),
-      ) ?? [];
+      );
+      this.groups_ =
+        flatRois !== undefined && flatRois.length > 0
+          ? [
+              {
+                id: this.nextGroupId_++,
+                name: "Group 1",
+                color: paletteColor(0),
+                visible: true,
+                rois: flatRois,
+              },
+            ]
+          : [];
+    }
     this.active_ =
       verifyOptionalObjectProperty(x, "active", (v) => v === true) ?? false;
     this.ghostAlpha_ =
       verifyOptionalObjectProperty(x, "ghostAlpha", verifyFiniteFloat) ??
       DEFAULT_GHOST_ALPHA;
     this.colorByGroup_ =
-      verifyOptionalObjectProperty(x, "colorByGroup", (v) => v === true) ??
-      false;
+      verifyOptionalObjectProperty(x, "colorByGroup", (v) => v === true) ?? true;
     this.changed.dispatch();
   }
 
   reset(): void {
     const wasDefault =
       !this.active_ &&
-      !this.colorByGroup_ &&
-      this.entries_.length === 0 &&
+      this.colorByGroup_ &&
+      this.groups_.length === 0 &&
       this.ghostAlpha_ === DEFAULT_GHOST_ALPHA;
     this.active_ = false;
     this.ghostAlpha_ = DEFAULT_GHOST_ALPHA;
-    this.colorByGroup_ = false;
-    this.entries_ = [];
+    this.colorByGroup_ = true;
+    this.groups_ = [];
+    this.nextGroupId_ = 1;
     if (!wasDefault) this.changed.dispatch();
   }
 }

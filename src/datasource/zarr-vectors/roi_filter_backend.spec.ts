@@ -21,10 +21,12 @@ import {
   RoiOperator,
   RoiPredicate,
   type Roi,
+  type RoiGroupConfig,
   type RoiShape,
 } from "#src/datasource/zarr-vectors/roi.js";
 import {
   computeChunkCrossings,
+  computeGroupedPassingSet,
   computePassingSet,
   diffPassingSet,
   RoiFilterAccumulator,
@@ -300,6 +302,90 @@ describe("computePassingSet", () => {
     const single = [roi(sphere(0, 0, 0, 1), RoiOperator.AND)];
     expect([...computePassingSet([chunkCrossesA], single)]).toEqual([42n]);
     expect([...computePassingSet([chunkCrossesB], single)]).toEqual([]);
+  });
+});
+
+describe("computeGroupedPassingSet", () => {
+  // Object 1 near origin, object 2 near x=10, object 3 near x=100 (crosses none).
+  const chunk: RoiFilterableChunk = {
+    rank: 3,
+    numVertices: 6,
+    positions: Float32Array.from([
+      -5, 0, 0, 5, 0, 0 /* obj1 */, 5, 0, 0, 15, 0, 0 /* obj2 */, 95, 0, 0, 105,
+      0, 0 /* obj3 */,
+    ]),
+    segmentIds: segColumn([1n, 1n, 2n, 2n, 3n, 3n]),
+    fragmentIndex: rangeIndex([
+      [0, 2],
+      [2, 2],
+      [4, 2],
+    ]),
+  };
+  const RED = 0xff0000;
+  const BLUE = 0x0000ff;
+  const groupA: RoiGroupConfig = {
+    rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
+    colorPacked: RED,
+    visible: true,
+  };
+  const groupB: RoiGroupConfig = {
+    rois: [roi(sphere(10, 0, 0, 1), RoiOperator.AND)],
+    colorPacked: BLUE,
+    visible: true,
+  };
+
+  it("unions passing objects across groups and colours by group", () => {
+    const { passing, colorById } = computeGroupedPassingSet(
+      [chunk],
+      [groupA, groupB],
+    );
+    expect([...passing].sort()).toEqual([1n, 2n]);
+    expect(colorById.get(1n)).toBe(RED);
+    expect(colorById.get(2n)).toBe(BLUE);
+    expect(colorById.has(3n)).toBe(false);
+  });
+
+  it("skips invisible groups entirely", () => {
+    const { passing } = computeGroupedPassingSet(
+      [chunk],
+      [groupA, { ...groupB, visible: false }],
+    );
+    expect([...passing]).toEqual([1n]);
+  });
+
+  it("keeps groups independent (one group's exclusion does not drop another's)", () => {
+    // Group A excludes the x=10 region; group B includes it. B's object 2 must
+    // survive — a flat fold would have A's ANDNOT drop it.
+    const a: RoiGroupConfig = {
+      rois: [
+        roi(sphere(0, 0, 0, 1), RoiOperator.AND),
+        roi(sphere(10, 0, 0, 1), RoiOperator.ANDNOT),
+      ],
+      colorPacked: RED,
+      visible: true,
+    };
+    const { passing } = computeGroupedPassingSet([chunk], [a, groupB]);
+    expect([...passing].sort()).toEqual([1n, 2n]);
+  });
+
+  it("first (topmost) visible group wins the colour for a shared object", () => {
+    // Both groups include the origin region; object 1 is in both -> gets A's.
+    const bAlsoOrigin: RoiGroupConfig = {
+      rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
+      colorPacked: BLUE,
+      visible: true,
+    };
+    const { colorById } = computeGroupedPassingSet(
+      [chunk],
+      [groupA, bAlsoOrigin],
+    );
+    expect(colorById.get(1n)).toBe(RED);
+  });
+
+  it("returns empty for no groups", () => {
+    const { passing, colorById } = computeGroupedPassingSet([chunk], []);
+    expect(passing.size).toBe(0);
+    expect(colorById.size).toBe(0);
   });
 });
 

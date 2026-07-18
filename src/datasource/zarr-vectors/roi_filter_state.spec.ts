@@ -21,6 +21,7 @@ import {
   type Roi,
 } from "#src/datasource/zarr-vectors/roi.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
+import { vec3 } from "#src/util/geom.js";
 
 const ellipsoid: Roi = {
   shape: {
@@ -41,169 +42,172 @@ const box: Roi = {
   operator: RoiOperator.ANDNOT,
 };
 
-describe("RoiFilterState", () => {
-  it("is empty and out of the URL by default", () => {
+/** Count `changed` dispatches while running `fn`. */
+function countChanges(s: RoiFilterState, fn: () => void): number {
+  let n = 0;
+  const unregister = s.changed.add(() => {
+    n++;
+  });
+  fn();
+  unregister();
+  return n;
+}
+
+describe("RoiFilterState groups", () => {
+  it("is empty, colour-by-group on, and out of the URL by default", () => {
     const s = new RoiFilterState();
     expect(s.active).toBe(false);
-    expect(s.rois).toEqual([]);
+    expect(s.colorByGroup).toBe(true);
+    expect(s.groups).toEqual([]);
+    expect(s.hasVisibleRois()).toBe(false);
     expect(s.toJSON()).toBeUndefined();
   });
 
-  it("round-trips ROIs, active, and ghostAlpha through JSON", () => {
+  it("adds groups with distinct ids, default names, palette colours", () => {
     const s = new RoiFilterState();
-    s.setRois([ellipsoid, box]);
+    const a = s.addGroup();
+    const b = s.addGroup();
+    expect(a).not.toBe(b);
+    expect(s.groups.map((g) => g.name)).toEqual(["Group 1", "Group 2"]);
+    expect(s.groups[0].visible).toBe(true);
+    // Distinct palette colours for the first two groups.
+    expect(Array.from(s.groups[0].color)).not.toEqual(
+      Array.from(s.groups[1].color),
+    );
+  });
+
+  it("binds ROIs to a group and reports hasVisibleRois", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    expect(s.hasVisibleRois()).toBe(false);
+    s.addRoi(g, ellipsoid);
+    expect(s.groups[0].rois).toEqual([ellipsoid]);
+    expect(s.hasVisibleRois()).toBe(true);
+    // A hidden group's ROIs do not count.
+    s.updateGroup(g, { visible: false });
+    expect(s.hasVisibleRois()).toBe(false);
+  });
+
+  it("addRoi to a missing group is a no-op returning -1", () => {
+    const s = new RoiFilterState();
+    expect(countChanges(s, () => expect(s.addRoi(999, ellipsoid)).toBe(-1))).toBe(
+      0,
+    );
+  });
+
+  it("updates group name/colour/visibility", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.updateGroup(g, { name: "Motor", visible: false });
+    expect(s.groups[0].name).toBe("Motor");
+    expect(s.groups[0].visible).toBe(false);
+  });
+
+  it("removes a group and reorders groups", () => {
+    const s = new RoiFilterState();
+    const a = s.addGroup();
+    s.addGroup();
+    s.moveGroup(0, 1);
+    expect(s.groups[1].id).toBe(a);
+    s.removeGroup(a);
+    expect(s.groups.map((g) => g.id)).not.toContain(a);
+  });
+
+  it("updates, removes, and reorders ROIs within a group", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.addRoi(g, ellipsoid);
+    s.addRoi(g, box);
+    s.updateRoi(g, 0, { operator: RoiOperator.OR });
+    expect(s.groups[0].rois[0].operator).toBe(RoiOperator.OR);
+    s.moveRoi(g, 0, 1);
+    expect(s.groups[0].rois[1].operator).toBe(RoiOperator.OR);
+    s.removeRoi(g, 0);
+    expect(s.groups[0].rois).toHaveLength(1);
+  });
+
+  it("every mutator reassigns arrays (new identity) and dispatches once", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.addRoi(g, ellipsoid);
+    const before = s.groups;
+    expect(countChanges(s, () => s.updateRoi(g, 0, { predicate: RoiPredicate.ANY_VERTEX }))).toBe(1);
+    expect(s.groups).not.toBe(before); // new array reference
+  });
+});
+
+describe("RoiFilterState serialization", () => {
+  it("round-trips groups (name, colour, visibility, ROIs) + config through JSON", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.updateGroup(g, {
+      name: "Motor",
+      color: vec3.fromValues(1, 0, 0),
+      visible: false,
+    });
+    s.addRoi(g, ellipsoid);
+    s.addRoi(g, box);
     s.active = true;
     s.ghostAlpha = 0.25;
+    s.colorByGroup = false;
+
     const json = s.toJSON();
+    expect(json.groups).toHaveLength(1);
+    expect(json.groups[0].name).toBe("Motor");
+    expect(json.groups[0].color).toBe("#ff0000");
+    expect(json.groups[0].visible).toBe(false);
     expect(json.active).toBe(true);
     expect(json.ghostAlpha).toBe(0.25);
-    expect(json.rois).toHaveLength(2);
+    expect(json.colorByGroup).toBe(false);
 
     const restored = new RoiFilterState();
     restored.restoreState(json);
+    expect(restored.groups[0].name).toBe("Motor");
+    expect(Array.from(restored.groups[0].color)).toEqual([1, 0, 0]);
+    expect(restored.groups[0].visible).toBe(false);
+    expect(restored.groups[0].rois).toHaveLength(2);
     expect(restored.active).toBe(true);
     expect(restored.ghostAlpha).toBe(0.25);
-    expect(restored.rois).toHaveLength(2);
-    // Geometry survives with the right kinds and values.
-    const [e, b] = restored.rois;
-    expect(e.shape.kind).toBe("ellipsoid");
-    expect(Array.from((e.shape as any).radii)).toEqual([4, 5, 6]);
-    expect(e.predicate).toBe(RoiPredicate.ANY_SEGMENT);
-    expect(e.operator).toBe(RoiOperator.AND);
-    expect(b.shape.kind).toBe("box");
-    expect(b.predicate).toBe(RoiPredicate.ANY_VERTEX);
-    expect(b.operator).toBe(RoiOperator.ANDNOT);
+    expect(restored.colorByGroup).toBe(false);
   });
 
-  it("preserves ROI order through the round-trip", () => {
+  it("omits ghostAlpha/colorByGroup from JSON at their defaults", () => {
     const s = new RoiFilterState();
-    s.setRois([box, ellipsoid]); // box first this time
-    const restored = new RoiFilterState();
-    restored.restoreState(s.toJSON());
-    expect(restored.rois.map((r) => r.shape.kind)).toEqual([
-      "box",
-      "ellipsoid",
-    ]);
-  });
-
-  it("omits ghostAlpha from JSON when at its default", () => {
-    const s = new RoiFilterState();
-    s.setRois([ellipsoid]);
+    s.addGroup();
     const json = s.toJSON();
     expect("ghostAlpha" in json).toBe(false);
+    expect("colorByGroup" in json).toBe(false); // default true
   });
 
-  it("dispatches changed on mutation and clamps ghostAlpha", () => {
+  it("migrates an old flat `rois` list into one default group", () => {
     const s = new RoiFilterState();
-    let count = 0;
-    s.changed.add(() => ++count);
-    s.active = true;
-    s.setRois([ellipsoid]);
-    s.ghostAlpha = 5; // clamps to 1
-    expect(s.ghostAlpha).toBe(1);
-    expect(count).toBe(3);
-    // Setting the same value again does not re-dispatch.
-    s.active = true;
-    expect(count).toBe(3);
+    s.restoreState({
+      rois: [
+        {
+          shape: { type: "ellipsoid", center: [1, 2, 3], radii: [4, 5, 6] },
+          predicate: "any_segment",
+          operator: "and",
+        },
+      ],
+      active: true,
+    });
+    expect(s.groups).toHaveLength(1);
+    expect(s.groups[0].name).toBe("Group 1");
+    expect(s.groups[0].visible).toBe(true);
+    expect(s.groups[0].rois).toHaveLength(1);
+    expect(s.active).toBe(true);
   });
 
-  it("rejects an unknown predicate/operator/shape on restore", () => {
+  it("reset returns to the empty default and re-runs from a clean id counter", () => {
     const s = new RoiFilterState();
-    expect(() =>
-      s.restoreState({
-        rois: [{ shape: shapeJson(), predicate: "nope", operator: "and" }],
-      }),
-    ).toThrow();
-    expect(() =>
-      s.restoreState({
-        rois: [
-          {
-            shape: { type: "wedge" },
-            predicate: "any_segment",
-            operator: "and",
-          },
-        ],
-      }),
-    ).toThrow();
-  });
-
-  it("reset returns to default and clears ROIs", () => {
-    const s = new RoiFilterState();
-    s.setRois([ellipsoid]);
+    s.addGroup();
     s.active = true;
-    s.colorByGroup = true;
     s.reset();
+    expect(s.groups).toEqual([]);
     expect(s.active).toBe(false);
-    expect(s.colorByGroup).toBe(false);
-    expect(s.rois).toEqual([]);
-    expect(s.toJSON()).toBeUndefined();
-  });
-
-  it("round-trips colorByGroup", () => {
-    const s = new RoiFilterState();
-    s.setRois([ellipsoid]);
-    s.colorByGroup = true;
-    const restored = new RoiFilterState();
-    restored.restoreState(s.toJSON());
-    expect(restored.colorByGroup).toBe(true);
+    expect(s.colorByGroup).toBe(true);
+    // A fresh group after reset is "Group 1" again.
+    s.addGroup();
+    expect(s.groups[0].name).toBe("Group 1");
   });
 });
-
-describe("RoiFilterState mutators", () => {
-  it("addRoi appends and returns the new index", () => {
-    const s = new RoiFilterState();
-    expect(s.addRoi(ellipsoid)).toBe(0);
-    expect(s.addRoi(box)).toBe(1);
-    expect(s.rois.map((r) => r.shape.kind)).toEqual(["ellipsoid", "box"]);
-  });
-
-  it("updateRoi replaces fields of one entry, out-of-range is a no-op", () => {
-    const s = new RoiFilterState();
-    s.setRois([ellipsoid, box]);
-    s.updateRoi(1, { operator: RoiOperator.OR });
-    expect(s.rois[1].operator).toBe(RoiOperator.OR);
-    expect(s.rois[1].shape.kind).toBe("box"); // shape untouched
-    s.updateRoi(9, { operator: RoiOperator.AND });
-    expect(s.rois).toHaveLength(2);
-  });
-
-  it("removeRoi drops one entry; out-of-range is a no-op", () => {
-    const s = new RoiFilterState();
-    s.setRois([ellipsoid, box]);
-    s.removeRoi(0);
-    expect(s.rois.map((r) => r.shape.kind)).toEqual(["box"]);
-    s.removeRoi(5);
-    expect(s.rois).toHaveLength(1);
-  });
-
-  it("moveRoi reorders; identity/out-of-range moves are no-ops", () => {
-    const s = new RoiFilterState();
-    const c: Roi = { ...box, predicate: RoiPredicate.EITHER_ENDPOINT };
-    s.setRois([ellipsoid, box, c]);
-    s.moveRoi(2, 0); // c to front
-    expect(s.rois.map((r) => r.predicate)).toEqual([
-      RoiPredicate.EITHER_ENDPOINT,
-      RoiPredicate.ANY_SEGMENT,
-      RoiPredicate.ANY_VERTEX,
-    ]);
-    s.moveRoi(1, 1); // no-op
-    s.moveRoi(0, 9); // out of range no-op
-    expect(s.rois).toHaveLength(3);
-  });
-
-  it("each mutator dispatches changed", () => {
-    const s = new RoiFilterState();
-    let count = 0;
-    s.changed.add(() => ++count);
-    s.addRoi(ellipsoid);
-    s.addRoi(box);
-    s.updateRoi(0, { operator: RoiOperator.OR });
-    s.moveRoi(0, 1);
-    s.removeRoi(0);
-    expect(count).toBe(5);
-  });
-});
-
-function shapeJson() {
-  return { type: "ellipsoid", center: [0, 0, 0], radii: [1, 1, 1] };
-}

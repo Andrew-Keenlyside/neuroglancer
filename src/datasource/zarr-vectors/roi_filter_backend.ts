@@ -29,7 +29,11 @@
  */
 
 import type { FragmentIndex } from "#src/datasource/zarr-vectors/fragment_index.js";
-import type { Roi, StreamlineRef } from "#src/datasource/zarr-vectors/roi.js";
+import type {
+  Roi,
+  RoiGroupConfig,
+  StreamlineRef,
+} from "#src/datasource/zarr-vectors/roi.js";
 import {
   combineRoiVerdicts,
   streamlinePassesRoi,
@@ -236,4 +240,35 @@ export function diffPassingSet(
     if (!target.has(id)) removed.push(id);
   }
   return { added, removed };
+}
+
+/**
+ * Evaluate several ROI groups against one batch of chunks. Each visible group
+ * is an independent dissection (its own include/or/exclude fold), so groups are
+ * computed separately — flattening them into one fold would wrongly let one
+ * group's exclusion drop another group's tracts.
+ *
+ * Returns the union of all visible groups' passing objects (what the ghost
+ * shader keeps visible) and, per passing object, the packed colour of the FIRST
+ * (topmost) visible group it belongs to — the group-colour attribution the
+ * frontend paints tracts with. Empty/invisible groups contribute nothing.
+ */
+export function computeGroupedPassingSet(
+  chunks: Iterable<RoiFilterableChunk>,
+  groups: readonly RoiGroupConfig[],
+): { passing: Set<bigint>; colorById: Map<bigint, number> } {
+  const passing = new Set<bigint>();
+  const colorById = new Map<bigint, number>();
+  // The chunk iterable may be single-use (a generator); materialise it once so
+  // every group sees the same batch.
+  const chunkArray = Array.isArray(chunks) ? chunks : [...chunks];
+  for (const group of groups) {
+    if (!group.visible || group.rois.length === 0) continue;
+    for (const id of computePassingSet(chunkArray, group.rois)) {
+      passing.add(id);
+      // First group in list order wins the colour (topmost, deterministic).
+      if (!colorById.has(id)) colorById.set(id, group.colorPacked);
+    }
+  }
+  return { passing, colorById };
 }

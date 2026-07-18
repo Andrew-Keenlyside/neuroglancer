@@ -23,13 +23,13 @@ import {
   withChunkManager,
 } from "#src/chunk_manager/backend.js";
 import { ChunkState } from "#src/chunk_manager/base.js";
-import type { Roi } from "#src/datasource/zarr-vectors/roi.js";
+import type { RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
 // Pure ROI geometry (no zarr/render deps) drives the streamline filter's
 // backend recompute for zarr-vectors spatially-indexed skeleton (tract) layers.
 // Inert for every other skeleton layer: the whole feature is guarded on the
 // per-layer `roiPassingSegments` shared set being present (undefined here).
 import {
-  computePassingSet,
+  computeGroupedPassingSet,
   diffPassingSet,
   type RoiFilterableChunk,
 } from "#src/datasource/zarr-vectors/roi_filter_backend.js";
@@ -579,14 +579,14 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   // case the recompute is a no-op and this layer behaves exactly as before.
   //   - roiPassingSegments: shared set of object ids that pass the filter; this
   //     backend mutates it, the frontend's twin drives the ghosting shader.
-  //   - roiConfig: the ordered ROI list (plain serialisable geometry).
+  //   - roiGroups: the ordered ROI groups (each an independent dissection).
   // The passing set is computed whenever ROIs exist, independent of whether the
   // user has the filter switched on — the *active* flag is purely a frontend
   // shader concern (uRoiFilterActive), so keeping the set current means enabling
   // the filter is instant rather than flashing the whole tractogram to
   // ghost-alpha while an async recompute catches up.
   roiPassingSegments?: Uint64Set;
-  roiConfig?: SharedWatchableValue<readonly Roi[]>;
+  roiGroups?: SharedWatchableValue<readonly RoiGroupConfig[]>;
   /** Set when an ROI edit needs a recompute even if the resident chunk set is unchanged. */
   private roiRecomputePending = false;
   /** Signature of the last resident-chunk set filtered over, to skip redundant recomputes. */
@@ -686,12 +686,12 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     // is unchanged; schedule one and let the late-priorities hook run it.
     if (options.roiPassingSegments !== undefined) {
       this.roiPassingSegments = rpc.get(options.roiPassingSegments);
-      const roiConfig = (this.roiConfig = rpc.get(options.roiConfig));
+      const roiGroups = (this.roiGroups = rpc.get(options.roiGroups));
       const scheduleRoiRecompute = () => {
         this.roiRecomputePending = true;
         this.chunkManager.scheduleUpdateChunkPriorities();
       };
-      this.registerDisposer(roiConfig.changed.add(scheduleRoiRecompute));
+      this.registerDisposer(roiGroups.changed.add(scheduleRoiRecompute));
     }
   }
 
@@ -746,12 +746,13 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
    */
   private maybeRecomputeRoiPassingSet() {
     const passingSet = this.roiPassingSegments;
-    if (passingSet === undefined || this.roiConfig === undefined) return;
-    // Compute whenever ROIs exist, regardless of the (frontend-only) active
-    // flag, so enabling the filter is instant. An empty ROI list yields an
-    // empty passing set; the shader treats "active with no ROIs" as off, so an
-    // empty set is never mistaken for "everything fails".
-    const rois = this.roiConfig.value;
+    if (passingSet === undefined || this.roiGroups === undefined) return;
+    // Compute whenever any visible group has ROIs, regardless of the
+    // (frontend-only) active flag, so enabling the filter is instant. No ROIs
+    // yields an empty passing set; the shader treats "active with no ROIs" as
+    // off, so an empty set is never mistaken for "everything fails".
+    const groups = this.roiGroups.value;
+    const hasRois = groups.some((g) => g.visible && g.rois.length !== 0);
     const lod3d = this.skeletonLod.value;
     const lod2d = this.skeletonLod2d.value;
 
@@ -761,7 +762,7 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
       number,
       { chunks: RoiFilterableChunk[]; count: number; hash: number }
     >();
-    if (rois.length !== 0) {
+    if (hasRois) {
       for (const source of this.roiFilterableSources()) {
         for (const chunk of source.chunks.values()) {
           const c = chunk as SpatiallyIndexedSkeletonChunk;
@@ -791,9 +792,11 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     this.roiRecomputePending = false;
     this.roiLastChunkSignature = signature;
 
-    const target = computePassingSet(chunks, rois);
+    // Union of every visible group's passing tracts drives the ghost shader.
+    // (Per-group colour attribution is applied in a later step.)
+    const { passing } = computeGroupedPassingSet(chunks, groups);
     const current = new Set<bigint>(passingSet.keys());
-    const { added, removed } = diffPassingSet(target, current);
+    const { added, removed } = diffPassingSet(passing, current);
     if (removed.length !== 0) passingSet.delete(removed);
     if (added.length !== 0) passingSet.add(added);
   }

@@ -29,7 +29,7 @@ import {
   LocalDataSource,
   localEquivalencesUrl,
 } from "#src/datasource/local.js";
-import type { Roi } from "#src/datasource/zarr-vectors/roi.js";
+import type { RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import { StreamlineFilterTab } from "#src/datasource/zarr-vectors/streamline_filter_tab.js";
 import type {
@@ -682,6 +682,20 @@ function getSpatialSkeletonGridHistogramConfig(
   return { origin: roundedOrigin, binSize: roundedBinSize };
 }
 
+/**
+ * Flatten the persisted ROI groups into the plain, structured-clone-safe form
+ * the worker consumes: each group's ROI list, its colour packed to an int, and
+ * its visibility. The worker unions the visible groups' passing tracts (ghost
+ * shader) and attributes each passing tract the colour of its group.
+ */
+function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
+  return roiFilter.groups.map((g) => ({
+    rois: g.rois,
+    colorPacked: packColor(g.color),
+    visible: g.visible,
+  }));
+}
+
 class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   constructor(public layer: SegmentationUserLayer) {
     // Even though `SegmentationUserLayer` assigns this to its `displayState` property, redundantly
@@ -857,14 +871,14 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
    * left undefined otherwise, so the skeleton shader's ROI tier stays inert for
    * every other segmentation layer. Mirror the persisted {@link roiFilter}
    * (URL truth) into non-persisted watchables the render layer / backend read:
-   * `roiConfig`/`roiFilterActive` feed the worker's passing-set recompute,
+   * `roiGroups`/`roiFilterActive` feed the worker's passing-set recompute,
    * `roiFilterActive`/`roiGhostAlpha` drive the shader uniforms, and the worker
    * mutates `roiPassingSegments` to say which streamlines survive.
    */
   roiPassingSegments?: Uint64Set;
   roiFilterActive?: WatchableValue<boolean>;
   roiGhostAlpha?: WatchableValue<number>;
-  roiConfig?: WatchableValue<readonly Roi[]>;
+  roiGroups?: WatchableValue<readonly RoiGroupConfig[]>;
   spatialSkeletonGridLevel2d = new TrackableValue<number>(
     0,
     verifyNonnegativeInt,
@@ -1857,7 +1871,7 @@ export class SegmentationUserLayer extends Base {
    * return immediately.
    *
    * Bridges the persisted {@link RoiFilterState} (URL truth) to the render
-   * layer / worker: `roiConfig`, `roiFilterActive`, and `roiGhostAlpha` mirror
+   * layer / worker: `roiGroups`, `roiFilterActive`, and `roiGhostAlpha` mirror
    * it into plain watchables (the render layer wraps the first two as shared
    * objects for the worker's passing-set recompute, and the shader reads
    * active/ghostAlpha as uniforms); `roiPassingSegments` is the shared set the
@@ -1873,14 +1887,17 @@ export class SegmentationUserLayer extends Base {
       Uint64Set.makeWithCounterpart(rpc),
     );
     // Effective-active: the shader ghosts non-passing streamlines only when the
-    // user has the filter on AND there is at least one ROI. With zero ROIs an
+    // user has the filter on AND some visible group has an ROI. With no ROIs an
     // empty passing set would otherwise ghost EVERY streamline (nothing is
-    // "passing"), whereas "no ROIs" means "no filter". Folding the ROI count in
-    // here keeps that case correct without the shader needing to know it.
-    const effectiveActive = () => roiFilter.active && roiFilter.rois.length > 0;
+    // "passing"), whereas "no ROIs" means "no filter". Folding that in here
+    // keeps the case correct without the shader needing to know it.
+    const effectiveActive = () =>
+      roiFilter.active && roiFilter.hasVisibleRois();
     const active = new WatchableValue<boolean>(effectiveActive());
     const ghostAlpha = new WatchableValue<number>(roiFilter.ghostAlpha);
-    const config = new WatchableValue<readonly Roi[]>(roiFilter.rois);
+    const groups = new WatchableValue<readonly RoiGroupConfig[]>(
+      buildRoiGroupConfigs(roiFilter),
+    );
     // Push URL-truth changes into the non-persisted watchables. Each setter
     // only dispatches when its value actually changed, so an unrelated edit
     // (e.g. colour-by-group) does not needlessly re-trigger a worker recompute.
@@ -1888,13 +1905,13 @@ export class SegmentationUserLayer extends Base {
       roiFilter.changed.add(() => {
         active.value = effectiveActive();
         ghostAlpha.value = roiFilter.ghostAlpha;
-        config.value = roiFilter.rois;
+        groups.value = buildRoiGroupConfigs(roiFilter);
       }),
     );
     displayState.roiPassingSegments = passingSegments;
     displayState.roiFilterActive = active;
     displayState.roiGhostAlpha = ghostAlpha;
-    displayState.roiConfig = config;
+    displayState.roiGroups = groups;
   }
 
   activateDataSubsources(subsources: Iterable<LoadedDataSubsource>) {
