@@ -951,6 +951,7 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   roiGhostAlpha?: WatchableValue<number>;
   roiGroups?: WatchableValue<readonly RoiGroupConfig[]>;
   roiSegmentColors?: Uint64Map;
+  roiColorByGroup?: WatchableValue<boolean>;
   spatialSkeletonGridLevel2d = new TrackableValue<number>(
     0,
     verifyNonnegativeInt,
@@ -1986,27 +1987,22 @@ export class SegmentationUserLayer extends Base {
     displayState.roiGroups = groups;
 
     // Colour-by-group: the worker fills `segmentColors` (id -> packed group
-    // colour) for passing tracts. Mirror it into `segmentStatedColors` — which
-    // the dynamic skeleton shader already resolves per object, winning over the
-    // hash colour — when colour-by-group is on; clear it when off (directional
-    // RGB returns). Debounced so a worker colour batch or an ROI edit triggers
-    // one rebuild, not one per id.
+    // colour) for passing tracts, which a dedicated ROI colour shader tier reads
+    // DIRECTLY to override the streamline's directional RGB. It deliberately
+    // does NOT touch the user-facing `segmentStatedColors` map (reusing that
+    // clobbers manual segment colours and bakes the materialised colour set into
+    // the URL). `colorByGroup` drives the tier's on/off shader uniform.
     const segmentColors = this.registerDisposer(
       Uint64Map.makeWithCounterpart(rpc),
     );
-    const applyRoiColors = () => {
-      const stated = displayState.segmentStatedColors.value;
-      if (roiFilter.colorByGroup) {
-        stated.assignFrom(segmentColors);
-      } else if (stated.size !== 0) {
-        stated.clear();
-      }
-    };
-    const debouncedApplyRoiColors = debounce(applyRoiColors, 0);
-    this.registerDisposer(() => debouncedApplyRoiColors.cancel());
-    this.registerDisposer(segmentColors.changed.add(debouncedApplyRoiColors));
-    this.registerDisposer(roiFilter.changed.add(debouncedApplyRoiColors));
+    const colorByGroup = new WatchableValue<boolean>(roiFilter.colorByGroup);
+    this.registerDisposer(
+      roiFilter.changed.add(() => {
+        colorByGroup.value = roiFilter.colorByGroup;
+      }),
+    );
     displayState.roiSegmentColors = segmentColors;
+    displayState.roiColorByGroup = colorByGroup;
   }
 
   /**
@@ -2038,6 +2034,13 @@ export class SegmentationUserLayer extends Base {
       source,
       RenderLayerRole.DEFAULT_ANNOTATION,
     );
+    // The overlay colour/hide-2d shader lives on the layer-shared annotation
+    // display state; restore whatever was there when the tract source goes away
+    // so it does not linger onto any other annotations the layer might gain.
+    const previousShader = this.annotationDisplayState.shader.value;
+    refCounted.registerDisposer(() => {
+      this.annotationDisplayState.shader.value = previousShader;
+    });
     const refs: AnnotationReference[] = [];
     const sync = () => {
       this.annotationDisplayState.shader.value = roiFilter.hideOverlays2d

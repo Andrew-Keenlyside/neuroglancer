@@ -244,10 +244,14 @@ export class StreamlineFilterTab extends Tab {
   // --- structural rebuild ---------------------------------------------------
 
   private structuralSignature(): string {
+    // Include each ROI's shape kind so a restore that keeps ids + counts but
+    // changes a kind still rebuilds (the sliders are wired per kind); exclude
+    // group colour/name/visibility (bound live to inputs — rebuilding on those
+    // would recreate an input mid-edit).
     return (
       `${this.activeGroupId}|` +
       this.roiFilter.groups
-        .map((g) => `${g.id}:${g.rois.length}`)
+        .map((g) => `${g.id}:${g.rois.map((r) => r.shape.kind[0]).join("")}`)
         .join(",")
     );
   }
@@ -287,7 +291,11 @@ export class StreamlineFilterTab extends Tab {
       text: "+ New group",
       title: "Create a new tract group",
       onClick: () => {
+        // addGroup() dispatches `changed` (which rebuilds with the OLD active
+        // group) before returning the new id; re-run onChanged so the new group
+        // becomes active and its ROI-add buttons show.
         this.activeGroupId = this.roiFilter.addGroup();
+        this.onChanged();
       },
     });
     addGroup.classList.add("neuroglancer-streamline-filter-add-group");
@@ -421,9 +429,12 @@ export class StreamlineFilterTab extends Tab {
 
     const controls = document.createElement("div");
     controls.classList.add("neuroglancer-streamline-filter-roi-controls");
-    // Role: first ROI seeds the fold, so its operator is fixed to Include.
-    const role = makeSelect(ROLE_OPTIONS, roi.operator, (v) =>
-      this.roiFilter.updateRoi(groupId, index, { operator: v }),
+    // Role: the first ROI seeds the fold, so its operator is ignored — always
+    // show it as Include (even if a reorder left a stale operator on it).
+    const role = makeSelect(
+      ROLE_OPTIONS,
+      index === 0 ? RoiOperator.AND : roi.operator,
+      (v) => this.roiFilter.updateRoi(groupId, index, { operator: v }),
     );
     if (index === 0) role.disabled = true;
     controls.appendChild(labelled("Role", role));
@@ -475,9 +486,10 @@ export class StreamlineFilterTab extends Tab {
         slider(
           axisName[i] ?? `x${i}`,
           this.axisRange(i),
-          () => this.currentShape(groupId, index, "ellipsoid").center[i],
+          () => this.currentShape(groupId, index, "ellipsoid")?.center[i] ?? 0,
           (v) => {
             const s = this.currentShape(groupId, index, "ellipsoid");
+            if (s === undefined) return;
             const center = Float32Array.from(s.center);
             center[i] = v;
             this.roiFilter.updateRoi(groupId, index, {
@@ -489,9 +501,10 @@ export class StreamlineFilterTab extends Tab {
       slider(
         "radius",
         { min: 0, max: this.maxExtent() / 2 },
-        () => this.currentShape(groupId, index, "ellipsoid").radii[0],
+        () => this.currentShape(groupId, index, "ellipsoid")?.radii[0] ?? 0,
         (v) => {
           const s = this.currentShape(groupId, index, "ellipsoid");
+          if (s === undefined) return;
           const radii = new Float32Array(s.radii.length).fill(v);
           this.roiFilter.updateRoi(groupId, index, { shape: { ...s, radii } });
         },
@@ -501,9 +514,13 @@ export class StreamlineFilterTab extends Tab {
         slider(
           `${axisName[i] ?? i}`,
           this.axisRange(i),
-          () => boxCentre(this.currentShape(groupId, index, "box"))[i],
+          () => {
+            const s = this.currentShape(groupId, index, "box");
+            return s === undefined ? 0 : boxCentre(s)[i];
+          },
           (v) => {
             const s = this.currentShape(groupId, index, "box");
+            if (s === undefined) return;
             const centre = boxCentre(s);
             centre[i] = v;
             this.roiFilter.updateRoi(groupId, index, {
@@ -516,9 +533,13 @@ export class StreamlineFilterTab extends Tab {
         slider(
           `size ${axisName[i] ?? i}`,
           { min: 0, max: this.maxExtent() },
-          () => boxSize(this.currentShape(groupId, index, "box"))[i],
+          () => {
+            const s = this.currentShape(groupId, index, "box");
+            return s === undefined ? 0 : boxSize(s)[i];
+          },
           (v) => {
             const s = this.currentShape(groupId, index, "box");
+            if (s === undefined) return;
             const size = boxSize(s);
             size[i] = v;
             this.roiFilter.updateRoi(groupId, index, {
@@ -531,18 +552,23 @@ export class StreamlineFilterTab extends Tab {
     return box;
   }
 
-  /** Re-read the current shape of an ROI (it may have changed under the slider). */
+  /**
+   * Re-read the current shape of an ROI, or `undefined` if it is gone or its
+   * kind changed. Returning undefined (not throwing) keeps a stale slider
+   * handler harmless if it fires on the same `changed` dispatch that deleted the
+   * ROI, before the structural rebuild disposes the widget.
+   */
   private currentShape<K extends RoiShape["kind"]>(
     groupId: number,
     index: number,
     kind: K,
-  ): Extract<RoiShape, { kind: K }> {
-    const group = this.roiFilter.groups.find((g) => g.id === groupId);
-    const shape = group?.rois[index]?.shape;
-    if (shape === undefined || shape.kind !== kind) {
-      throw new Error("ROI shape changed out from under the slider");
-    }
-    return shape as Extract<RoiShape, { kind: K }>;
+  ): Extract<RoiShape, { kind: K }> | undefined {
+    const shape = this.roiFilter.groups.find((g) => g.id === groupId)?.rois[
+      index
+    ]?.shape;
+    return shape !== undefined && shape.kind === kind
+      ? (shape as Extract<RoiShape, { kind: K }>)
+      : undefined;
   }
 
   // --- ROI creation ---------------------------------------------------------
