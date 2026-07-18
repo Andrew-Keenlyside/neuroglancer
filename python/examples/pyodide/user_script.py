@@ -44,8 +44,17 @@ TEST_TRACTOGRAM = (
 viewer = neuroglancer.Viewer()
 
 with viewer.txn() as s:
-    s.layers["tracts"] = neuroglancer.SegmentationLayer(source=TEST_TRACTOGRAM)
+    tracts = neuroglancer.SegmentationLayer(source=TEST_TRACTOGRAM)
+    s.layers["tracts"] = tracts
     s.layout = "4panel"
+
+    # Render the streamlines as thin lines. In the 2-d slices default to lines
+    # only (no per-node dots, which clutter a dense tractogram), and draw
+    # passing streamlines fully opaque there (the slice default is 0.5). The
+    # ROI filter dims non-passing streamlines to `DEFAULT_GHOST_ALPHA` (0.3).
+    tracts.skeleton_rendering.mode2d = "lines"
+    tracts.skeleton_rendering.line_width2d = 2
+    tracts.selected_alpha = 1  # passing ("on") streamline opacity in 2-d
 
     # Load sparse-first. The pyramid holds ~503k / 50k / 5k / 503 / 50 whole
     # streamlines at levels 0..4; the GPU-memory budget picks the finest level

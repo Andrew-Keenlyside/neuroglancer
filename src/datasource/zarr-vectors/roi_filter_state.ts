@@ -71,7 +71,7 @@ const JSON_TO_OPERATOR = new Map<string, RoiOperator>(
   ]),
 );
 
-const DEFAULT_GHOST_ALPHA = 0.1;
+const DEFAULT_GHOST_ALPHA = 0.3;
 
 function shapeToJson(shape: RoiShape): any {
   switch (shape.kind) {
