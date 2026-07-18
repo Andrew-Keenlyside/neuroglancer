@@ -226,18 +226,8 @@ export class StreamlineFilterTab extends Tab {
       ),
     );
     header.appendChild(labelled("Hide regions in 2-d", hide2d.element));
-
-    const ghost = this.registerDisposer(
-      new RangeWidget(
-        fieldWatchable(
-          this.roiFilter.changed,
-          () => this.roiFilter.ghostAlpha,
-          (v) => (this.roiFilter.ghostAlpha = v),
-        ),
-        { min: 0, max: 1, step: 0.01 },
-      ),
-    );
-    header.appendChild(labelled("Non-passing opacity", ghost.element));
+    // The non-passing ("off") opacity now lives on the Render tab as a global
+    // setting; per-group "on" opacity is a slider on each group row below.
     return header;
   }
 
@@ -279,11 +269,21 @@ export class StreamlineFilterTab extends Tab {
     const el = this.bodyEl;
     el.textContent = "";
 
-    // Group list.
+    // Group list. The selected group's ROIs + add-buttons nest directly under
+    // its row, so it is clear the ROIs belong to that group.
     const groupList = document.createElement("div");
     groupList.classList.add("neuroglancer-streamline-filter-group-list");
     for (const group of this.roiFilter.groups) {
-      groupList.appendChild(this.makeGroupRow(group));
+      const container = document.createElement("div");
+      container.classList.add("neuroglancer-streamline-filter-group");
+      if (group.id === this.activeGroupId) {
+        container.classList.add("neuroglancer-selected");
+      }
+      container.appendChild(this.makeGroupRow(group));
+      if (group.id === this.activeGroupId) {
+        container.appendChild(this.makeRoiSection(group));
+      }
+      groupList.appendChild(container);
     }
     el.appendChild(groupList);
 
@@ -300,12 +300,6 @@ export class StreamlineFilterTab extends Tab {
     });
     addGroup.classList.add("neuroglancer-streamline-filter-add-group");
     el.appendChild(addGroup);
-
-    // Active group's ROIs.
-    const group = this.roiFilter.groups.find((g) => g.id === this.activeGroupId);
-    if (group !== undefined) {
-      el.appendChild(this.makeRoiSection(group));
-    }
   }
 
   private makeGroupRow(group: RoiGroup): HTMLElement {
@@ -358,7 +352,37 @@ export class StreamlineFilterTab extends Tab {
         },
       }),
     );
-    return row;
+
+    // Per-group render controls (a sub-row): the group's "on" opacity and a
+    // high-detail toggle (loads this group's passing tracts at full detail).
+    const controls = document.createElement("div");
+    controls.classList.add("neuroglancer-streamline-filter-group-controls");
+    const opacity = this.bodyContext.registerDisposer(
+      new RangeWidget(
+        fieldWatchable(
+          this.roiFilter.changed,
+          () => group.opacity,
+          (v) => this.roiFilter.updateGroup(group.id, { opacity: v }),
+        ),
+        { min: 0, max: 1, step: 0.01 },
+      ),
+    );
+    controls.appendChild(labelled("Opacity", opacity.element));
+
+    const highDetail = document.createElement("input");
+    highDetail.type = "checkbox";
+    highDetail.checked = group.highDetail;
+    highDetail.title = "Load this group's tracts at full detail (slower)";
+    highDetail.addEventListener("change", () =>
+      this.roiFilter.updateGroup(group.id, { highDetail: highDetail.checked }),
+    );
+    controls.appendChild(labelled("High detail", highDetail));
+
+    const wrapper = document.createElement("div");
+    wrapper.classList.add("neuroglancer-streamline-filter-group-header");
+    wrapper.appendChild(row);
+    wrapper.appendChild(controls);
+    return wrapper;
   }
 
   private makeRoiSection(group: RoiGroup): HTMLElement {

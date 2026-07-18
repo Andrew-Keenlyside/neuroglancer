@@ -105,8 +105,11 @@ export interface Roi {
  */
 export interface RoiGroupConfig {
   readonly rois: readonly Roi[];
+  /** Packed RGBA: rgb = group colour, a = group opacity (colour-by-group + per-group opacity ride this one value). */
   readonly colorPacked: number;
   readonly visible: boolean;
+  /** Load this group's passing tracts at full detail (object-keyed pass 2). */
+  readonly highDetail: boolean;
 }
 
 /** A streamline: `count` vertices from `start`, in a flat `rank`-strided array. */

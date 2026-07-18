@@ -211,8 +211,7 @@ import {
 } from "#src/util/color.js";
 import type { Borrowed, Owned } from "#src/util/disposable.js";
 import { RefCounted } from "#src/util/disposable.js";
-import type { vec4 } from "#src/util/geom.js";
-import { vec3 } from "#src/util/geom.js";
+import { vec3, vec4 } from "#src/util/geom.js";
 import {
   parseArray,
   parseUint64,
@@ -702,8 +701,13 @@ function getSpatialSkeletonGridHistogramConfig(
 function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
   return roiFilter.groups.map((g) => ({
     rois: g.rois,
-    colorPacked: packColor(g.color),
+    // Pack RGBA: rgb = group colour, a = group opacity. The colour-by-group RGB
+    // override and the per-group "on" opacity both ride this single value.
+    colorPacked: packColor(
+      vec4.fromValues(g.color[0], g.color[1], g.color[2], g.opacity),
+    ),
     visible: g.visible,
+    highDetail: g.highDetail,
   }));
 }
 

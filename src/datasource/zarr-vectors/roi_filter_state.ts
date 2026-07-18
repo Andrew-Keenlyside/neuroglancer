@@ -202,8 +202,14 @@ export interface RoiGroup {
   readonly name: string;
   readonly color: vec3;
   readonly visible: boolean;
+  /** Opacity of this group's passing streamlines, in [0, 1]. */
+  readonly opacity: number;
+  /** Load this group's passing tracts at full detail (object-keyed pass 2). */
+  readonly highDetail: boolean;
   readonly rois: readonly Roi[];
 }
+
+const DEFAULT_GROUP_OPACITY = 1;
 
 function groupToJson(group: RoiGroup): any {
   const json: any = {
@@ -212,6 +218,8 @@ function groupToJson(group: RoiGroup): any {
     rois: group.rois.map(entryToJson),
   };
   if (!group.visible) json.visible = false;
+  if (group.opacity !== DEFAULT_GROUP_OPACITY) json.opacity = group.opacity;
+  if (group.highDetail) json.highDetail = true;
   return json;
 }
 
@@ -223,6 +231,12 @@ function groupFromJson(obj: any, id: number): RoiGroup {
     color: verifyObjectProperty(obj, "color", (v) => parseHexColor(verifyString(v))),
     visible:
       verifyOptionalObjectProperty(obj, "visible", (v) => v === true) ?? true,
+    opacity:
+      verifyOptionalObjectProperty(obj, "opacity", verifyFiniteFloat) ??
+      DEFAULT_GROUP_OPACITY,
+    highDetail:
+      verifyOptionalObjectProperty(obj, "highDetail", (v) => v === true) ??
+      false,
     rois: verifyObjectProperty(obj, "rois", (v) => parseArray(v, entryFromJson)),
   };
 }
@@ -307,6 +321,8 @@ export class RoiFilterState {
         name: `Group ${this.groups_.length + 1}`,
         color: paletteColor(this.groups_.length),
         visible: true,
+        opacity: DEFAULT_GROUP_OPACITY,
+        highDetail: false,
         rois: [],
       },
     ];
@@ -323,7 +339,13 @@ export class RoiFilterState {
 
   updateGroup(
     id: number,
-    changes: { name?: string; color?: vec3; visible?: boolean },
+    changes: {
+      name?: string;
+      color?: vec3;
+      visible?: boolean;
+      opacity?: number;
+      highDetail?: boolean;
+    },
   ): void {
     const idx = this.groupIndex(id);
     if (idx < 0) return;
@@ -436,6 +458,8 @@ export class RoiFilterState {
                 name: "Group 1",
                 color: paletteColor(0),
                 visible: true,
+                opacity: DEFAULT_GROUP_OPACITY,
+                highDetail: false,
                 rois: flatRois,
               },
             ]

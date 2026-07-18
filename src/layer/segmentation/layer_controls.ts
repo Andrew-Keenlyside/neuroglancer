@@ -94,6 +94,28 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     })),
   },
   {
+    label: "Non-passing opacity",
+    toolJson: json_keys.ROI_NONPASSING_ALPHA_JSON_KEY,
+    isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
+    title:
+      "Opacity of streamlines that do NOT pass the ROI filter (the 'off' / " +
+      "ghost opacity). The per-group 'on' opacity is set in the Filter tab.",
+    ...rangeLayerControl((layer) => ({
+      // The value lives on RoiFilterState (round-trips inside `roiFilter`); adapt
+      // it to the WatchableValueInterface the range control expects.
+      value: {
+        get value() {
+          return layer.displayState.roiFilter.ghostAlpha;
+        },
+        set value(v: number) {
+          layer.displayState.roiFilter.ghostAlpha = v;
+        },
+        changed: layer.displayState.roiFilter.changed,
+      },
+      options: { min: 0, max: 1, step: 0.01 },
+    })),
+  },
+  {
     label: "Resolution (slice)",
     toolJson: json_keys.CROSS_SECTION_RENDER_SCALE_JSON_KEY,
     isValid: (layer) => layer.has2dLayer,

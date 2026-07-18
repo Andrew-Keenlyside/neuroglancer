@@ -48,26 +48,47 @@
 .neuroglancer-streamline-filter-group-list {
   display: flex;
   flex-direction: column;
+  gap: 4px;
+}
+
+/* One group: its header (row + per-group render controls) and, when selected,
+   its nested ROI section. */
+.neuroglancer-streamline-filter-group {
+  border: 1px solid transparent;
+  border-radius: 3px;
+}
+
+.neuroglancer-streamline-filter-group.neuroglancer-selected {
+  border-color: #4fc3f7;
+  background: #1e262b;
+}
+
+.neuroglancer-streamline-filter-group-header {
+  display: flex;
+  flex-direction: column;
   gap: 2px;
+  padding: 2px 3px;
 }
 
 .neuroglancer-streamline-filter-group-row {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 3px;
-  border: 1px solid transparent;
-  border-radius: 3px;
   cursor: pointer;
 }
 
-.neuroglancer-streamline-filter-group-row:hover {
-  background: #2a2a2a;
+.neuroglancer-streamline-filter-group-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 24px;
 }
 
-.neuroglancer-streamline-filter-group-row.neuroglancer-selected {
-  border-color: #4fc3f7;
-  background: #23303a;
+.neuroglancer-streamline-filter-group-controls
+  .neuroglancer-streamline-filter-field
+  > span:first-child {
+  min-width: 0;
+  color: #999;
 }
 
 .neuroglancer-streamline-filter-group-row input[type="color"] {
@@ -94,13 +115,14 @@
   align-self: flex-start;
 }
 
-/* --- ROIs of the active group --- */
+/* --- ROIs nested under the selected group --- */
 
 .neuroglancer-streamline-filter-roi-section {
   display: flex;
   flex-direction: column;
   gap: 4px;
   border-top: 1px solid #333;
+  margin: 2px 4px 4px 24px;
   padding-top: 4px;
 }
 

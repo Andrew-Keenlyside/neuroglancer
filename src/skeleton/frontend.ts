@@ -486,6 +486,20 @@ void spatialChunkCull() {
   }`
       : "";
 
+    // Per-group "on" opacity: a passing tract takes the alpha byte of its
+    // group's colour (packed into roiSegmentColors). Independent of
+    // colour-by-group (that only gates the RGB override, below); applied only
+    // when the filter is active so an inactive filter keeps the global alpha.
+    const roiOpacityFragment = params.hasRoiSegmentColors
+      ? `
+  if (uRoiFilterActive > 0.5) {
+    vec4 roiColor;
+    if (${this.roiSegmentColorShaderManager.getFunctionName}(segmentId, roiColor)) {
+      return roiColor.a;
+    }
+  }`
+      : "";
+
     this.visibleSegmentsShaderManager.defineShader(builder);
     this.excludedSegmentsShaderManager.defineShader(builder);
     this.segmentColorShaderManager.defineShader(builder);
@@ -553,7 +567,7 @@ ${hoverAdjustFragment}
 float getSegmentLookupAlpha(uint64_t segmentId) {
   if (${this.excludedSegmentsShaderManager.hasFunctionName}(segmentId)) {
     return ${excludedSegmentAlpha};
-  }${roiFilterFragment}
+  }${roiFilterFragment}${roiOpacityFragment}
   bool isVisible = ${this.visibleSegmentsShaderManager.hasFunctionName}(segmentId);
   ${alphaExpression}
 }

@@ -144,6 +144,8 @@ describe("RoiFilterState serialization", () => {
       name: "Motor",
       color: vec3.fromValues(1, 0, 0),
       visible: false,
+      opacity: 0.4,
+      highDetail: true,
     });
     s.addRoi(g, ellipsoid);
     s.addRoi(g, box);
@@ -158,6 +160,8 @@ describe("RoiFilterState serialization", () => {
     expect(json.groups[0].name).toBe("Motor");
     expect(json.groups[0].color).toBe("#ff0000");
     expect(json.groups[0].visible).toBe(false);
+    expect(json.groups[0].opacity).toBe(0.4);
+    expect(json.groups[0].highDetail).toBe(true);
     expect(json.active).toBe(true);
     expect(json.ghostAlpha).toBe(0.25);
     expect(json.colorByGroup).toBe(false);
@@ -167,11 +171,23 @@ describe("RoiFilterState serialization", () => {
     expect(restored.groups[0].name).toBe("Motor");
     expect(Array.from(restored.groups[0].color)).toEqual([1, 0, 0]);
     expect(restored.groups[0].visible).toBe(false);
+    expect(restored.groups[0].opacity).toBe(0.4);
+    expect(restored.groups[0].highDetail).toBe(true);
     expect(restored.groups[0].rois).toHaveLength(2);
     expect(restored.active).toBe(true);
     expect(restored.ghostAlpha).toBe(0.25);
     expect(restored.colorByGroup).toBe(false);
     expect(restored.hideOverlays2d).toBe(true);
+  });
+
+  it("defaults new-group opacity to 1 and highDetail to false, omitted from JSON", () => {
+    const s = new RoiFilterState();
+    s.addGroup();
+    expect(s.groups[0].opacity).toBe(1);
+    expect(s.groups[0].highDetail).toBe(false);
+    const json = s.toJSON();
+    expect("opacity" in json.groups[0]).toBe(false);
+    expect("highDetail" in json.groups[0]).toBe(false);
   });
 
   it("omits ghostAlpha/colorByGroup from JSON at their defaults", () => {

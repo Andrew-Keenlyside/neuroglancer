@@ -327,11 +327,13 @@ describe("computeGroupedPassingSet", () => {
     rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
     colorPacked: RED,
     visible: true,
+    highDetail: false,
   };
   const groupB: RoiGroupConfig = {
     rois: [roi(sphere(10, 0, 0, 1), RoiOperator.AND)],
     colorPacked: BLUE,
     visible: true,
+    highDetail: false,
   };
 
   it("unions passing objects across groups and colours by group", () => {
@@ -363,6 +365,7 @@ describe("computeGroupedPassingSet", () => {
       ],
       colorPacked: RED,
       visible: true,
+      highDetail: false,
     };
     const { passing } = computeGroupedPassingSet([chunk], [a, groupB]);
     expect([...passing].sort()).toEqual([1n, 2n]);
@@ -374,6 +377,7 @@ describe("computeGroupedPassingSet", () => {
       rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
       colorPacked: BLUE,
       visible: true,
+      highDetail: false,
     };
     const { colorById } = computeGroupedPassingSet(
       [chunk],
