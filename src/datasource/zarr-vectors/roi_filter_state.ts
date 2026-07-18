@@ -198,7 +198,14 @@ export class RoiFilterState {
     this.changed.dispatch();
   }
 
-  /** The ordered ROI list. Already a valid `Roi[]` for the filter. */
+  /**
+   * The ordered ROI list. Already a valid `Roi[]` for the filter.
+   *
+   * Treat the result as immutable. The render layer mirrors it to the worker by
+   * watching for a new array *reference* on each `changed` dispatch (all the
+   * mutators below reassign `entries_`), so mutating a returned `Roi`/`RoiShape`
+   * in place would silently fail to reach the backend. Edit via the mutators.
+   */
   get rois(): readonly Roi[] {
     return this.entries_;
   }

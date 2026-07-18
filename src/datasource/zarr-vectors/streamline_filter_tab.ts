@@ -34,6 +34,7 @@ import type { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_sta
 import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
 import { TrackableBooleanCheckbox } from "#src/trackable_boolean.js";
 import type { WatchableValueInterface } from "#src/trackable_value.js";
+import type { Uint64Set } from "#src/uint64_set.js";
 import { makeDeleteButton } from "#src/widget/delete_button.js";
 import { makeIcon } from "#src/widget/icon.js";
 import { RangeWidget } from "#src/widget/range.js";
@@ -103,10 +104,14 @@ function makeSelect<T extends number>(
 
 export class StreamlineFilterTab extends Tab {
   private roiFilter: RoiFilterState;
+  /** The worker-maintained set of passing object ids (undefined if unwired). */
+  private passingSegments: Uint64Set | undefined;
+  private countEl: HTMLElement | undefined;
 
   constructor(public layer: SegmentationUserLayer) {
     super();
     this.roiFilter = layer.displayState.roiFilter;
+    this.passingSegments = layer.displayState.roiPassingSegments;
     const { element } = this;
     element.classList.add("neuroglancer-streamline-filter-tab");
 
@@ -119,9 +124,29 @@ export class StreamlineFilterTab extends Tab {
 
     element.appendChild(this.makeDisplayControls());
 
-    const rebuild = () => this.renderRoiList(listEl);
+    const rebuild = () => {
+      this.renderRoiList(listEl);
+      this.updateCount();
+    };
     this.registerDisposer(this.roiFilter.changed.add(rebuild));
     rebuild();
+  }
+
+  /**
+   * Show how many loaded streamlines pass the current ROIs. The worker keeps the
+   * passing set current whenever ROIs exist (even before the filter is switched
+   * on), so this is live feedback while dissecting. The count is over the tracts
+   * resident at the current LOD, not the whole store — hence "(this level)".
+   */
+  private updateCount(): void {
+    const el = this.countEl;
+    if (el === undefined) return;
+    if (this.roiFilter.rois.length === 0) {
+      el.textContent = "";
+      return;
+    }
+    const n = this.passingSegments?.size ?? 0;
+    el.textContent = `${n.toLocaleString()} streamline${n === 1 ? "" : "s"} pass (this level)`;
   }
 
   private makeHeader(): HTMLElement {
@@ -143,11 +168,17 @@ export class StreamlineFilterTab extends Tab {
     activeLabel.appendChild(document.createTextNode(" Active"));
     header.appendChild(activeLabel);
 
-    // Live pass count is wired once the backend passing set exists; a
-    // placeholder keeps the layout stable until then.
+    // Live "N streamlines pass" readout, driven by the worker-maintained
+    // passing set. Absent only if the ROI channel was never created (it always
+    // is for the tract layers this tab is shown for).
     const count = document.createElement("span");
     count.classList.add("neuroglancer-streamline-filter-count");
-    count.textContent = "";
+    this.countEl = count;
+    if (this.passingSegments !== undefined) {
+      this.registerDisposer(
+        this.passingSegments.changed.add(() => this.updateCount()),
+      );
+    }
     header.appendChild(count);
 
     return header;
