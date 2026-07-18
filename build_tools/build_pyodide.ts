@@ -265,14 +265,20 @@ function createPythonZip() {
 // Keep this name in sync with DEFAULT_USER_SCRIPT_PATH there.
 const USER_SCRIPT_NAME = "user_script.py";
 
-function copyExampleScript() {
-  const src = path.resolve(repoRoot, "python", "examples", "pyodide", USER_SCRIPT_NAME);
-  const dest = path.resolve(outDir, USER_SCRIPT_NAME);
-  if (fs.existsSync(src)) {
-    fs.copyFileSync(src, dest);
-    console.log("Copied", USER_SCRIPT_NAME);
-  } else {
-    console.warn(`Warning: ${USER_SCRIPT_NAME} not found at`, src);
+// Copy every use-case Python script alongside the bundle so each is selectable
+// at runtime via `?script=<name>` (the default, user_script.py, loads when no
+// ?script= is given). `dev_server.py` is server-side only, never served.
+function copyExampleScripts() {
+  const srcDir = path.resolve(repoRoot, "python", "examples", "pyodide");
+  const scripts = fs
+    .readdirSync(srcDir)
+    .filter((f) => f.endsWith(".py") && f !== "dev_server.py");
+  if (!scripts.includes(USER_SCRIPT_NAME)) {
+    console.warn(`Warning: default ${USER_SCRIPT_NAME} not found in`, srcDir);
+  }
+  for (const name of scripts) {
+    fs.copyFileSync(path.resolve(srcDir, name), path.resolve(outDir, name));
+    console.log("Copied", name);
   }
 }
 
@@ -291,7 +297,7 @@ await runCompiler([pyodideWorkerConfig]);
 
 if (!watchMode) {
   createPythonZip();
-  copyExampleScript();
+  copyExampleScripts();
   console.log(`\nBuild complete! Output: ${outDir}`);
   console.log("\nTo test locally:");
   console.log("  python python/examples/pyodide/dev_server.py");

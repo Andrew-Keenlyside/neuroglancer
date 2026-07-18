@@ -5,9 +5,17 @@ serverless** version of a Neuroglancer Python viewer.  Python runs entirely in
 the browser via [Pyodide](https://pyodide.org/) (Python compiled to WebAssembly)
 — no server, no installation, no backend required.
 
-The included example (`user_script.py`) opens a viewer on a public precomputed
-dataset. It is the default script; select another with
-`?script=<same-origin-path>`.
+One shared bundle is built once and reused across use cases; each use case is a
+separate Python script that ships alongside it and is chosen at runtime via the
+`?script=<same-origin-path>` URL parameter (same server, same bundle — only the
+URL differs). The build copies every `*.py` in this directory into
+`dist/pyodide/`. Two ship today:
+
+- `user_script.py` — **default** (no `?script=`): the Streamline Filter demo,
+  which boots the HCP1065 whole-brain tractogram (zarr-vectors) into a viewer
+  whose layer has a **Filter** tab for drawing ROIs.
+- `example_linear_registration_pyodide.py` — the interactive linear-registration
+  workflow; open with `?script=/example_linear_registration_pyodide.py`.
 
 ## How it works
 
@@ -52,7 +60,8 @@ Output is written to `dist/pyodide/`:
 | `pyodide_sw.js` | Service Worker (stable filename, no hash) |
 | `pyodide_worker.[hash].js` | Pyodide Web Worker |
 | `neuroglancer_pyodide.zip` | Bundled neuroglancer Python package |
-| `user_script.py` | User Python script (override with `?script=`) |
+| `user_script.py` | Default script (Streamline Filter demo; override with `?script=`) |
+| `example_linear_registration_pyodide.py` | Linear-registration workflow (`?script=/…`) |
 
 For development with watch mode:
 
