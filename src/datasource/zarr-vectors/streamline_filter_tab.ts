@@ -159,8 +159,13 @@ export class StreamlineFilterTab extends Tab {
    * one no longer hides the others. New groups start expanded.
    */
   private expandedGroupIds = new Set<number>();
-  /** The structural (groups/ROIs/expanded) signature the body currently reflects. */
-  private structuralSig = "";
+  /**
+   * The structural (groups/ROIs/expanded) signature the body currently reflects.
+   * `undefined` until the first build so the initial render always happens — a
+   * zero-group filter has an empty-string signature, which must still differ
+   * from the pre-build state (else the "+ New group" button never renders).
+   */
+  private structuralSig: string | undefined = undefined;
   private bodyEl: HTMLElement;
   /** Disposers for the widgets in the current body build. */
   private bodyContext = new RefCounted();

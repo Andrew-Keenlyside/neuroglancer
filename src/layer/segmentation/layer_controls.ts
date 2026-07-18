@@ -66,9 +66,11 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
   {
     label: "Opacity (on)",
     toolJson: json_keys.SELECTED_ALPHA_JSON_KEY,
+    // Hidden for spatially-indexed (tract) layers: per-group "on" opacity is set
+    // in the Filter tab, so this global on-opacity is redundant clutter there.
     isValid: (layer) =>
       makeCachedDerivedWatchableValue(
-        (has2d, hasSpatialSkeletons) => has2d || hasSpatialSkeletons,
+        (has2d, hasSpatialSkeletons) => has2d && !hasSpatialSkeletons,
         [layer.has2dLayer, layer.hasSpatiallyIndexedSkeletonsLayer],
       ),
     title:
@@ -97,7 +99,7 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     })),
   },
   {
-    label: "Off opacity",
+    label: "Opacity (off)",
     toolJson: json_keys.ROI_NONPASSING_ALPHA_JSON_KEY,
     isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
     title:
@@ -191,7 +193,16 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
   {
     label: "Opacity (3d)",
     toolJson: json_keys.OBJECT_ALPHA_JSON_KEY,
-    isValid: (layer) => layer.has3dLayer,
+    // Shown for meshes and non-spatial skeletons; hidden for pure tract layers,
+    // whose 3-d opacity is the unified "Opacity (off)" (bulk) plus per-group
+    // opacity (passing). Kept for mesh+skeleton combos so mesh opacity stays
+    // controllable.
+    isValid: (layer) =>
+      makeCachedDerivedWatchableValue(
+        (has3d, hasMesh, hasSpatialSkeletons) =>
+          has3d && (hasMesh || !hasSpatialSkeletons),
+        [layer.has3dLayer, layer.hasMeshLayer, layer.hasSpatiallyIndexedSkeletonsLayer],
+      ),
     title: "Opacity of meshes and skeletons",
     ...rangeLayerControl((layer) => ({
       value: layer.displayState.objectAlpha,
@@ -200,7 +211,9 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
   {
     label: "Silhouette (3d)",
     toolJson: json_keys.MESH_SILHOUETTE_RENDERING_JSON_KEY,
-    isValid: (layer) => layer.has3dLayer,
+    // Silhouette shades mesh faces by their angle to the view; it does nothing
+    // for skeletons/streamlines (no faces), so gate it on an actual mesh.
+    isValid: (layer) => layer.hasMeshLayer,
     title:
       "Set to a non-zero value to increase transparency of object faces perpendicular to view direction",
     ...rangeLayerControl((layer) => ({
