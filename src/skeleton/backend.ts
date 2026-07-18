@@ -33,6 +33,14 @@ import {
   diffPassingSet,
   type RoiFilterableChunk,
 } from "#src/datasource/zarr-vectors/roi_filter_backend.js";
+// The dissection geometry itself evaluates in Python/WASM; this client is the
+// bridge, and falls back to the TypeScript implementation above when no such
+// service is present (an ordinary Neuroglancer build).
+import {
+  RoiFilterServiceClient,
+  type RoiFilterChunkEntry,
+  type RoiFilterResult,
+} from "#src/datasource/zarr-vectors/roi_filter_service.js";
 import { decodeVertexPositionsAndIndices } from "#src/mesh/backend.js";
 import {
   type DisplayDimensionRenderInfo,
@@ -594,6 +602,12 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   roiHighDetailSegments?: Uint64Set;
   /** Set when an ROI edit needs a recompute even if the resident chunk set is unchanged. */
   private roiRecomputePending = false;
+  /** An evaluation is outstanding; at most one runs at a time. */
+  private roiRecomputeInFlight = false;
+  /** Something asked for a recompute while one was in flight. */
+  private roiRecomputeQueued = false;
+  /** Client for the Python/WASM dissection service; built on first evaluation. */
+  private roiFilterServiceClient: RoiFilterServiceClient | undefined;
   /** Signature of the last resident-chunk set filtered over, to skip redundant recomputes. */
   private roiLastChunkSignature = "";
   /** The colour attribution last pushed to `roiSegmentColors`, for diffing. */
@@ -773,7 +787,7 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     // per-level count and an order-independent hash of their keys.
     const byLod = new Map<
       number,
-      { chunks: RoiFilterableChunk[]; count: number; hash: number }
+      { chunks: RoiFilterChunkEntry[]; count: number; hash: number }
     >();
     if (hasRois) {
       for (const source of this.roiFilterableSources()) {
@@ -788,7 +802,7 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
             bucket = { chunks: [], count: 0, hash: 0 };
             byLod.set(c.lod, bucket);
           }
-          bucket.chunks.push(data);
+          bucket.chunks.push({ key: c.key ?? "", data });
           bucket.count++;
           bucket.hash = (bucket.hash ^ cheapStringHash(c.key ?? "")) | 0;
         }
@@ -799,19 +813,110 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     const chunks = bucket?.chunks ?? [];
 
     const signature = `${targetLod}:${bucket?.count ?? 0}:${bucket?.hash ?? 0}`;
+
+    // While an evaluation is outstanding, ALWAYS queue and return. This check
+    // must come before the signature comparison below, because during a flight
+    // `roiLastChunkSignature` still holds the last COMMITTED signature, not the
+    // in-flight one. Comparing against it would let a pass that happens to
+    // observe the previously-committed world state early-return without
+    // queueing, after which the in-flight result commits its own (now stale)
+    // signature and nothing is left to correct it:
+    //
+    //   1. committed "lod4:A"; user moves to lod 3
+    //   2. dispatch over "lod3:B"
+    //   3. mid-flight, user moves back to lod 4 -> pass sees "lod4:A", which
+    //      equals the committed signature -> returns, queueing nothing
+    //   4. the lod-3 result lands and commits "lod3:B"
+    //   5. drain finds nothing queued; the filter now shows lod-3 verdicts
+    //      over lod-4 geometry until some unrelated event happens to fire
+    //
+    // Queueing unconditionally costs one extra pass per flight, whose own
+    // signature check then early-returns if nothing really changed.
+    if (this.roiRecomputeInFlight) {
+      this.roiRecomputeQueued = true;
+      return;
+    }
+
     if (!this.roiRecomputePending && signature === this.roiLastChunkSignature) {
       return;
     }
-    this.roiRecomputePending = false;
-    this.roiLastChunkSignature = signature;
 
-    // Union of every visible group's passing tracts drives the ghost shader;
-    // colorById attributes each passing tract its group's colour; highDetail is
-    // the subset in high-detail groups (drives the object-keyed pass-2 layer).
-    const { passing, colorById, highDetail } = computeGroupedPassingSet(
-      chunks,
+    // The evaluation itself may be remote (the Python/WASM dissection service),
+    // so it can no longer be committed at dispatch the way a synchronous call
+    // could. Only ONE runs at a time (the guard above): the ROI sliders fire on
+    // `input` with no debounce, so a drag would otherwise queue a recompute per
+    // frame, each superseded before it landed. A drag coalesces into "the one
+    // running" plus "one more afterwards". And `roiLastChunkSignature` /
+    // `roiRecomputePending` commit on COMPLETION -- clearing them at dispatch
+    // would let a failed or superseded request lose the layer's dirty state and
+    // leave the passing set stale indefinitely.
+    this.roiRecomputeInFlight = true;
+    this.roiRecomputeQueued = false;
+    this.roiRecomputePending = false;
+
+    this.evaluateRoiGroups(chunks, groups).then(
+      (result) => {
+        this.roiRecomputeInFlight = false;
+        // The evaluation can now outlive the layer, which was impossible while
+        // it was synchronous. Writing to the shared sets after disposal would
+        // resurrect RPC objects the frontend has already torn down.
+        if (this.wasDisposed) return;
+        this.roiLastChunkSignature = signature;
+        this.applyRoiResult(result);
+        this.drainRoiRecompute();
+      },
+      (e) => {
+        this.roiRecomputeInFlight = false;
+        if (this.wasDisposed) return;
+        // Leave the layer dirty: the signature is not advanced and the pending
+        // flag is re-armed, so the next priority pass retries this same work.
+        this.roiRecomputePending = true;
+        console.error("ROI streamline filter: recompute failed", e);
+        this.drainRoiRecompute();
+      },
+    );
+  }
+
+  /** Re-enter the recompute if anything arrived while one was in flight. */
+  private drainRoiRecompute() {
+    if (this.roiRecomputeQueued || this.roiRecomputePending) {
+      this.roiRecomputeQueued = false;
+      this.chunkManager.scheduleUpdateChunkPriorities();
+    }
+  }
+
+  /**
+   * Evaluate the dissection, preferring the Python/WASM service.
+   *
+   * Falls back to the in-worker TypeScript implementation whenever there is no
+   * service to talk to — an ordinary Neuroglancer build has no request
+   * interceptor — so the filter behaves exactly as it did before in that case
+   * rather than silently doing nothing.
+   */
+  private async evaluateRoiGroups(
+    chunks: readonly RoiFilterChunkEntry[],
+    groups: readonly RoiGroupConfig[],
+  ): Promise<RoiFilterResult> {
+    let client = this.roiFilterServiceClient;
+    if (client === undefined) {
+      client = this.roiFilterServiceClient = new RoiFilterServiceClient(
+        `${this.rpcId}`,
+      );
+    }
+    if (!client.isUnavailable) {
+      const remote = await client.compute(chunks, groups);
+      if (remote !== undefined) return remote;
+    }
+    return computeGroupedPassingSet(
+      chunks.map((c) => c.data),
       groups,
     );
+  }
+
+  /** Push one evaluation's result to the three shared objects, as minimal diffs. */
+  private applyRoiResult({ passing, colorById, highDetail }: RoiFilterResult) {
+    const passingSet = this.roiPassingSegments;
+    if (passingSet === undefined) return;
     const current = new Set<bigint>(passingSet.keys());
     const { added, removed } = diffPassingSet(passing, current);
     if (removed.length !== 0) passingSet.delete(removed);

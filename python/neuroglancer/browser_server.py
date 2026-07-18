@@ -53,6 +53,7 @@ _MESH_RE = re.compile(r"^/neuroglancer/mesh/(?P<key>[^/?]+)/(?P<object_id>[0-9]+
 _SKELETON_RE = re.compile(
     r"^/neuroglancer/skeleton/(?P<key>[^/?]+)/(?P<object_id>[0-9]+)"
 )
+_ROI_FILTER_RE = re.compile(r"^/neuroglancer/roi_filter/(?P<scope>[^/?]+)")
 _ACTION_RE = re.compile(r"^/action/(?P<viewer_token>[^/?]+)")
 _VOLUME_INFO_RESP_RE = re.compile(
     r"^/volume_response/(?P<viewer_token>[^/]+)/(?P<request_id>[^/]+)/info"
@@ -75,6 +76,9 @@ class BrowserViewerServer:
 
     def __init__(self):
         self.viewers: dict = {}
+        # Built on first use: importing the tractography package pulls in numpy,
+        # which most viewers never need.
+        self._roi_filter_service = None
         self._setup_js_bridge()
 
     def _setup_js_bridge(self):
@@ -153,6 +157,12 @@ class BrowserViewerServer:
             query = parse_qs(parsed.query)
         except Exception:
             return 400, "text/plain", b"Bad URL"
+
+        # Checked before _DATA_RE: both live under /neuroglancer/, and although
+        # the shapes do not currently collide, the specific route should win.
+        m = _ROI_FILTER_RE.match(path)
+        if m and method == "POST":
+            return self._handle_roi_filter(m.group("scope"), body, query)
 
         m = _INFO_RE.match(path)
         if m:
@@ -305,6 +315,45 @@ class BrowserViewerServer:
         except Exception as e:
             return 500, "text/plain", str(e).encode()
         return 200, "application/octet-stream", encoded
+
+    def _handle_roi_filter(
+        self, scope: str, body: bytes, query: dict
+    ) -> tuple[int, str, bytes]:
+        """Evaluate one ROI dissection for the viewer's chunk backend worker.
+
+        Called directly from that worker via the Service Worker, so it never
+        touches viewer state and nothing here reaches the URL. Synchronous, like
+        every route here: it holds the Python thread for the duration of the
+        dissection, which is why the geometry is cached rather than re-uploaded
+        (the arithmetic is milliseconds; re-parsing megabytes would not be).
+        """
+        from .tractography.service import RoiFilterService
+        from .tractography.wire import decode_request
+
+        service = self._roi_filter_service
+        if service is None:
+            service = self._roi_filter_service = RoiFilterService()
+        try:
+            params = query.get("p", ["{}"])[0]
+            request = decode_request(params, body)
+        except Exception as e:
+            return 400, "text/plain", f"bad roi_filter request: {e}".encode()
+        if request.scope != scope:
+            return 400, "text/plain", b"roi_filter scope mismatch"
+        try:
+            return 200, "application/octet-stream", service.handle(request)
+        except KeyError as e:
+            # Geometry this process no longer has -- the worker restarted under
+            # a viewer that still believes it is cached. Naming the chunks lets
+            # the viewer re-upload them rather than silently mis-filtering.
+            missing = e.args[0] if e.args else []
+            return (
+                409,
+                "application/json",
+                encode_json({"missing": list(missing)}).encode(),
+            )
+        except Exception as e:
+            return 500, "text/plain", f"roi_filter failed: {e}".encode()
 
     def _handle_action(self, viewer_token: str, body: bytes) -> tuple[int, str, bytes]:
         viewer = self.viewers.get(viewer_token)
