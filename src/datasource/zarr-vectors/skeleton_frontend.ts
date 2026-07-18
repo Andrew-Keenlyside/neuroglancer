@@ -525,6 +525,15 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
    * that could not fit even in principle -- for this store level 0 estimates
    * ~4 GB against a 1 GB budget -- rather than to predict real usage.
    */
+  /**
+   * Objects (streamlines) per level, **coarsest first** to match
+   * `getSpatialSkeletonGridSizes()`. `undefined` for a level whose count the
+   * writer did not stamp.
+   */
+  getSpatialSkeletonLevelObjectCounts(): (number | undefined)[] {
+    return this.perLevelObjectCount.slice().reverse();
+  }
+
   getSpatialSkeletonLevelCostsBytes(): number[] {
     const finestFirst = this.levels.map((level, k) => {
       const count = this.perLevelVertexCount[k];

@@ -163,6 +163,12 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
         histogram: layer.displayState.spatialSkeletonGridRenderScaleHistogram2d,
         target: layer.displayState.spatialSkeletonGridResolutionTarget2d,
         unitOfTarget: getLayerSpatialUnit(layer),
+        // A deliberate drag takes over from the camera. Without this the
+        // auto-level derivation rewrites the target on the very next frame
+        // and the handle springs back, which reads as a broken control.
+        onManualTarget: () => {
+          layer.displayState.autoSpatialSkeletonGridLevel2d.value = false;
+        },
       }),
       SpatialSkeletonGridRenderScaleWidget,
     ),
@@ -186,6 +192,12 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
         histogram: layer.displayState.spatialSkeletonGridRenderScaleHistogram3d,
         target: layer.displayState.spatialSkeletonGridResolutionTarget3d,
         unitOfTarget: getLayerSpatialUnit(layer),
+        // A deliberate drag takes over from the camera. Without this the
+        // auto-level derivation rewrites the target on the very next frame
+        // and the handle springs back, which reads as a broken control.
+        onManualTarget: () => {
+          layer.displayState.autoSpatialSkeletonGridLevel3d.value = false;
+        },
       }),
       SpatialSkeletonGridRenderScaleWidget,
     ),

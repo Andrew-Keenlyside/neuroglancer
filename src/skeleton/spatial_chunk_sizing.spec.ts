@@ -243,3 +243,37 @@ describe("selectSpatialSkeletonGridLevelByBudget", () => {
     expect(selectSpatialSkeletonGridLevelByBudget([10, 5000, 20], 100)).toBe(2);
   });
 });
+
+describe("buildSpatialSkeletonGridLevels — object counts", () => {
+  const sizes = [
+    { x: 8, y: 8, z: 8 },
+    { x: 4, y: 4, z: 4 },
+    { x: 2, y: 2, z: 2 },
+  ];
+
+  it("attaches per-level object counts positionally", () => {
+    const levels = buildSpatialSkeletonGridLevels(sizes, [50, 5000, 503000]);
+    expect(levels.map((l) => l.objectCount)).toEqual([50, 5000, 503000]);
+  });
+
+  it("omits the count where the writer did not stamp one", () => {
+    const levels = buildSpatialSkeletonGridLevels(sizes, [50, undefined, 503000]);
+    expect(levels[0].objectCount).toBe(50);
+    expect("objectCount" in levels[1]).toBe(false);
+    expect(levels[2].objectCount).toBe(503000);
+  });
+
+  it("omits zero and non-finite counts, which would size a bar as real", () => {
+    const levels = buildSpatialSkeletonGridLevels(sizes, [0, Number.NaN, 7]);
+    expect("objectCount" in levels[0]).toBe(false);
+    expect("objectCount" in levels[1]).toBe(false);
+    expect(levels[2].objectCount).toBe(7);
+  });
+
+  it("is unchanged when no counts are supplied", () => {
+    const levels = buildSpatialSkeletonGridLevels(sizes);
+    expect(levels).toHaveLength(3);
+    expect(levels.every((l) => l.objectCount === undefined)).toBe(true);
+    expect(levels.map((l) => l.lod)).toEqual([0, 0.5, 1]);
+  });
+});

@@ -901,35 +901,52 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
       ),
     );
 
-    this.spatialSkeletonGridResolutionTarget2d.changed.add(() => {
-      const levels = this.spatialSkeletonGridLevels.value;
-      if (levels.length > 0 && this.spatialSkeletonBudgetLevel === undefined) {
-        this.setSpatialSkeletonGridLevel(
-          "2d",
-          findClosestSpatialSkeletonGridLevelBySpacing(
-            levels,
-            this.spatialSkeletonGridResolutionTarget2d.value,
-          ),
-        );
-      }
-    });
-    this.spatialSkeletonGridResolutionTarget3d.changed.add(() => {
-      const levels = this.spatialSkeletonGridLevels.value;
-      // The camera recomputes this target every frame, so without the guard it
-      // would immediately undo a budget-driven choice — which is exactly what
-      // it did: the level picked at load survived in 2d (whose target is
-      // static in a 3d layout) but was overwritten back to the finest level in
-      // 3d on the first frame.
-      if (levels.length > 0 && this.spatialSkeletonBudgetLevel === undefined) {
-        this.setSpatialSkeletonGridLevel(
-          "3d",
-          findClosestSpatialSkeletonGridLevelBySpacing(
-            levels,
-            this.spatialSkeletonGridResolutionTarget3d.value,
-          ),
-        );
-      }
-    });
+    this.spatialSkeletonGridResolutionTarget2d.changed.add(() =>
+      this.applySpatialSkeletonResolutionTarget(
+        "2d",
+        this.spatialSkeletonGridResolutionTarget2d.value,
+      ),
+    );
+    this.spatialSkeletonGridResolutionTarget3d.changed.add(() =>
+      this.applySpatialSkeletonResolutionTarget(
+        "3d",
+        this.spatialSkeletonGridResolutionTarget3d.value,
+      ),
+    );
+  }
+
+  /**
+   * Move a view's grid level to the one closest to `target`, but no finer than
+   * the memory budget allows.
+   *
+   * The budget is a CEILING, not a choice. It used to be a veto: while a
+   * budget-driven level was in force these listeners stood down entirely, so
+   * the resolution sliders moved, updated the URL, and changed nothing —
+   * silently. Clamping instead keeps the whole-brain out-of-memory case fixed
+   * (nothing can select a level that does not fit) while letting the slider do
+   * what it appears to do, in both directions, at any zoom.
+   *
+   * `levels` is COARSEST-first (`getSpatialSkeletonGridSizes` ends in
+   * `finestFirst.reverse()`), so a larger index is FINER, and
+   * `spatialSkeletonBudgetLevel` -- the largest index whose cost fits the GPU
+   * budget -- is an upper bound. Clamping is therefore a MINIMUM: coarser is
+   * always available, finer only up to what fits.
+   */
+  private applySpatialSkeletonResolutionTarget(
+    view: "2d" | "3d",
+    target: number,
+  ) {
+    const levels = this.spatialSkeletonGridLevels.value;
+    if (levels.length === 0) return;
+    const requested = findClosestSpatialSkeletonGridLevelBySpacing(
+      levels,
+      target,
+    );
+    const ceiling = this.spatialSkeletonBudgetLevel;
+    this.setSpatialSkeletonGridLevel(
+      view,
+      ceiling === undefined ? requested : Math.min(requested, ceiling),
+    );
   }
 
   segmentSelectionState = new SegmentSelectionState();
@@ -1067,8 +1084,9 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
     gridSizes: SpatialSkeletonGridSize[],
     levelCostsBytes?: number[],
     budgetBytes?: number,
+    levelObjectCounts?: (number | undefined)[],
   ) {
-    const levels = buildSpatialSkeletonGridLevels(gridSizes);
+    const levels = buildSpatialSkeletonGridLevels(gridSizes, levelObjectCounts);
     const { origin: histogramOrigin, binSize: histogramBinSize } =
       getSpatialSkeletonGridHistogramConfig(levels);
     if (
@@ -2091,6 +2109,9 @@ export class SegmentationUserLayer extends Base {
     let hasVolume = false;
     let spatialSkeletonGridSizes: SpatialSkeletonGridSize[] | undefined;
     let spatialSkeletonLevelCostsBytes: number[] | undefined;
+    let spatialSkeletonLevelObjectCounts:
+      | (number | undefined)[]
+      | undefined;
     let spatialSkeletonBudgetBytes: number | undefined;
     // A datasource-preferred default shader, and whether any subsource would be
     // One entry per skeleton subsource: the shader it nominates as the layer
@@ -2166,6 +2187,17 @@ export class SegmentationUserLayer extends Base {
               this.manager.chunkManager.chunkQueueManager.capacities.gpuMemory
                 .sizeLimit.value;
           }
+          // Objects per level, when the source can say. Sizes the resolution
+          // histogram's bars by how many streamlines each level holds, which is
+          // what a user means by "how big is this level".
+          spatialSkeletonLevelObjectCounts = (
+            mesh as {
+              getSpatialSkeletonLevelObjectCounts?: () => (
+                | number
+                | undefined
+              )[];
+            }
+          ).getSpatialSkeletonLevelObjectCounts?.();
           skeletonShaderCandidates.push(mesh.defaultFragmentMain);
         } else if (
           mesh !== undefined &&
@@ -2421,6 +2453,7 @@ export class SegmentationUserLayer extends Base {
       spatialSkeletonGridSizes ?? [],
       spatialSkeletonLevelCostsBytes,
       spatialSkeletonBudgetBytes,
+      spatialSkeletonLevelObjectCounts,
     );
     this.displayState.hasVolume.value = hasVolume;
     this.updateSpatialSkeletonChunkLoadState();

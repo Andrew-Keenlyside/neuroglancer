@@ -27,6 +27,13 @@ export type SpatialSkeletonGridSize = { x: number; y: number; z: number };
 export type SpatialSkeletonGridLevel = {
   size: SpatialSkeletonGridSize;
   lod: number;
+  /**
+   * How many objects this level holds, when the source can say. For a
+   * tractogram this is the streamline count, which is what "how big is this
+   * level" means to a user -- a pyramid that drops from ~503k tracts to ~50
+   * is describing sparsity, not chunk geometry.
+   */
+  objectCount?: number;
 };
 
 export interface DefaultSpatiallyIndexedSkeletonChunkSizeOptions {
@@ -69,13 +76,20 @@ export function sortSpatialSkeletonGridSizes(
  */
 export function buildSpatialSkeletonGridLevels(
   gridSizes: readonly SpatialSkeletonGridSize[],
+  objectCounts?: readonly (number | undefined)[],
 ): SpatialSkeletonGridLevel[] {
   if (gridSizes.length === 0) return [];
   const lastIndex = gridSizes.length - 1;
-  return gridSizes.map((size, index) => ({
-    size,
-    lod: lastIndex === 0 ? 0 : index / lastIndex,
-  }));
+  return gridSizes.map((size, index) => {
+    const objectCount = objectCounts?.[index];
+    return {
+      size,
+      lod: lastIndex === 0 ? 0 : index / lastIndex,
+      ...(Number.isFinite(objectCount) && (objectCount as number) > 0
+        ? { objectCount: objectCount as number }
+        : {}),
+    };
+  });
 }
 
 /**

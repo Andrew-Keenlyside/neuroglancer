@@ -3856,6 +3856,7 @@ export class SpatiallyIndexedSkeletonLayer
       | ReadonlyArray<{
           size: { x: number; y: number; z: number };
           lod: number;
+          objectCount?: number;
         }>
       | undefined,
     histogram: RenderScaleHistogram,
@@ -3896,16 +3897,56 @@ export class SpatiallyIndexedSkeletonLayer
         }
       },
     );
+    // When the source can say how many objects each level holds, size the bars
+    // by that instead of by chunk-slot demand. For a tractogram, "how big is
+    // this level" means its streamline count -- a pyramid running ~503k / 50k /
+    // 5k / 503 / 50 is describing sparsity, and that is what the user is
+    // choosing between. Chunk counts answer a different question (how much grid
+    // is in view) and only ever existed for the one level being drawn, which
+    // left every other bar an identical stub.
+    const objectCounts = levels?.some((l) => l.objectCount !== undefined)
+      ? levels
+      : undefined;
+    if (objectCounts !== undefined) {
+      for (const level of objectCounts) {
+        const spacing = spacingOf(level.size);
+        const count = level.objectCount ?? 0;
+        // The drawn level counts as present, the rest as not-present, so the
+        // bar for what is on screen reads differently from the alternatives.
+        const drawn = perSpacing.has(spacing);
+        histogram.add(spacing, spacing, drawn ? count : 0, drawn ? 0 : count);
+      }
+      return;
+    }
+
     for (const [spacing, { present, missing }] of perSpacing) {
       histogram.add(spacing, spacing, present, missing);
     }
-    // Keep every pyramid level visible in the widget by adding a
-    // render-only placeholder bar for any level with no chunks in view.
+    // No per-level object counts: fall back to chunk slots. Only the selected
+    // level's are enumerated, so the others are derived -- levels tile the same
+    // viewed volume, so slots scale with the inverse cube of chunk spacing.
+    // Scaling one measured count is O(levels) per frame, where enumerating each
+    // level's slots would repeat the source selection and arbitration above for
+    // every one of them. Flagged render-only so an estimate is never counted as
+    // real chunk demand.
+    let reference: { spacing: number; count: number } | undefined;
+    for (const [spacing, { present, missing }] of perSpacing) {
+      const count = present + missing;
+      if (count > 0 && (reference === undefined || spacing < reference.spacing)) {
+        reference = { spacing, count };
+      }
+    }
     for (const level of levels ?? []) {
       const spacing = spacingOf(level.size);
-      if (!histogram.spatialScales.has(spacing)) {
-        histogram.add(spacing, spacing, 0, 1, true);
-      }
+      if (histogram.spatialScales.has(spacing)) continue;
+      const estimate =
+        reference === undefined
+          ? 1
+          : Math.max(
+              1,
+              Math.round(reference.count * (reference.spacing / spacing) ** 3),
+            );
+      histogram.add(spacing, spacing, 0, estimate, true);
     }
   }
 
