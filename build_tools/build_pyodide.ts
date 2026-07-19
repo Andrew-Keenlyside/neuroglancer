@@ -268,15 +268,41 @@ function runCompiler(configs: Configuration[]): Promise<Stats[]> {
 
 // Paths and the zip name are passed as argv rather than interpolated into the
 // script, so Windows separators are never parsed as Python escape sequences.
+//
+// argv[1] is the python/ dir (its neuroglancer/ package is always zipped);
+// argv[2] is the output zip; argv[3:] are extra pure-Python package roots to
+// add at the zip root, each under its own directory name (so `zarr_vectors/`
+// becomes importable). Those come from NEUROGLANCER_PYODIDE_PACKAGES.
 const ZIP_PYTHON_SCRIPT = `
 import pathlib, sys, zipfile
 
-pkg = pathlib.Path(sys.argv[1]) / "neuroglancer"
+roots = [pathlib.Path(sys.argv[1]) / "neuroglancer"]
+roots += [pathlib.Path(p) for p in sys.argv[3:]]
 with zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED) as zf:
-    for f in sorted(pkg.rglob("*.py")):
-        arcname = f.relative_to(pkg).as_posix()
-        zf.write(f, "neuroglancer/" + arcname)
+    for root in roots:
+        if not root.is_dir():
+            raise SystemExit(f"package root not found: {root}")
+        base = root.name
+        for f in sorted(root.rglob("*.py")):
+            zf.write(f, base + "/" + f.relative_to(root).as_posix())
 `;
+
+/**
+ * Extra pure-Python package roots to bundle into the zip, from
+ * NEUROGLANCER_PYODIDE_PACKAGES (comma/`;`-separated absolute paths, each a
+ * package directory, e.g. `.../zarr-vectors-py/zarr_vectors`).
+ *
+ * Opt-in so a CI build with neither sibling repo present still succeeds -- when
+ * absent, the tractography reader falls back to its built-in decoder.
+ */
+function extraPackageRoots(): string[] {
+  const raw = process.env.NEUROGLANCER_PYODIDE_PACKAGES;
+  if (!raw) return [];
+  return raw
+    .split(/[,;]/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+}
 
 function resolvePythonInterpreter(): string {
   for (const candidate of ["python3", "python"]) {
@@ -301,9 +327,12 @@ function createPythonZip() {
   // Remove existing zip if present
   if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
 
+  const extras = extraPackageRoots();
+  for (const p of extras) console.log("Bundling extra package:", p);
+
   execFileSync(
     resolvePythonInterpreter(),
-    ["-c", ZIP_PYTHON_SCRIPT, pythonDir, zipPath],
+    ["-c", ZIP_PYTHON_SCRIPT, pythonDir, zipPath, ...extras],
     {
       stdio: "inherit",
     },

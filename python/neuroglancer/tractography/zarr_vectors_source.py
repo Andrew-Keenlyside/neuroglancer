@@ -48,17 +48,21 @@ switching -- and that makes the worker's request handlers interleave, which
 deadlocks the event loop under concurrent reads. See the comment at the
 `handleRequest` call in `src/python_integration/pyodide_worker.ts`.
 
-So the fix is an async read API upstream, not more code here; see
-`upstream_prompts/zarr-vectors-py.md`. Until that lands, reading the bytes with
-the browser's own `fetch` and decoding them with numpy keeps the dependency
-footprint at numpy alone.
+That async read API has since landed as `zarr_vectors.core.aio.read_async`, and
+`load_tract_index` now uses it: it builds a fetch-backed zarr Store
+(`browser_fetch_store.py`), opens the store with `open_store_async`, and runs
+`read_polylines` through `read_async`. The library is the canonical decoder --
+one copy of the format, with compression and sharding support this module never
+had.
 
-**This module is a stopgap and should be deleted when that API exists.** It is a
-strict subset of the real reader -- no compressors, no sharding, and it walks the
-whole chunk grid absorbing 404s where core reads the `nonempty_chunks` manifest
--- and its fragment-index decode is byte-for-byte identical to
-`zarr_vectors/encoding/fragments.py`. Two copies of one binary format is exactly
-the drift risk it was written to avoid elsewhere.
+**The built-in numpy decoder below is now a FALLBACK**, kept for two cases: an
+environment where zarr / zarr-vectors are not importable (this repo's plain
+CPython, which has neither), and a read the fetch Store cannot serve. It is a
+strict subset -- no compressors, no sharding, and it walks the whole chunk grid
+absorbing 404s where core reads the `nonempty_chunks` manifest -- and its
+fragment-index decode is byte-for-byte identical to
+`zarr_vectors/encoding/fragments.py`. Once the library path is verified end to
+end in a real Pyodide runtime, this fallback can go.
 
 The two decoders here mirror `src/datasource/zarr-vectors/vlen_bytes.ts` and
 `src/datasource/zarr-vectors/fragment_index.ts`, which read the same bytes for
@@ -270,6 +274,125 @@ async def _read_array_meta(fetch, base: str, path: str) -> dict:
     return meta
 
 
+# -- byte ranges (pure; testable without zarr) ------------------------------
+
+
+def apply_byte_range(data: bytes, byte_range: object) -> bytes:
+    """Slice ``data`` per a zarr 3 ``ByteRequest``, or return it whole.
+
+    Duck-typed rather than imported, so this stays usable (and unit-testable)
+    where zarr is not installed. The three zarr variants are distinguished by
+    their attributes: ``RangeByteRequest`` has ``start``/``end``,
+    ``OffsetByteRequest`` has ``offset``, ``SuffixByteRequest`` has ``suffix``.
+    """
+    if byte_range is None:
+        return data
+    suffix = getattr(byte_range, "suffix", None)
+    if suffix is not None:
+        return data[len(data) - int(suffix) :]
+    offset = getattr(byte_range, "offset", None)
+    if offset is not None:
+        return data[int(offset) :]
+    start = getattr(byte_range, "start", None)
+    if start is not None:
+        end = getattr(byte_range, "end", None)
+        return data[int(start) : (None if end is None else int(end))]
+    return data
+
+
+# -- zarr-vectors-py adapter (pure; testable without zarr) -------------------
+
+
+def _polylines_to_tract_index(result: dict) -> TractIndex:
+    """Turn ``zarr_vectors.read_polylines`` output into a `TractIndex`.
+
+    ``read_polylines`` returns ``{"polylines": [...], "object_ids": [...]}``,
+    where ``polylines[i]`` is a list of fragment arrays (each ``(k, 3)``) for
+    object ``object_ids[i]``. A `TractIndex` row is one fragment, tagged with
+    its object id -- the same shape the built-in decoder builds, so the two
+    paths produce identical indices.
+    """
+    polylines = result["polylines"]
+    object_ids = result["object_ids"]
+    position_blocks: list[np.ndarray] = []
+    counts: list[int] = []
+    row_ids: list[int] = []
+    for fragment_list, object_id in zip(polylines, object_ids):
+        for fragment in fragment_list:
+            frag = np.asarray(fragment, dtype=np.float32).reshape(-1, 3)
+            if frag.shape[0] == 0:
+                continue
+            position_blocks.append(frag)
+            counts.append(int(frag.shape[0]))
+            row_ids.append(int(object_id))
+    if not position_blocks:
+        raise ValueError("zarr-vectors read returned no vertices")
+    positions = np.concatenate(position_blocks)
+    offsets = np.zeros(len(counts) + 1, dtype=np.intp)
+    np.cumsum(np.asarray(counts, dtype=np.intp), out=offsets[1:])
+    return TractIndex(positions, offsets, np.array(row_ids, dtype=np.uint64))
+
+
+async def _load_via_zarr_vectors(
+    base: str,
+    level: int,
+    fetch: Callable[[str], Awaitable[bytes | None]],
+) -> TractIndex | None:
+    """Read the level through zarr-vectors-py, or return None to fall back.
+
+    Preferred over the built-in decoder below because it is the canonical
+    reader -- one copy of the format, and it handles compression and sharding
+    the built-in path rejects. Returns None (rather than raising) whenever the
+    library, zarr, or the async read is unavailable or unsuccessful, so the
+    caller falls back to the self-contained decoder.
+    """
+    try:
+        from zarr_vectors import read_polylines
+        from zarr_vectors.core.aio import open_store_async, read_async
+
+        from .browser_fetch_store import make_browser_fetch_store
+    except Exception:
+        return None
+    try:
+        store = make_browser_fetch_store(base, fetch)
+        root = await open_store_async(store)
+        result = await read_async(read_polylines, root, level=level)
+        return _polylines_to_tract_index(result)
+    except Exception as exc:  # noqa: BLE001
+        # A read the fetch store cannot serve (one that needs to *list*), a
+        # compressed level, or a version mismatch all land here. The built-in
+        # decoder is a strict subset, so it will raise its own clear error if
+        # the data is genuinely beyond it.
+        import logging
+
+        logging.getLogger(__name__).info(
+            "zarr-vectors read of %s level %s failed (%s); using built-in decoder",
+            base,
+            level,
+            exc,
+        )
+        return None
+
+
+def _finish_index(
+    index: TractIndex,
+    max_vertices: int | None,
+    scale: Iterable[float] | None,
+    translation: Iterable[float] | None,
+) -> TractIndex:
+    """Apply the coordinate transform and decimation both read paths share."""
+    if scale is not None or translation is not None:
+        scaled = index.positions.astype(np.float32, copy=True)
+        if scale is not None:
+            scaled *= np.asarray(list(scale), dtype=np.float32)
+        if translation is not None:
+            scaled += np.asarray(list(translation), dtype=np.float32)
+        index = TractIndex(scaled, index.offsets, index.row_ids)
+    if max_vertices is not None:
+        index = index.decimate(max_vertices)
+    return index
+
+
 # -- loading ----------------------------------------------------------------
 
 
@@ -300,6 +423,13 @@ async def load_tract_index(
     if fetch is None:
         fetch = _default_fetch()
     base = url if url.endswith("/") else url + "/"
+
+    # Prefer the real library; fall back to the built-in decoder below when it
+    # is unavailable or cannot serve the read.
+    index = await _load_via_zarr_vectors(base, level, fetch)
+    if index is not None:
+        return _finish_index(index, max_vertices, scale, translation)
+
     prefix = f"{level}/"
 
     vertices_meta = await _read_array_meta(fetch, base, f"{prefix}vertices")
@@ -382,15 +512,4 @@ async def load_tract_index(
     offsets = np.zeros(len(counts) + 1, dtype=np.intp)
     np.cumsum(np.asarray(counts, dtype=np.intp), out=offsets[1:])
     index = TractIndex(positions, offsets, np.array(row_ids, dtype=np.uint64))
-
-    if scale is not None or translation is not None:
-        scaled = index.positions.astype(np.float32, copy=True)
-        if scale is not None:
-            scaled *= np.asarray(list(scale), dtype=np.float32)
-        if translation is not None:
-            scaled += np.asarray(list(translation), dtype=np.float32)
-        index = TractIndex(scaled, index.offsets, index.row_ids)
-
-    if max_vertices is not None:
-        index = index.decimate(max_vertices)
-    return index
+    return _finish_index(index, max_vertices, scale, translation)

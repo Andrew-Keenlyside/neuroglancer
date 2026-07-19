@@ -92,6 +92,7 @@ module = [
   "google.*",
   "osteoid",
   "zarr",
+  "zarr.*",
   "zarrita",
   "dask",
   "dask.*",

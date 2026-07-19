@@ -124,8 +124,14 @@ async function setupPyodide(
 
   self.postMessage({ type: "progress", message: "Loading Python packages…" });
 
-  // Install scientific packages.
-  await pyodide.loadPackage(["numpy", "scipy", "pillow", "micropip"]);
+  // Install scientific packages. `zarr` comes from the pyodide distribution
+  // (314.0.2 ships a WASM-patched zarr 3.2.1 that runs sync() on a WebLoop, not
+  // a thread) so the tractography reader can go through zarr-vectors-py rather
+  // than its built-in decoder. loadPackage pulls zarr's deps (numcodecs,
+  // google-crc32c) automatically; never micropip zarr, which is the unpatched
+  // PyPI wheel. Absent zarr, or absent the bundled zarr_vectors package, the
+  // reader falls back cleanly.
+  await pyodide.loadPackage(["numpy", "scipy", "pillow", "micropip", "zarr"]);
 
   self.postMessage({
     type: "progress",
