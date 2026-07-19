@@ -71,6 +71,9 @@ import {
 import { overlaysOpen } from "#src/overlay.js";
 import { ScreenshotHandler } from "#src/python_integration/screenshots.js";
 import { allRenderLayerRoles, RenderLayerRole } from "#src/renderlayer.js";
+import { roiStoreEnabled } from "#src/roi_store/config.js";
+import { getRoiStoreAuth } from "#src/roi_store/credentials.js";
+import { RoiStoreSignInWidget } from "#src/roi_store/sign_in_widget.js";
 import { StatusMessage } from "#src/status.js";
 import {
   ElementVisibilityFromTrackableBoolean,
@@ -779,6 +782,13 @@ export class Viewer extends RefCounted implements ViewerState {
     if (stateShareEnabled) {
       const stateShare = this.registerDisposer(new StateShare(this));
       topRow.appendChild(stateShare.element);
+    }
+
+    if (roiStoreEnabled) {
+      const signIn = this.registerDisposer(
+        new RoiStoreSignInWidget(getRoiStoreAuth()),
+      );
+      topRow.appendChild(signIn.element);
     }
 
     {
