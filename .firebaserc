@@ -10,6 +10,9 @@
         ],
         "ng-zarr-vectors": [
           "ng-zarr-vectors"
+        ],
+        "ng-pyodide": [
+          "ng-pyodide"
         ]
       }
     },

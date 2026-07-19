@@ -124,20 +124,30 @@ export default defineConfig((env, args) => {
       // tractography, matching the sample data in
       // `python/examples/pyodide/user_script.py`.
       //
-      // NOTE: as configured today this bucket grants anonymous object READ but
-      // not `storage.objects.list`, so the "From store" checklist prompts to
-      // sign in before it can enumerate anything. To make browsing anonymous:
+      // Uses the `middleauth` provider, reusing the CAVE/daf-apis login already
+      // configured for state sharing (config/state_servers.json) so no separate
+      // Google OAuth client is needed. Two constraints follow (see
+      // src/roi_store/README.md):
       //
-      //   gcloud storage buckets add-iam-policy-binding \
-      //     gs://hip_ct_zarr_vector_03987646472fethdsvdvdfg \
-      //     --member=allUsers --role=roles/storage.objectViewer
+      //   - BROWSE and LOAD work anonymously against the public bucket at
+      //     `endpoint` (default storage.googleapis.com) with no sign-in.
+      //   - SAVE and DELETE send the CAVE bearer token to `endpoint`; raw GCS
+      //     rejects it (401). To enable writing, point `endpoint` at a
+      //     middleauth-fronted store that accepts the token and implements the
+      //     GCS JSON upload API.
       //
-      // `clientId` must be an OAuth2 client authorised for this origin AND the
-      // devstorage scope. The brainmaps client ID above is neither, so saving
-      // will fail until a real one is substituted; see src/roi_store/README.md.
+      // Also: middleauth's popup response comes from the CAVE server's own page
+      // via window.opener, which COOP severs, so SAVE cannot complete in the
+      // cross-origin isolated pyodide build regardless of `endpoint`. There,
+      // browse/load work and save does not.
+      //
+      // This bucket grants anonymous object READ but not storage.objects.list,
+      // so the "From store" checklist offers "Sign in and retry" until an
+      // owner grants allUsers roles/storage.objectViewer.
       ROI_STORE: JSON.stringify({
         bucket: "hip_ct_zarr_vector_03987646472fethdsvdvdfg",
-        clientId: "REPLACE_ME.apps.googleusercontent.com",
+        provider: "middleauth",
+        authServer: "https://global.daf-apis.com",
       }),
 
       // NEUROGLANCER_CREDIT_LINK: JSON.stringify({url: '...', text: '...'}),
