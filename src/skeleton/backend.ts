@@ -23,12 +23,14 @@ import {
   withChunkManager,
 } from "#src/chunk_manager/backend.js";
 import { ChunkState } from "#src/chunk_manager/base.js";
-import type { RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
+import type { Roi, RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
+import { roiRegionBounds } from "#src/datasource/zarr-vectors/roi.js";
 // Pure ROI geometry (no zarr/render deps) drives the streamline filter's
 // backend recompute for zarr-vectors spatially-indexed skeleton (tract) layers.
 // Inert for every other skeleton layer: the whole feature is guarded on the
 // per-layer `roiPassingSegments` shared set being present (undefined here).
 import {
+  selectHighDetail,
   computeGroupedPassingSet,
   diffPassingSet,
   type RoiFilterableChunk,
@@ -113,6 +115,26 @@ const tempCenterDataPosition = vec3.create();
 const tempArbitrationChunkCenterWorld = vec3.create();
 const tempArbitrationCandidateChunkPos = vec3.create();
 const tempArbitrationLocalPoint = vec3.create();
+const tempRoiChunkLower = new Float32Array(3);
+const tempRoiChunkUpper = new Float32Array(3);
+const tempRoiChunkPosition = new Float32Array(3);
+
+/**
+ * Cap on chunks the ROI-residency guarantee may pin.
+ *
+ * The guarantee exists so a small region's geometry is always present; a region
+ * spanning the volume would instead pin the level and defeat the memory
+ * ceiling. Past this the guarantee is dropped rather than honoured -- a
+ * dissection that broad is not one the ceiling can serve anyway.
+ */
+const MAX_ROI_REGION_CHUNKS = 512;
+
+/**
+ * Priority boost for ROI-region chunks, above the frustum's own requests: the
+ * filter cannot be correct without them, whereas a merely-visible chunk only
+ * affects what is drawn.
+ */
+const ROI_REGION_CHUNK_PRIORITY = 10;
 
 function getChunkSpacing(size: Float32Array): number {
   return Math.max(Math.min(size[0], size[1], size[2]), 1e-6);
@@ -526,8 +548,7 @@ export class SpatiallyIndexedSkeletonChunk
     // its fragmentIndex is the one net-new retained allocation, so make it
     // visible to the system-memory budget.
     this.systemMemoryBytes =
-      attributeBytes +
-      (this.roiFilterableChunk?.fragmentIndex.byteLength ?? 0);
+      attributeBytes + (this.roiFilterableChunk?.fragmentIndex.byteLength ?? 0);
     super.downloadSucceeded();
   }
 }
@@ -600,6 +621,13 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   roiSegmentColors?: Uint64Map;
   /** Shared set of passing tracts of visible high-detail groups (drives pass-2). */
   roiHighDetailSegments?: Uint64Set;
+  /**
+   * Maximum streamlines pass 2 may load, or undefined for no cap.
+   *
+   * A count, not a byte figure: pass 2 fetches whole objects, so a tract that
+   * merely clips the view costs its entire length.
+   */
+  roiHighDetailBudget?: SharedWatchableValue<number>;
   /** Set when an ROI edit needs a recompute even if the resident chunk set is unchanged. */
   private roiRecomputePending = false;
   /** An evaluation is outstanding; at most one runs at a time. */
@@ -719,6 +747,16 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         this.chunkManager.scheduleUpdateChunkPriorities();
       };
       this.registerDisposer(roiGroups.changed.add(scheduleRoiRecompute));
+      if (options.roiHighDetailBudget !== undefined) {
+        const budget = (this.roiHighDetailBudget = rpc.get(
+          options.roiHighDetailBudget,
+        ));
+        // Lowering the cap must evict, raising it must fetch, so a change is a
+        // recompute trigger exactly like an ROI edit. Registered after
+        // `scheduleRoiRecompute` exists -- a `const` arrow referenced above its
+        // declaration is a temporal dead zone, not a hoisted function.
+        this.registerDisposer(budget.changed.add(scheduleRoiRecompute));
+      }
     }
   }
 
@@ -736,7 +774,8 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
       if (attachmentState === undefined) continue;
       for (const scales of attachmentState.transformedSources) {
         for (const tsource of scales) {
-          const source = tsource.source as SpatiallyIndexedSkeletonSourceBackend;
+          const source =
+            tsource.source as SpatiallyIndexedSkeletonSourceBackend;
           if (!seen.has(source)) {
             seen.add(source);
             yield source;
@@ -780,27 +819,26 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     // off, so an empty set is never mistaken for "everything fails".
     const groups = this.roiGroups.value;
     const hasRois = groups.some((g) => g.visible && g.rois.length !== 0);
-    const lod3d = this.skeletonLod.value;
-    const lod2d = this.skeletonLod2d.value;
-
-    // Bucket the resident, filterable chunks of the two live levels, tracking a
-    // per-level count and an order-independent hash of their keys.
-    const byLod = new Map<
+    // Bucket by PYRAMID LEVEL (the source's `gridIndex`), not by `chunk.lod`.
+    // `lod` records which render level a chunk was requested for; the level it
+    // actually belongs to is a property of its source. Bucketing by `lod` tied
+    // the dissection to whatever the camera had selected.
+    const byLevel = new Map<
       number,
       { chunks: RoiFilterChunkEntry[]; count: number; hash: number }
     >();
     if (hasRois) {
       for (const source of this.roiFilterableSources()) {
+        const gridIndex = getSpatiallyIndexedSkeletonGridIndex(source);
+        if (gridIndex === undefined) continue;
         for (const chunk of source.chunks.values()) {
           const c = chunk as SpatiallyIndexedSkeletonChunk;
           const data = c.roiFilterableChunk;
-          if (data === undefined || (c.lod !== lod3d && c.lod !== lod2d)) {
-            continue;
-          }
-          let bucket = byLod.get(c.lod);
+          if (data === undefined) continue;
+          let bucket = byLevel.get(gridIndex);
           if (bucket === undefined) {
             bucket = { chunks: [], count: 0, hash: 0 };
-            byLod.set(c.lod, bucket);
+            byLevel.set(gridIndex, bucket);
           }
           bucket.chunks.push({ key: c.key ?? "", data });
           bucket.count++;
@@ -808,11 +846,28 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         }
       }
     }
-    const targetLod = byLod.has(lod3d) ? lod3d : lod2d;
-    const bucket = byLod.get(targetLod);
+    // Evaluate at the FINEST level with any resident geometry -- larger
+    // gridIndex is finer (`frontend.ts`: levelPaths[0], the finest, is assigned
+    // `numLevels - 1`).
+    //
+    // `requestRoiRegionChunks` guarantees the ROI regions' chunks at every
+    // level, and a fragment outside every region cannot change a crossing test,
+    // so the finest level is fully decidable from a bounded set of chunks even
+    // though the level as a whole is nowhere near resident. That is what lets
+    // the dissection see streamlines that exist ONLY at fine levels, rather
+    // than being confined to whatever level the camera happens to draw.
+    //
+    // Still a SINGLE level: mixing differently-decimated geometry for one id
+    // would let a coarse level pollute a fine verdict (see the note above
+    // `roiFilterableSources`). Mixing happens over OBJECTS, not geometry.
+    let targetLevel = -1;
+    for (const level of byLevel.keys()) {
+      if (level > targetLevel) targetLevel = level;
+    }
+    const bucket = targetLevel < 0 ? undefined : byLevel.get(targetLevel);
     const chunks = bucket?.chunks ?? [];
 
-    const signature = `${targetLod}:${bucket?.count ?? 0}:${bucket?.hash ?? 0}`;
+    const signature = `${targetLevel}:${bucket?.count ?? 0}:${bucket?.hash ?? 0}`;
 
     // While an evaluation is outstanding, ALWAYS queue and return. This check
     // must come before the signature comparison below, because during a flight
@@ -903,13 +958,28 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         `${this.rpcId}`,
       );
     }
+    // Applied to BOTH paths. The Python/WASM service does its own fold and
+    // returns early, so capping only the TypeScript fallback would make the
+    // budget silently stop applying wherever the service is available -- which
+    // is precisely the build the budget matters most in.
+    const budget = this.roiHighDetailBudget?.value;
     if (!client.isUnavailable) {
       const remote = await client.compute(chunks, groups);
-      if (remote !== undefined) return remote;
+      if (remote !== undefined) {
+        return {
+          ...remote,
+          highDetail: selectHighDetail(
+            remote.passing,
+            remote.highDetail,
+            budget,
+          ),
+        };
+      }
     }
     return computeGroupedPassingSet(
       chunks.map((c) => c.data),
       groups,
+      budget,
     );
   }
 
@@ -966,6 +1036,84 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         view.projectionParameters.value.displayDimensionRenderInfo,
       transformedSources: [],
     };
+  }
+
+  /**
+   * Request the chunks the ROI regions overlap, whatever the camera is showing.
+   *
+   * The dissection is folded over RESIDENT chunks, and residency is otherwise
+   * driven by the frustum -- so zooming in silently dropped an object's
+   * out-of-view fragments and a spanning dissection ("through here AND
+   * terminating there") under-selected.
+   *
+   * The bound that makes this cheap: a fragment lying outside every region can
+   * never change a crossing test, so the chunks overlapping the regions are not
+   * merely necessary but SUFFICIENT to decide the whole fold. ROIs are small, so
+   * this is a handful of chunks, and it holds the single-level evaluation intact
+   * rather than folding differently-decimated geometry together.
+   *
+   * Skipped when any region is a halfspace: unbounded, so no finite chunk set
+   * can be guaranteed and the camera's residency is all there is.
+   */
+  private requestRoiRegionChunks(
+    tsource: TransformedSource<
+      SpatiallyIndexedSkeletonRenderLayerBackend,
+      SpatiallyIndexedSkeletonSourceBackend
+    >,
+    priorityTier: number,
+    basePriority: number,
+  ) {
+    const groups = this.roiGroups?.value;
+    if (groups === undefined) return;
+    const rois: Roi[] = [];
+    for (const group of groups) {
+      if (group.visible && group.rois.length !== 0) rois.push(...group.rois);
+    }
+    if (rois.length === 0) return;
+    const bounds = roiRegionBounds(rois);
+    if (bounds === undefined) return;
+
+    const source = tsource.source as SpatiallyIndexedSkeletonSourceBackend;
+    const lower = tempRoiChunkLower;
+    const upper = tempRoiChunkUpper;
+    if (
+      !getChunkGridPositionForWorldPoint(tsource, bounds.lower, lower) ||
+      !getChunkGridPositionForWorldPoint(tsource, bounds.upper, upper)
+    ) {
+      return;
+    }
+    const { lowerChunkBound, upperChunkBound } = tsource.source.spec;
+    let total = 1;
+    for (let i = 0; i < 3; ++i) {
+      const lo = Math.max(Math.min(lower[i], upper[i]), lowerChunkBound[i]);
+      const hi = Math.min(Math.max(lower[i], upper[i]), upperChunkBound[i] - 1);
+      if (hi < lo) return;
+      lower[i] = lo;
+      upper[i] = hi;
+      total *= hi - lo + 1;
+    }
+    // A pathological ROI spanning the volume would otherwise pin the whole
+    // level resident, defeating the memory ceiling entirely.
+    if (total > MAX_ROI_REGION_CHUNKS) return;
+
+    const pos = tempRoiChunkPosition;
+    for (let z = lower[2]; z <= upper[2]; ++z) {
+      for (let y = lower[1]; y <= upper[1]; ++y) {
+        for (let x = lower[0]; x <= upper[0]; ++x) {
+          pos[0] = x;
+          pos[1] = y;
+          pos[2] = z;
+          // Same tier as the visible chunks: these ARE needed to draw a correct
+          // dissection, so demoting them to prefetch would let the filter
+          // under-select for as long as memory stayed tight.
+          this.chunkManager.requestChunk(
+            source.getChunk(pos),
+            priorityTier,
+            basePriority + ROI_REGION_CHUNK_PRIORITY,
+          );
+        }
+      }
+    }
   }
 
   private recomputeChunkPriorities() {
@@ -1141,6 +1289,20 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
 
       const lodValue = (is2dView ? this.skeletonLod2d : this.skeletonLod).value;
       for (const scales of transformedSources) {
+        // Every level, before any frustum work: the dissection's geometry
+        // requirement is set by the ROI regions and the budget, not by what is
+        // on screen, so this must not sit inside a branch that has already
+        // narrowed to one level.
+        for (const tsource of scales) {
+          this.requestRoiRegionChunks(
+            tsource as TransformedSource<
+              SpatiallyIndexedSkeletonRenderLayerBackend,
+              SpatiallyIndexedSkeletonSourceBackend
+            >,
+            priorityTier,
+            basePriority,
+          );
+        }
         if (
           !is2dView &&
           scales.length > 1 &&

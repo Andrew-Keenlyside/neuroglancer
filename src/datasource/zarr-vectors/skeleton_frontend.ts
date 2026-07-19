@@ -44,6 +44,7 @@ import {
 import { buildVertexAttributeMap } from "#src/datasource/zarr-vectors/skeleton_shader_bridge.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
 import type { SharedKvStoreContext } from "#src/kvstore/frontend.js";
+import { bytesPerObjectFromLevelCounts } from "#src/skeleton/spatial_chunk_sizing.js";
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import {
   MultiscaleSpatiallyIndexedSkeletonSource,
@@ -534,21 +535,50 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     return this.perLevelObjectCount.slice().reverse();
   }
 
+  /** What one vertex of level `k` (finest-first) costs on the GPU. */
+  private bytesPerVertexAtLevel(k: number): number {
+    const p = this.levels[k].parameters;
+    let bytesPerVertex = p.rank * 4; // positions, float32
+    if (hasSynthesisedTangent(p.geometryKind)) bytesPerVertex += 3 * 4;
+    for (const dtype of p.attributeDtypes) {
+      bytesPerVertex += ATTR_DTYPE_BYTES[dtype];
+    }
+    bytesPerVertex += 8; // synthesised segment column, uvec2
+    bytesPerVertex += 8; // ~1 implicit edge per vertex, uvec2 index pair
+    return bytesPerVertex;
+  }
+
   getSpatialSkeletonLevelCostsBytes(): number[] {
-    const finestFirst = this.levels.map((level, k) => {
+    const finestFirst = this.levels.map((_level, k) => {
       const count = this.perLevelVertexCount[k];
       if (count === undefined) return Number.NaN;
-      const p = level.parameters;
-      let bytesPerVertex = p.rank * 4; // positions, float32
-      if (hasSynthesisedTangent(p.geometryKind)) bytesPerVertex += 3 * 4;
-      for (const dtype of p.attributeDtypes) {
-        bytesPerVertex += ATTR_DTYPE_BYTES[dtype];
-      }
-      bytesPerVertex += 8; // synthesised segment column, uvec2
-      bytesPerVertex += 8; // ~1 implicit edge per vertex, uvec2 index pair
-      return count * bytesPerVertex;
+      return count * this.bytesPerVertexAtLevel(k);
     });
     return finestFirst.reverse();
+  }
+
+  /**
+   * What ONE full-resolution streamline costs on the GPU, or `undefined` when
+   * the store does not carry enough metadata to say.
+   *
+   * This is the conversion a byte budget needs to become a streamline budget,
+   * and streamlines are the right unit because the object-keyed pass fetches
+   * whole tracts: one clipping the view costs its entire length.
+   *
+   * Measured at the FINEST level, since that is what that pass loads.
+   *
+   * Returns `undefined` when `perLevelObjectCount` has degenerated to
+   * `perLevelVertexCount` -- `computePerLevelObjectCount` falls back to exactly
+   * that when the store omits `inherited_num_objects`/`object_sparsity`, which
+   * would make vertices-per-object a meaningless 1.0 and the derived budget
+   * wrong by two orders of magnitude. Better to decline than to invent one.
+   */
+  getFullDetailBytesPerStreamline(): number | undefined {
+    return bytesPerObjectFromLevelCounts(
+      this.perLevelVertexCount[0],
+      this.perLevelObjectCount[0],
+      this.bytesPerVertexAtLevel(0),
+    );
   }
 
   /**

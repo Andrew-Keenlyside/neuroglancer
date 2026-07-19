@@ -236,6 +236,15 @@ interface SkeletonShaderParameters {
    * every other skeleton layer's shader is byte-identical to before.
    */
   hasRoiFilter: boolean;
+  /**
+   * Compile the pass-1 hide tier: suppress tracts that the object-keyed pass-2
+   * layer draws at full resolution, so each is drawn exactly once.
+   *
+   * Set only on PASS 1. Pass 2 runs this same shader code over the same display
+   * state, so compiling it there would make that layer hide precisely the tracts
+   * it exists to draw.
+   */
+  hasRoiHighDetailHide: boolean;
   /** Compile the ROI colour-by-group tier (zarr-vectors tract layers). */
   hasRoiSegmentColors: boolean;
   hasSegmentStatedColors: boolean;
@@ -310,6 +319,9 @@ class RenderHelper extends RefCounted {
   private roiPassingSegmentsShaderManager = new HashSetShaderManager(
     "roiPassingSegments",
   );
+  private roiHighDetailSegmentsShaderManager = new HashSetShaderManager(
+    "roiHighDetailSegments",
+  );
   private segmentColorShaderManager = new SegmentColorShaderManager(
     "segmentColorHash",
   );
@@ -326,7 +338,12 @@ class RenderHelper extends RefCounted {
   private gpuVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuTemporaryVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
   private gpuEmptySegmentsHashTable: GPUHashTable<HashSetUint64>;
-  private gpuRoiPassingSegmentsHashTable: GPUHashTable<HashSetUint64> | undefined;
+  private gpuRoiPassingSegmentsHashTable:
+    | GPUHashTable<HashSetUint64>
+    | undefined;
+  private gpuRoiHighDetailSegmentsHashTable:
+    | GPUHashTable<HashSetUint64>
+    | undefined;
   private gpuRoiSegmentColorHashTable: GPUHashTable<HashMapUint64> | undefined;
   // Lazily acquired and re-checked each draw; see getSegmentStatedColorHashTable.
   private gpuSegmentStatedColorHashTable:
@@ -485,6 +502,20 @@ void spatialChunkCull() {
       excludedSegmentAlpha = "1.0";
     }
 
+    // Pass-1 hide tier: a tract the pass-2 layer draws at full resolution must
+    // not also be drawn here, or it renders twice -- blended over itself, so it
+    // reads brighter and thicker than its neighbours. Because the pyramid is
+    // strictly nested, the doubled tracts would be exactly the coarse backbone,
+    // inverting the emphasis. Placed before the ghost tier: a tract pass 2 owns
+    // is not ghosted, it is simply not drawn here at all.
+    const roiHighDetailHideFragment = params.hasRoiHighDetailHide
+      ? `
+  if (uRoiFilterActive > 0.5 &&
+      ${this.roiHighDetailSegmentsShaderManager.hasFunctionName}(segmentId)) {
+    return 0.0;
+  }`
+      : "";
+
     // ROI filter tier: ghost segments that are not in the passing set while the
     // filter is active. Defined only when compiled in, so other skeleton layers
     // are unaffected.
@@ -495,7 +526,6 @@ void spatialChunkCull() {
     return uRoiGhostAlpha;
   }`
       : "";
-
 
     // Per-group "on" opacity: a passing tract takes the alpha byte of its
     // group's colour (packed into roiSegmentColors). Independent of
@@ -521,6 +551,9 @@ void spatialChunkCull() {
       this.roiPassingSegmentsShaderManager.defineShader(builder);
       builder.addUniform("highp float", "uRoiFilterActive");
       builder.addUniform("highp float", "uRoiGhostAlpha");
+    }
+    if (params.hasRoiHighDetailHide) {
+      this.roiHighDetailSegmentsShaderManager.defineShader(builder);
     }
     if (params.hasRoiSegmentColors) {
       this.roiSegmentColorShaderManager.defineShader(builder);
@@ -578,7 +611,7 @@ ${hoverAdjustFragment}
 float getSegmentLookupAlpha(uint64_t segmentId) {
   if (${this.excludedSegmentsShaderManager.hasFunctionName}(segmentId)) {
     return ${excludedSegmentAlpha};
-  }${roiFilterFragment}${roiOpacityFragment}
+  }${roiHighDetailHideFragment}${roiFilterFragment}${roiOpacityFragment}
   bool isVisible = ${this.visibleSegmentsShaderManager.hasFunctionName}(segmentId);
   ${alphaExpression}
 }
@@ -624,6 +657,14 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
       gl.uniform1f(
         shader.uniform("uRoiGhostAlpha"),
         dss.roiGhostAlpha?.value ?? 0,
+      );
+    }
+    if (skeletonParams.hasRoiHighDetailHide) {
+      this.roiHighDetailSegmentsShaderManager.enable(
+        gl,
+        shader,
+        this.gpuRoiHighDetailSegmentsHashTable ??
+          this.gpuEmptySegmentsHashTable,
       );
     }
     // 3D (perspective) uses objectAlpha/hiddenObjectAlpha; 2D (slice) uses
@@ -767,6 +808,12 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
     if (roiPassingSegments !== undefined) {
       this.gpuRoiPassingSegmentsHashTable = this.registerDisposer(
         GPUHashTable.get(this.gl, roiPassingSegments.hashTable),
+      );
+    }
+    const roiHighDetailSegments = base.displayState.roiHighDetailSegments;
+    if (roiHighDetailSegments !== undefined) {
+      this.gpuRoiHighDetailSegmentsHashTable = this.registerDisposer(
+        GPUHashTable.get(this.gl, roiHighDetailSegments.hashTable),
       );
     }
     const roiSegmentColors = base.displayState.roiSegmentColors;
@@ -1478,6 +1525,13 @@ export interface SkeletonLayerDisplayState extends SegmentationDisplayState3D {
    * reads it as its visible set. Threaded to the backend counterpart.
    */
   roiHighDetailSegments?: Uint64Set;
+  /**
+   * Maximum streamlines pass 2 may load at full resolution, in OBJECTS.
+   *
+   * Counted in streamlines because pass 2 fetches whole objects: a tract that
+   * clips the view brings its whole length, so bytes-in-view understates it.
+   */
+  roiHighDetailBudget?: WatchableValueInterface<number>;
 }
 
 export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
@@ -1494,6 +1548,7 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
     new WatchableValue<SkeletonShaderParameters>({
       dynamicSegmentAppearance: false,
       hasRoiFilter: false,
+      hasRoiHighDetailHide: false,
       hasRoiSegmentColors: false,
       hasSegmentStatedColors: false,
       hasSegmentDefaultColor: false,
@@ -3148,10 +3203,22 @@ export class SpatiallyIndexedSkeletonLayer
     const hasRoiFilter = this.displayState.roiPassingSegments !== undefined;
     const hasRoiSegmentColors =
       this.displayState.roiSegmentColors !== undefined;
+    // The pass-2 layer runs this same shader over the same display state, so the
+    // hide tier must be compiled ONLY into pass 1 -- otherwise pass 2 would hide
+    // exactly the tracts it exists to draw, and nothing would render at all.
+    // The source is what distinguishes them.
+    const isRoiHighDetailLayer =
+      (this.source as { isRoiHighDetailSource?: boolean })
+        .isRoiHighDetailSource === true;
+    const hasRoiHighDetailHide =
+      hasRoiFilter &&
+      !isRoiHighDetailLayer &&
+      this.displayState.roiHighDetailSegments !== undefined;
     this.skeletonShaderParameters =
       new WatchableValue<SkeletonShaderParameters>({
         dynamicSegmentAppearance: true,
         hasRoiFilter,
+        hasRoiHighDetailHide,
         hasRoiSegmentColors,
         hasSegmentStatedColors: false,
         hasSegmentDefaultColor: false,
@@ -3164,6 +3231,7 @@ export class SpatiallyIndexedSkeletonLayer
       this.skeletonShaderParameters.value = {
         dynamicSegmentAppearance: true,
         hasRoiFilter,
+        hasRoiHighDetailHide,
         hasRoiSegmentColors,
         hasSegmentStatedColors: colorGroupState.segmentStatedColors.size !== 0,
         hasSegmentDefaultColor:
@@ -3310,6 +3378,16 @@ export class SpatiallyIndexedSkeletonLayer
         counterpartOptions.roiHighDetailSegments =
           displayState.roiHighDetailSegments.rpcId;
       }
+      if (displayState.roiHighDetailBudget !== undefined) {
+        // Shared, not snapshotted: the cap is user-adjustable, and a plain
+        // value would freeze whatever it happened to be at construction.
+        counterpartOptions.roiHighDetailBudget = this.registerDisposer(
+          SharedWatchableValue.makeFromExisting(
+            rpc,
+            displayState.roiHighDetailBudget,
+          ),
+        ).rpcId;
+      }
       counterpartOptions.roiGroups = this.registerDisposer(
         SharedWatchableValue.makeFromExisting(rpc, displayState.roiGroups),
       ).rpcId;
@@ -3317,9 +3395,13 @@ export class SpatiallyIndexedSkeletonLayer
       this.registerDisposer(
         displayState.roiPassingSegments.changed.add(roiRedraw),
       );
-      this.registerDisposer(displayState.roiFilterActive.changed.add(roiRedraw));
+      this.registerDisposer(
+        displayState.roiFilterActive.changed.add(roiRedraw),
+      );
       if (displayState.roiGhostAlpha !== undefined) {
-        this.registerDisposer(displayState.roiGhostAlpha.changed.add(roiRedraw));
+        this.registerDisposer(
+          displayState.roiGhostAlpha.changed.add(roiRedraw),
+        );
       }
       if (displayState.roiSegmentColors !== undefined) {
         this.registerDisposer(
@@ -3932,7 +4014,10 @@ export class SpatiallyIndexedSkeletonLayer
     let reference: { spacing: number; count: number } | undefined;
     for (const [spacing, { present, missing }] of perSpacing) {
       const count = present + missing;
-      if (count > 0 && (reference === undefined || spacing < reference.spacing)) {
+      if (
+        count > 0 &&
+        (reference === undefined || spacing < reference.spacing)
+      ) {
         reference = { spacing, count };
       }
     }

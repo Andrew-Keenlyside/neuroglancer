@@ -36,9 +36,11 @@ function raggedBlob(groups: number[][][]): Uint8Array {
   const buf = new Uint8Array(8 * (1 + k) + flat.length * 8);
   const dv = new DataView(buf.buffer);
   dv.setBigInt64(0, BigInt(k), true);
-  for (let i = 0; i < k; ++i) dv.setBigInt64(8 + 8 * i, BigInt(byteOffsets[i]), true);
+  for (let i = 0; i < k; ++i)
+    dv.setBigInt64(8 + 8 * i, BigInt(byteOffsets[i]), true);
   const base = 8 * (1 + k);
-  for (let i = 0; i < flat.length; ++i) dv.setBigInt64(base + 8 * i, BigInt(flat[i]), true);
+  for (let i = 0; i < flat.length; ++i)
+    dv.setBigInt64(base + 8 * i, BigInt(flat[i]), true);
   return buf;
 }
 
@@ -69,12 +71,19 @@ describe("decodeRaggedBlobRows", () => {
   it("flattens multiple groups", () => {
     const rows = decodeRaggedBlobRows(
       raggedBlob([
-        [[1, 2], [3, 4]],
+        [
+          [1, 2],
+          [3, 4],
+        ],
         [[5, 6]],
       ]),
       2,
     );
-    expect(rows).toEqual([[1, 2], [3, 4], [5, 6]]);
+    expect(rows).toEqual([
+      [1, 2],
+      [3, 4],
+      [5, 6],
+    ]);
   });
 
   it("returns [] for an empty blob (k = 0)", () => {
@@ -108,20 +117,34 @@ describe("decodeLinkCell", () => {
   });
 
   it("uses a negative offset correctly", () => {
-    const [record] = decodeLinkCell(cell([[7, 8]]), [2, 2, 2], [[-1, 0, 0]], 2, false);
+    const [record] = decodeLinkCell(
+      cell([[7, 8]]),
+      [2, 2, 2],
+      [[-1, 0, 0]],
+      2,
+      false,
+    );
     expect(record.endpoints[1].chunkCoords).toEqual([1, 2, 2]);
   });
 
   it("skips the perm_idx column when has_perm is set", () => {
     // Row is [perm_idx, vi_0, vi_1]; only the vi columns become endpoints.
-    const [record] = decodeLinkCell(cell([[5, 11, 22]]), [0, 0, 0], [[0, 1, 0]], 2, true);
+    const [record] = decodeLinkCell(
+      cell([[5, 11, 22]]),
+      [0, 0, 0],
+      [[0, 1, 0]],
+      2,
+      true,
+    );
     expect(record.endpoints.map((e) => e.vertexIndex)).toEqual([11, 22]);
     expect(record.endpoints[1].chunkCoords).toEqual([0, 1, 0]);
   });
 
   it("rejects a zstd-compressed cell with a clear error", () => {
     const zstd = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0]);
-    expect(() => decodeLinkCell(zstd, [0, 0, 0], [[0, 0, 1]], 2, false)).toThrow(/zstd/);
+    expect(() =>
+      decodeLinkCell(zstd, [0, 0, 0], [[0, 0, 1]], 2, false),
+    ).toThrow(/zstd/);
   });
 });
 

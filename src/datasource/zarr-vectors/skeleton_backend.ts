@@ -48,6 +48,7 @@ import {
   recomputeTangentsForBridges,
   type ResolvedBridge,
 } from "#src/datasource/zarr-vectors/skeleton_chunk.js";
+import { ChunkCoalescingCache } from "#src/datasource/zarr-vectors/chunk_coalescing_cache.js";
 import {
   downloadSkeletonChunk,
   fetchGhostVertices,
@@ -662,6 +663,17 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
   ZarrVectorsObjectKeyedSkeletonSourceParameters,
 ) {
   /**
+   * Shared across this source's concurrent object downloads.
+   *
+   * Tracts in a dissection are spatially clustered by construction -- they pass
+   * through the same regions -- so without this the same spatial chunk is
+   * fetched and decoded once per tract crossing it. That redundancy, not the
+   * transfer, is what made a large full-detail set unusable.
+   */
+  private chunkCoalescingCache = new ChunkCoalescingCache<
+    Awaited<ReturnType<typeof downloadSkeletonChunk>>
+  >();
+  /**
    * Cached decoded ``cross_chunk_links/0/`` table for this level.  Read
    * lazily on the first ``download()`` and reused across all subsequent
    * object downloads — the table is per-level, not per-object.
@@ -849,6 +861,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
         geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
         crossChunkLinks,
         hasFragmentSegmentIds,
+        chunkCache: this.chunkCoalescingCache,
       },
       signal,
     );

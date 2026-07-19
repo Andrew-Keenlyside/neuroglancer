@@ -215,3 +215,60 @@ export function getDefaultSpatiallyIndexedSkeletonChunkSize(
 
   return extents.map(() => low);
 }
+
+/**
+ * Bytes one full-resolution object costs on the GPU, or `undefined` when the
+ * inputs cannot support the answer.
+ *
+ * This is the conversion that turns a memory budget into an OBJECT budget, which
+ * is the meaningful unit wherever whole objects are fetched: one clipping the
+ * view costs its entire extent, so any per-chunk or in-view estimate understates
+ * it systematically.
+ *
+ * Declines when `objectCount` equals `vertexCount`. That is not a coincidence to
+ * be papered over: a pyramid whose per-level object counts are unavailable
+ * substitutes the vertex counts, and taking the ratio then yields exactly 1.0
+ * vertex per object — a budget wrong by however many vertices a real object has,
+ * two orders of magnitude on a tractogram. Returning `undefined` lets the caller
+ * keep a manual figure rather than act on a fabricated one.
+ */
+export function bytesPerObjectFromLevelCounts(
+  vertexCount: number | undefined,
+  objectCount: number | undefined,
+  bytesPerVertex: number,
+): number | undefined {
+  if (
+    vertexCount === undefined ||
+    objectCount === undefined ||
+    !Number.isFinite(vertexCount) ||
+    !Number.isFinite(objectCount) ||
+    !Number.isFinite(bytesPerVertex) ||
+    vertexCount <= 0 ||
+    objectCount <= 0 ||
+    bytesPerVertex <= 0 ||
+    vertexCount === objectCount
+  ) {
+    return undefined;
+  }
+  return (vertexCount / objectCount) * bytesPerVertex;
+}
+
+/**
+ * How many objects a byte budget affords, given the per-object cost.
+ *
+ * Floored, and never negative: a budget that cannot afford a single object is 0
+ * rather than a fraction the caller would have to round itself.
+ */
+export function objectBudgetFromBytes(
+  budgetBytes: number,
+  bytesPerObject: number,
+): number {
+  if (
+    !Number.isFinite(budgetBytes) ||
+    !Number.isFinite(bytesPerObject) ||
+    bytesPerObject <= 0
+  ) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(budgetBytes / bytesPerObject));
+}

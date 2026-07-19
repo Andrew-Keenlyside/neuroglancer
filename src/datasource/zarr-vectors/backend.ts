@@ -36,12 +36,12 @@ import {
 import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
 import { requestAsyncComputation } from "#src/async_computation/request.js";
 import { WithParameters } from "#src/chunk_manager/backend.js";
-import { readVlenBytesElement } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import type { ZarrVectorsAttributeDtype } from "#src/datasource/zarr-vectors/base.js";
 import {
   ZarrVectorsAnnotationSourceParameters,
   ZarrVectorsAnnotationSpatialIndexSourceParameters,
 } from "#src/datasource/zarr-vectors/base.js";
+import { readVlenBytesElement } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import { WithSharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
 import { joinBaseUrlAndPath } from "#src/kvstore/url.js";
 import { registerSharedObject } from "#src/worker_rpc.js";

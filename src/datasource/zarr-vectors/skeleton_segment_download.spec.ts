@@ -6,12 +6,12 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
 import {
   FRAGMENT_INDEX_MAGIC,
   FRAGMENT_INDEX_VERSION,
   FragmentIndex,
 } from "#src/datasource/zarr-vectors/fragment_index.js";
+import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
 import { MANIFEST_MODE_SINGLE } from "#src/datasource/zarr-vectors/object_manifest.js";
 import { buildSkeletonChunk } from "#src/datasource/zarr-vectors/skeleton_chunk.js";
 import {

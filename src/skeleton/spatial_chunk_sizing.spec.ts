@@ -20,6 +20,8 @@ import {
   buildSpatialSkeletonGridLevels,
   getDefaultSpatiallyIndexedSkeletonChunkSize,
   getSpatialSkeletonGridSpacing,
+  bytesPerObjectFromLevelCounts,
+  objectBudgetFromBytes,
   selectSpatialSkeletonGridLevelByBudget,
   sortSpatialSkeletonGridSizes,
   type SpatialSkeletonGridSize,
@@ -257,7 +259,11 @@ describe("buildSpatialSkeletonGridLevels — object counts", () => {
   });
 
   it("omits the count where the writer did not stamp one", () => {
-    const levels = buildSpatialSkeletonGridLevels(sizes, [50, undefined, 503000]);
+    const levels = buildSpatialSkeletonGridLevels(sizes, [
+      50,
+      undefined,
+      503000,
+    ]);
     expect(levels[0].objectCount).toBe(50);
     expect("objectCount" in levels[1]).toBe(false);
     expect(levels[2].objectCount).toBe(503000);
@@ -275,5 +281,55 @@ describe("buildSpatialSkeletonGridLevels — object counts", () => {
     expect(levels).toHaveLength(3);
     expect(levels.every((l) => l.objectCount === undefined)).toBe(true);
     expect(levels.map((l) => l.lod)).toEqual([0, 0.5, 1]);
+  });
+});
+
+describe("bytesPerObjectFromLevelCounts", () => {
+  it("scales vertices-per-object by the per-vertex cost", () => {
+    // 200 vertices per object at 40 bytes each.
+    expect(bytesPerObjectFromLevelCounts(103369, 503, 40)).toBeCloseTo(
+      (103369 / 503) * 40,
+    );
+  });
+
+  it("declines when the counts are equal", () => {
+    // A pyramid without per-level object counts substitutes the vertex counts,
+    // so the ratio degenerates to 1.0 vertex per object -- a budget wrong by two
+    // orders of magnitude on a tractogram. Better to decline than to fabricate.
+    expect(bytesPerObjectFromLevelCounts(5000, 5000, 40)).toBeUndefined();
+  });
+
+  it("declines on missing, zero or non-finite inputs", () => {
+    expect(bytesPerObjectFromLevelCounts(undefined, 10, 40)).toBeUndefined();
+    expect(bytesPerObjectFromLevelCounts(1000, undefined, 40)).toBeUndefined();
+    expect(bytesPerObjectFromLevelCounts(1000, 0, 40)).toBeUndefined();
+    expect(bytesPerObjectFromLevelCounts(0, 10, 40)).toBeUndefined();
+    expect(bytesPerObjectFromLevelCounts(1000, 10, 0)).toBeUndefined();
+    expect(bytesPerObjectFromLevelCounts(Number.NaN, 10, 40)).toBeUndefined();
+  });
+});
+
+describe("objectBudgetFromBytes", () => {
+  it("floors to whole objects", () => {
+    expect(objectBudgetFromBytes(1000, 300)).toBe(3);
+  });
+
+  it("is 0 when it cannot afford one", () => {
+    expect(objectBudgetFromBytes(100, 300)).toBe(0);
+  });
+
+  it("is 0 rather than negative or infinite on bad input", () => {
+    expect(objectBudgetFromBytes(-5, 300)).toBe(0);
+    expect(objectBudgetFromBytes(1000, 0)).toBe(0);
+    expect(objectBudgetFromBytes(Number.NaN, 300)).toBe(0);
+  });
+
+  it("converts a real half-share of a 1 GB pool", () => {
+    // 500 MB at ~8.1 kB per tract: a few tens of thousands of streamlines,
+    // which is the order the default manual budget assumed.
+    const perObject = bytesPerObjectFromLevelCounts(103369, 503, 40)!;
+    const budget = objectBudgetFromBytes(0.5e9, perObject);
+    expect(budget).toBeGreaterThan(10_000);
+    expect(budget).toBeLessThan(200_000);
   });
 });

@@ -17,8 +17,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { Uint64Set } from "#src/uint64_set.js";
-import { mat4 } from "#src/util/geom.js";
 import { DataType } from "#src/util/data_type.js";
+import { mat4 } from "#src/util/geom.js";
 
 if (!("WebGL2RenderingContext" in globalThis)) {
   Object.defineProperty(globalThis, "WebGL2RenderingContext", {
@@ -239,7 +239,9 @@ describe("SpatiallyIndexedSkeletonLayer browse exclusions", () => {
   });
 });
 
-function makeIdentityMappedTransform(modelToRenderLayerTransform: Float32Array) {
+function makeIdentityMappedTransform(
+  modelToRenderLayerTransform: Float32Array,
+) {
   return {
     rank: 3,
     unpaddedRank: 3,
@@ -359,7 +361,12 @@ describe("maybeUpdateAutoSpatialSkeletonGridResolutionTarget bias stability", ()
 
     maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
       displayState,
-      { viewProjectionMat, width: 1000, height: 1, globalPosition: new Float32Array(3) },
+      {
+        viewProjectionMat,
+        width: 1000,
+        height: 1,
+        globalPosition: new Float32Array(3),
+      },
       localPosition,
       "3d",
     );

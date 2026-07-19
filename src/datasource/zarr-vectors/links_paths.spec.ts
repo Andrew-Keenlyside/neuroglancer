@@ -85,7 +85,9 @@ describe("formatOffsets / parseOffsets", () => {
 
   it("rejects arity mismatches (guards against decoding wrong geometry)", () => {
     // Too few offsets for the width.
-    expect(() => parseOffsets("0.0.+1", { sidNdim: 3, linkWidth: 3 })).toThrow();
+    expect(() =>
+      parseOffsets("0.0.+1", { sidNdim: 3, linkWidth: 3 }),
+    ).toThrow();
     // Wrong component count for sidNdim.
     expect(() => parseOffsets("0.0", { sidNdim: 3, linkWidth: 2 })).toThrow();
     // 'self' with width > 1, and a real segment with width 1.
@@ -135,19 +137,49 @@ describe("linksHasPerm", () => {
   });
 
   it("is false for intra-chunk regardless of policy", () => {
-    expect(linksHasPerm([[0, 0, 0]], { delta: 0, directed: false, store: "canonical" })).toBe(false);
-    expect(linksHasPerm([[0, 0, 0]], { delta: 0, directed: false, store: "duplicate" })).toBe(false);
+    expect(
+      linksHasPerm([[0, 0, 0]], {
+        delta: 0,
+        directed: false,
+        store: "canonical",
+      }),
+    ).toBe(false);
+    expect(
+      linksHasPerm([[0, 0, 0]], {
+        delta: 0,
+        directed: false,
+        store: "duplicate",
+      }),
+    ).toBe(false);
   });
 
   it("is false for cross-level regardless of policy", () => {
-    expect(linksHasPerm([[0, 0, 1]], { delta: 1, directed: false, store: "duplicate" })).toBe(false);
+    expect(
+      linksHasPerm([[0, 0, 1]], {
+        delta: 1,
+        directed: false,
+        store: "duplicate",
+      }),
+    ).toBe(false);
   });
 
   it("is true for undirected same-level canonical (a sort happened)", () => {
-    expect(linksHasPerm([[0, 0, 1]], { delta: 0, directed: false, store: "canonical" })).toBe(true);
+    expect(
+      linksHasPerm([[0, 0, 1]], {
+        delta: 0,
+        directed: false,
+        store: "canonical",
+      }),
+    ).toBe(true);
   });
 
   it("is true for duplicate same-level even when directed", () => {
-    expect(linksHasPerm([[0, 0, 1]], { delta: 0, directed: true, store: "duplicate" })).toBe(true);
+    expect(
+      linksHasPerm([[0, 0, 1]], {
+        delta: 0,
+        directed: true,
+        store: "duplicate",
+      }),
+    ).toBe(true);
   });
 });

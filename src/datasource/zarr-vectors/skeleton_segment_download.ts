@@ -16,8 +16,8 @@
  * `vertexAttributes` — ready to drop into a per-segment `SkeletonChunk`.
  */
 
-import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
 import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
+import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
 import { resolveFragmentRef } from "#src/datasource/zarr-vectors/object_manifest.js";
 import {
   readObjectManifest,
@@ -29,6 +29,7 @@ import type {
   SkeletonChunk,
   SkeletonGeometryKind,
 } from "#src/datasource/zarr-vectors/skeleton_chunk.js";
+import type { ChunkCoalescingCache } from "#src/datasource/zarr-vectors/chunk_coalescing_cache.js";
 import {
   downloadSkeletonChunk,
   type AttributeDtype,
@@ -163,6 +164,14 @@ export function filterChunkByFragments(
 export interface DownloadSegmentSkeletonOptions {
   /** Manifest reader configuration (numObjects, chunkSize, sidNdim, kvStoreRead). */
   readonly manifestReader: ObjectManifestReaderOptions;
+  /**
+   * Shared across concurrent calls, so a chunk several tracts pass through is
+   * decoded once rather than once per tract. Optional: omit it and each call
+   * decodes independently, as before.
+   */
+  readonly chunkCache?: ChunkCoalescingCache<
+    Awaited<ReturnType<typeof downloadSkeletonChunk>>
+  >;
   /** Spatial-chunk download parameters (rank, dtypes, links convention, etc.). */
   readonly rank: number;
   readonly linkDtype: LinkDtype;
@@ -331,6 +340,7 @@ export async function downloadSegmentSkeleton(
     geometryKind,
     crossChunkLinks,
     hasFragmentSegmentIds,
+    chunkCache,
   } = options;
   const manifest = await readObjectManifest(oid, manifestReader, signal);
   if (manifest === undefined || manifest.length === 0) return undefined;
@@ -375,9 +385,19 @@ export async function downloadSegmentSkeleton(
 
   let runningVertexOffset = 0;
 
-  for (const block of manifest) {
-    const chunkKey = block.chunkCoords.join(".");
-    const skel = await downloadSkeletonChunk(
+  // Fetch every chunk this manifest touches UP FRONT, in parallel, and (when a
+  // cache is supplied) shared with the other tracts being fetched alongside.
+  //
+  // The loop below stays strictly ordered -- `runningVertexOffset` accumulates
+  // and `orderedBlocks` drives the implicit_sequential cross-chunk edge
+  // reconstruction, both of which depend on manifest order -- but it no longer
+  // pays a round trip per block. Previously each block was a serial `await`, so
+  // a tract spanning 40 chunks cost 40 sequential decodes.
+  const uniqueChunkKeys = [
+    ...new Set(manifest.map((block) => block.chunkCoords.join("."))),
+  ];
+  const loadChunk = (chunkKey: string, chunkSignal: AbortSignal) =>
+    downloadSkeletonChunk(
       {
         chunkKey,
         rank,
@@ -389,8 +409,31 @@ export async function downloadSegmentSkeleton(
         hasFragmentSegmentIds,
         kvStoreRead: manifestReader.kvStoreRead,
       },
-      signal,
+      chunkSignal,
     );
+  const fetchedChunks = new Map<
+    string,
+    Awaited<ReturnType<typeof downloadSkeletonChunk>>
+  >();
+  await Promise.all(
+    uniqueChunkKeys.map(async (chunkKey) => {
+      const skel =
+        chunkCache === undefined
+          ? await loadChunk(chunkKey, signal)
+          : // A cached entry is shared, so it must not carry THIS caller's
+            // signal: aborting one tract would cancel a decode the others are
+            // still waiting on. See `ChunkCoalescingCache`.
+            await chunkCache.get(chunkKey, () =>
+              loadChunk(chunkKey, new AbortController().signal),
+            );
+      fetchedChunks.set(chunkKey, skel);
+    }),
+  );
+  if (signal.aborted) return undefined;
+
+  for (const block of manifest) {
+    const chunkKey = block.chunkCoords.join(".");
+    const skel = fetchedChunks.get(chunkKey);
     if (skel === undefined) continue;
 
     const fragmentIds = resolveFragmentRef(block.fragmentRef);
