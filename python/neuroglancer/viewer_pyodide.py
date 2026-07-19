@@ -20,6 +20,8 @@ they register with :mod:`browser_server` and push state changes as SSE events
 via ``js.globalThis.pyodide_push_sse``.
 """
 
+from typing import TYPE_CHECKING
+
 from . import browser_server, viewer_base
 from .json_utils import encode_json
 
@@ -37,6 +39,12 @@ class _PyodideViewerHelper:
     this mixin's ``__init__`` is never reached via the MRO chain.  Subclasses
     must call ``_pyodide_setup()`` explicitly after their base ``__init__``.
     """
+
+    if TYPE_CHECKING:
+        # Supplied by ``ViewerBase``, which every concrete subclass mixes in
+        # alongside this class. Declared here so the mixin type-checks on its
+        # own; it is never assigned at runtime by this class.
+        token: str
 
     def _pyodide_setup(self):
         """Wire up the Pyodide browser-server.  Call after ViewerBase.__init__."""

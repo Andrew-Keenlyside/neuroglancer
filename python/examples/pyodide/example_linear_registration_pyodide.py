@@ -246,7 +246,9 @@ def filter_local_dims(
     return neuroglancer.CoordinateSpace(
         names=[space.names[i] for i in indices],
         units=[space.units[i] for i in indices],
-        scales=np.array([space.scales[i] for i in indices]),
+        # CoordinateSpace takes a Sequence[float]; the comprehension already is
+        # one, so wrapping it in np.array only broke the type.
+        scales=[space.scales[i] for i in indices],
     )
 
 
@@ -273,9 +275,13 @@ def create_coord_space_matching_global_dims(
         return neuroglancer.CoordinateSpace(
             names=[names[i] for i in indices],
             units=[units[i] for i in indices],
-            scales=np.array([scales[i] for i in indices]),
+            scales=[scales[i] for i in indices],
         )
-    return neuroglancer.CoordinateSpace(names=names, units=units, scales=scales)
+    # `scales` comes off a CoordinateSpace as an ndarray; the constructor wants
+    # a Sequence[float].
+    return neuroglancer.CoordinateSpace(
+        names=names, units=units, scales=scales.tolist()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +466,7 @@ class LinearRegistrationWorkflow:
                     data_coords = neuroglancer.CoordinateSpace(
                         names=[all_dims.names[i] for i in indices],
                         units=[all_dims.units[i] for i in indices],
-                        scales=np.array([all_dims.scales[i] for i in indices]),
+                        scales=[all_dims.scales[i] for i in indices],
                     )
                 else:
                     data_coords = all_dims
@@ -510,9 +516,7 @@ class LinearRegistrationWorkflow:
                         spatial_space = neuroglancer.CoordinateSpace(
                             names=spatial_names,
                             units=[existing_out.units[i] for i in spatial_indices],
-                            scales=np.array(
-                                [existing_out.scales[i] for i in spatial_indices]
-                            ),
+                            scales=[existing_out.scales[i] for i in spatial_indices],
                         )
                         output_dims_final = copy_coord_space(spatial_space, "2")
                     new_coord_space = neuroglancer.CoordinateSpaceTransform(
@@ -783,9 +787,7 @@ class LinearRegistrationWorkflow:
                     output_dims_primed = neuroglancer.CoordinateSpace(
                         names=spatial_out_names,
                         units=[ref_out.units[i] for i in spatial_out_indices],
-                        scales=np.array(
-                            [ref_out.scales[i] for i in spatial_out_indices]
-                        ),
+                        scales=[ref_out.scales[i] for i in spatial_out_indices],
                     )
                     source.transform = neuroglancer.CoordinateSpaceTransform(
                         input_dimensions=v,

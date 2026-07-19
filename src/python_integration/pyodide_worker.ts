@@ -88,7 +88,6 @@ self.addEventListener("message", async (event) => {
     } catch (e) {
       self.postMessage({ type: "error", message: String(e) });
     }
-
   } else if (msgType === "run") {
     const { startingUrl }: { startingUrl: string | null } = event.data;
 
@@ -128,20 +127,27 @@ async function setupPyodide(
   // Install scientific packages.
   await pyodide.loadPackage(["numpy", "scipy", "pillow", "micropip"]);
 
-  self.postMessage({ type: "progress", message: "Loading neuroglancer Python package…" });
+  self.postMessage({
+    type: "progress",
+    message: "Loading neuroglancer Python package…",
+  });
 
   // Unpack the bundled neuroglancer Python zip into the VFS.
   const zipResp = await fetch(neuroglancerZipUrl);
   if (!zipResp.ok) {
-    throw new Error(`Failed to fetch neuroglancer zip: HTTP ${zipResp.status} from ${neuroglancerZipUrl}`);
+    throw new Error(
+      `Failed to fetch neuroglancer zip: HTTP ${zipResp.status} from ${neuroglancerZipUrl}`,
+    );
   }
   const zipBuf = await zipResp.arrayBuffer();
   // unpackArchive requires a TypedArray, not a raw ArrayBuffer.
   // Use Python's site module to get the correct versioned site-packages path.
   const sitePackages: string = pyodide.runPython(
-    "import site; site.getsitepackages()[0]"
+    "import site; site.getsitepackages()[0]",
   );
-  pyodide.unpackArchive(new Uint8Array(zipBuf), "zip", { extractDir: sitePackages });
+  pyodide.unpackArchive(new Uint8Array(zipBuf), "zip", {
+    extractDir: sitePackages,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +200,44 @@ async function handleSwRequest(event: MessageEvent) {
     // Do NOT call pyodide.toPy() here: that converts it to a Python memoryview which
     // Pyodide then unwraps before passing to the Python function, leaving no .to_py().
     const bodyBytes = body ? new Uint8Array(body) : null;
+    // This call MUST stay synchronous. Do not "fix" it to
+    // `await handleRequest.callPromising(...)`.
+    //
+    // Being synchronous is what makes each request handler ATOMIC. The service
+    // worker assigns a requestId and posts immediately, with no queue
+    // (pyodide_service_worker.ts) -- concurrency is the design, and it is only
+    // safe because handlers cannot interleave.
+    //
+    // Making this promising enables JSPI stack switching, which is what a
+    // synchronous zarr call needs in order to suspend. It also turns atomic
+    // handlers into interleaved coroutines, and two concurrent promising entries
+    // into zarr-vectors' sync read path wedge this worker PERMANENTLY.
+    // Independently reproduced 2026-07-19 (headless chromium 141, pyodide
+    // 314.0.2), deterministic over 8 runs:
+    //
+    //   - concurrency 2 at ~530-730 store keys per reader and above -> hang.
+    //     Below that it interleaves fine, so a small-store smoke test passes and
+    //     production hangs.
+    //   - the same store read concurrently hangs too; not a two-store artifact.
+    //   - sequential at ~7x the work (12,096 keys x2) completes in 25.5s, so it
+    //     is not memory and not total work.
+    //   - blast radius is THIS worker's event loop, not the page's: the UI stays
+    //     alive while Python request handling is dead and unrecoverable.
+    //
+    // Root cause is still open. Two internal-corruption hypotheses
+    // (validSuspender save/restore crossing, Module.stackStop clobbering) were
+    // tested and refuted; what is established is that resuming a JSPI-suspended
+    // stack needs the macrotask queue, and the queue stops being serviced.
+    //
+    // If this ever must become promising, serialising every promising entry into
+    // Python is a proven mitigation (100% completion at hanging scale) -- but it
+    // must cover EVERY entry, not just this one: any other promising entrypoint
+    // racing a request reintroduces the identical bug.
+    //
+    // The real fix is upstream and avoids JSPI entirely: zarr_vectors/core/aio.py
+    // awaits the I/O up front, then replays the ordinary sync readers against a
+    // primed Group so they never reach sync(). See
+    // upstream_prompts/zarr-vectors-py.md.
     const result = handleRequest(url, method, bodyBytes ?? null);
 
     const status: number = result.status;
@@ -212,11 +256,20 @@ async function handleSwRequest(event: MessageEvent) {
     }
 
     if (status >= 500) {
-      console.error(`[pyodide_worker] Python returned ${status} for ${method} ${url}:`, new TextDecoder().decode(responseBody));
+      console.error(
+        `[pyodide_worker] Python returned ${status} for ${method} ${url}:`,
+        new TextDecoder().decode(responseBody),
+      );
     }
 
     swPort!.postMessage(
-      { type: "response", requestId, status, contentType, body: responseBody.buffer },
+      {
+        type: "response",
+        requestId,
+        status,
+        contentType,
+        body: responseBody.buffer,
+      },
       [responseBody.buffer],
     );
   } catch (e) {

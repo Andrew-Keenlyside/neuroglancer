@@ -46,7 +46,10 @@ const pendingRequests = new Map<
 >();
 
 // Open SSE stream controllers keyed by viewer token.
-const sseStreams = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
+const sseStreams = new Map<
+  string,
+  ReadableStreamDefaultController<Uint8Array>
+>();
 
 const encoder = new TextEncoder();
 let requestCounter = 0;
@@ -139,10 +142,7 @@ sw.addEventListener("fetch", (event) => {
 // SSE (EventSource) handler
 // ---------------------------------------------------------------------------
 
-async function handleSSERequest(
-  url: URL,
-  request: Request,
-): Promise<Response> {
+async function handleSSERequest(url: URL, request: Request): Promise<Response> {
   const token = url.pathname.split("/")[2];
 
   // Create a ReadableStream that stays open and receives events pushed by
@@ -177,8 +177,7 @@ async function handleSSERequest(
 // ---------------------------------------------------------------------------
 
 async function handleAPIRequest(request: Request): Promise<Response> {
-  const body =
-    request.method !== "GET" ? await request.arrayBuffer() : null;
+  const body = request.method !== "GET" ? await request.arrayBuffer() : null;
   try {
     const result = await forwardToPyodide(request.url, request.method, body);
     return new Response(result.body, {

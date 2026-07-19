@@ -181,8 +181,12 @@ function promptForStartingUrl(): Promise<string | null> {
     const spinner = document.getElementById("neuroglancer-pyodide-spinner")!;
     const loading = document.getElementById("neuroglancer-pyodide-loading")!;
     const note = document.getElementById("neuroglancer-pyodide-note")!;
-    const section = document.getElementById("neuroglancer-pyodide-url-section")!;
-    const input = document.getElementById("neuroglancer-pyodide-url-input") as HTMLInputElement;
+    const section = document.getElementById(
+      "neuroglancer-pyodide-url-section",
+    )!;
+    const input = document.getElementById(
+      "neuroglancer-pyodide-url-input",
+    ) as HTMLInputElement;
     const btnUrl = document.getElementById("neuroglancer-pyodide-btn-url")!;
     const btnDemo = document.getElementById("neuroglancer-pyodide-btn-demo")!;
 
@@ -206,7 +210,9 @@ function promptForStartingUrl(): Promise<string | null> {
       input.value = "";
       submit();
     });
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submit();
+    });
   });
 }
 
@@ -220,7 +226,9 @@ async function bootstrap() {
   // ------------------------------------------------------------------
   setLoadingMessage("Registering Service Worker…");
   if (!("serviceWorker" in navigator)) {
-    setLoadingMessage("Error: Service Workers are not supported in this browser.");
+    setLoadingMessage(
+      "Error: Service Workers are not supported in this browser.",
+    );
     return;
   }
 
@@ -260,9 +268,12 @@ async function bootstrap() {
   // whole app to be module-output. Building it as its own module-output entry
   // keeps that blast radius to the worker, and avoids emitting the worker
   // twice (once here, once as a workersConfig entry).
-  const pyodideWorker = new Worker(new URL(PYODIDE_WORKER_PATH, window.location.href), {
-    type: "module",
-  });
+  const pyodideWorker = new Worker(
+    new URL(PYODIDE_WORKER_PATH, window.location.href),
+    {
+      type: "module",
+    },
+  );
 
   // Phase 1: load Pyodide + packages.  Resolves on 'packages_ready'.
   const packagesReadyPromise = new Promise<void>((resolve, reject) => {
@@ -280,7 +291,10 @@ async function bootstrap() {
   });
 
   // Send port2 and configuration to the Pyodide Worker (does NOT run script yet).
-  const neuroglancerZipUrl = new URL("/neuroglancer_pyodide.zip", window.location.href).href;
+  const neuroglancerZipUrl = new URL(
+    "/neuroglancer_pyodide.zip",
+    window.location.href,
+  ).href;
   const userScriptUrl = new URL(getUserScriptPath(), window.location.href).href;
   const userScriptResponse = await fetch(userScriptUrl);
   if (!userScriptResponse.ok) {
@@ -297,16 +311,18 @@ async function bootstrap() {
   //
   // The pin is load-bearing for zarr-vectors: the datasource is zarr-v3-only,
   // and zarr-vectors-py requires zarr>=3.0 ("zarr 2 cannot read these stores").
-  // No pyodide release bundles zarr -- it installs from PyPI via micropip as a
-  // pure-Python wheel -- but zarr 3 needs numcodecs>=0.14 and numpy>=2, and
-  // numcodecs has C extensions, so it can only come from the distribution:
   //
-  //   0.27.4   numcodecs 0.13.1  -> too old for zarr 3, unusable here
-  //   314.0.2  numcodecs 0.15.1, numpy 2.4.3, google-crc32c 1.8.0 -> works
+  //   0.27.4   numcodecs 0.13.1 -> too old for zarr 3, unusable here
+  //   314.0.2  zarr 3.2.1, numcodecs 0.15.1, numpy 2.4.3, crc32c 1.8.0 -> works
   //
-  // google-crc32c is a hard zarr 3 dependency with no pure-Python wheel on
-  // PyPI, so the distribution shipping it is what makes micropip install of
-  // zarr possible at all. Check pyodide-lock.json before moving this pin.
+  // 314.0.2 ships zarr 3.2.1 as a first-party package, and crucially it is
+  // upstream zarr's WASM build: the distribution wheel adds `zarr/_constants.py`
+  // and patches `zarr/core/sync.py` so `IS_WASM` is true and the normally
+  // thread-based sync path runs on pyodide's WebLoop instead. That patch is not
+  // yet merged upstream (zarr-python PR #1903 is still open), so zarr must come
+  // from `loadPackage`, NEVER from `micropip.install("zarr")` -- micropip would
+  // fetch the unpatched PyPI wheel, which needs a real OS thread and cannot
+  // work here. Check pyodide-lock.json before moving this pin.
   //
   // This must be the .mjs entry point: the worker imports it dynamically, as
   // pyodide >=314 refuses to run in a classic worker.

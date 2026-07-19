@@ -28,14 +28,37 @@ against roughly a gigabyte for the finest level.
 
 **Why this does not use `zarr-vectors-py`.** That package is the natural home for
 this, and the format handling below is a direct restatement of its layout (ZVF
-0.9). But its read path is unusable under Pyodide for two reasons that are both
-in the I/O layer rather than the format layer: `zarr`'s synchronous API is
-implemented by dispatching to an event loop on a *dedicated thread*, and Pyodide
-cannot start threads; and its remote backends are `obstore` (a compiled Rust
-extension, no Pyodide wheel) and `fsspec`/`gcsfs` (which need `aiohttp`, also
-compiled). Reading the bytes with the browser's own `fetch` and decoding them
-with numpy sidesteps both, and drops the dependency footprint to numpy alone --
-no `zarr`, no `numcodecs`, no `micropip` step at start-up.
+0.9). This module exists only because its read path cannot yet be driven from
+the browser -- and the reason is narrower than it once appeared. Re-checked
+2026-07-19 against pyodide 314.0.2:
+
+* `zarr` itself is FINE. Pyodide ships zarr 3.2.1 with upstream's WASM patch, so
+  its sync API runs on a WebLoop rather than a dedicated thread. See the pin
+  comment in `src/main_pyodide.ts`.
+* `obstore`/`fsspec`/`aiohttp` are NOT a blocker, contrary to what this file
+  used to say. They are optional extras in both zarr and zarr-vectors, imported
+  function-locally, and reached only when a caller passes a URL *string* rather
+  than a pre-built store. Pyodide ships aiohttp and fsspec anyway.
+* Compression is NOT a blocker either: `asyncio.to_thread` runs inline under
+  Pyodide, so the zstd/blosc/gzip codecs decode.
+
+What actually blocks it: every public read entry point in zarr-vectors-py is
+synchronous, so calling it from JS needs a *promising* entrypoint and JSPI stack
+switching -- and that makes the worker's request handlers interleave, which
+deadlocks the event loop under concurrent reads. See the comment at the
+`handleRequest` call in `src/python_integration/pyodide_worker.ts`.
+
+So the fix is an async read API upstream, not more code here; see
+`upstream_prompts/zarr-vectors-py.md`. Until that lands, reading the bytes with
+the browser's own `fetch` and decoding them with numpy keeps the dependency
+footprint at numpy alone.
+
+**This module is a stopgap and should be deleted when that API exists.** It is a
+strict subset of the real reader -- no compressors, no sharding, and it walks the
+whole chunk grid absorbing 404s where core reads the `nonempty_chunks` manifest
+-- and its fragment-index decode is byte-for-byte identical to
+`zarr_vectors/encoding/fragments.py`. Two copies of one binary format is exactly
+the drift risk it was written to avoid elsewhere.
 
 The two decoders here mirror `src/datasource/zarr-vectors/vlen_bytes.ts` and
 `src/datasource/zarr-vectors/fragment_index.ts`, which read the same bytes for
@@ -49,7 +72,7 @@ import asyncio
 import itertools
 import json
 import struct
-from typing import Awaitable, Callable, Iterable, Optional
+from collections.abc import Awaitable, Callable, Iterable
 
 import numpy as np
 
@@ -148,9 +171,7 @@ def decode_fragment_index(raw: bytes) -> list[np.ndarray]:
     offset += num_ranges * 16
 
     num_explicit = num_fragments - num_ranges
-    csr_offsets = np.frombuffer(
-        raw, dtype="<u4", count=num_explicit + 1, offset=offset
-    )
+    csr_offsets = np.frombuffer(raw, dtype="<u4", count=num_explicit + 1, offset=offset)
     offset += (num_explicit + 1) * 4
     total = int(csr_offsets[-1]) if num_explicit else 0
     csr_indices = np.frombuffer(raw, dtype="<i8", count=total, offset=offset)
@@ -175,7 +196,7 @@ def decode_fragment_index(raw: bytes) -> list[np.ndarray]:
 # -- fetching ---------------------------------------------------------------
 
 
-async def _pyodide_fetch(url: str) -> Optional[bytes]:
+async def _pyodide_fetch(url: str) -> bytes | None:
     from pyodide.http import pyfetch  # type: ignore
 
     response = await pyfetch(url)
@@ -186,7 +207,7 @@ async def _pyodide_fetch(url: str) -> Optional[bytes]:
     return await response.bytes()
 
 
-async def _urllib_fetch(url: str) -> Optional[bytes]:
+async def _urllib_fetch(url: str) -> bytes | None:
     """CPython-only fallback, for running this outside the browser.
 
     Never selected under Pyodide -- `asyncio.to_thread` would fail there, since
@@ -208,7 +229,7 @@ async def _urllib_fetch(url: str) -> Optional[bytes]:
     return await asyncio.to_thread(get)
 
 
-def _default_fetch() -> Callable[[str], Awaitable[Optional[bytes]]]:
+def _default_fetch() -> Callable[[str], Awaitable[bytes | None]]:
     try:
         import pyodide.http  # noqa: F401
     except ImportError:
@@ -256,11 +277,11 @@ async def load_tract_index(
     url: str,
     level: int = 3,
     *,
-    fetch: Optional[Callable[[str], Awaitable[Optional[bytes]]]] = None,
+    fetch: Callable[[str], Awaitable[bytes | None]] | None = None,
     concurrency: int = 32,
-    max_vertices: Optional[int] = None,
-    scale: Optional[Iterable[float]] = None,
-    translation: Optional[Iterable[float]] = None,
+    max_vertices: int | None = None,
+    scale: Iterable[float] | None = None,
+    translation: Iterable[float] | None = None,
 ) -> TractIndex:
     """Load one pyramid level of a zarr-vectors store as a `TractIndex`.
 
@@ -289,17 +310,14 @@ async def load_tract_index(
         .get("separator", "/")
     )
     chunk_shape = [
-        int(x)
-        for x in vertices_meta["chunk_grid"]["configuration"]["chunk_shape"]
+        int(x) for x in vertices_meta["chunk_grid"]["configuration"]["chunk_shape"]
     ]
     if any(c != 1 for c in chunk_shape):
         raise NotImplementedError(
             f"expected one cell per chunk, got chunk_shape {chunk_shape}"
         )
     await _read_array_meta(fetch, base, f"{prefix}vertex_fragments")
-    await _read_array_meta(
-        fetch, base, f"{prefix}fragment_attributes/segment_id"
-    )
+    await _read_array_meta(fetch, base, f"{prefix}fragment_attributes/segment_id")
 
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -310,9 +328,7 @@ async def load_tract_index(
             if raw_vertices is None:
                 return None
             raw_fragments = await fetch(f"{base}{prefix}vertex_fragments/{key}")
-            raw_ids = await fetch(
-                f"{base}{prefix}fragment_attributes/segment_id/{key}"
-            )
+            raw_ids = await fetch(f"{base}{prefix}fragment_attributes/segment_id/{key}")
         if raw_fragments is None or raw_ids is None:
             # Vertices without their fragment index or ids cannot be attributed
             # to a tract, so they are unusable rather than merely incomplete.

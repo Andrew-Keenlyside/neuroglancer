@@ -76,6 +76,10 @@ exclude = [
   "/guide_video_recorder/",
   "^docs/",
   "^build/",
+  # Build output, like ^build/. Without this, running mypy after a
+  # `build-pyodide` fails with a duplicate-module error against the copies of
+  # the example scripts under dist/pyodide/.
+  "^dist/",
   "^testdata/",
 ]
 
@@ -95,6 +99,18 @@ module = [
   "scipy.*",
   "cloudvolume",
   "trio",
+  # Only exist inside a Pyodide runtime; there is nothing to install for them
+  # on CPython, so mypy can never resolve them here.
+  "js",
+  "pyodide",
+  "pyodide.*",
+  # Optional runtime dependencies of the tract exporter, imported lazily with
+  # install hints (see neuroglancer/tract_export/run.py). Not installed in the
+  # mypy environment by design.
+  "zarr_vectors",
+  "zarr_vectors.*",
+  "zarr_vectors_tools",
+  "zarr_vectors_tools.*",
 ]
 ignore_missing_imports = true
 

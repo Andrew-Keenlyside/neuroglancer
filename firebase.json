@@ -8,9 +8,26 @@
       "target": "ng-wizard-demo",
       "public": "dist/client"
     },
-     {
+    {
       "target": "ng-zarr-vectors",
       "public": "dist/client"
+    },
+    {
+      "target": "ng-pyodide",
+      "public": "dist/pyodide",
+      "headers": [
+        {
+          "source": "**",
+          "headers": [
+            { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" },
+            { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" }
+          ]
+        },
+        {
+          "source": "/@(index.html|pyodide_sw.js|neuroglancer_pyodide.zip|*.py)",
+          "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
+        }
+      ]
     },
     {
       "target": "docs",

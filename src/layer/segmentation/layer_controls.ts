@@ -213,7 +213,11 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
       makeCachedDerivedWatchableValue(
         (has3d, hasMesh, hasSpatialSkeletons) =>
           has3d && (hasMesh || !hasSpatialSkeletons),
-        [layer.has3dLayer, layer.hasMeshLayer, layer.hasSpatiallyIndexedSkeletonsLayer],
+        [
+          layer.has3dLayer,
+          layer.hasMeshLayer,
+          layer.hasSpatiallyIndexedSkeletonsLayer,
+        ],
       ),
     title: "Opacity of meshes and skeletons",
     ...rangeLayerControl((layer) => ({
@@ -238,6 +242,60 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     toolJson: json_keys.HIDE_SEGMENT_ZERO_JSON_KEY,
     title: "Disallow selection and display of segment id 0",
     ...checkboxLayerControl((layer) => layer.displayState.hideSegmentZero),
+  },
+  {
+    label: "Auto full-detail budget",
+    toolJson: json_keys.AUTO_ROI_HIGH_DETAIL_BUDGET_JSON_KEY,
+    isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
+    title:
+      "Derive the full-detail streamline count from the GPU memory limit and " +
+      "the share below, instead of using the manual figure. Falls back to the " +
+      "manual figure when the dataset does not record how many streamlines " +
+      "each level holds.",
+    ...checkboxLayerControl(
+      (layer) => layer.displayState.autoRoiHighDetailBudget,
+    ),
+  },
+  {
+    label: "Full-detail memory share",
+    toolJson: json_keys.ROI_FULL_DETAIL_MEMORY_SHARE_JSON_KEY,
+    isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
+    title:
+      "How much of the GPU memory limit goes to full-resolution streamlines " +
+      "rather than to the coarse pyramid level underneath them. Both draw " +
+      "from one pool.",
+    ...rangeLayerControl((layer) => ({
+      value: layer.displayState.roiFullDetailMemoryShare,
+      options: { min: 0, max: 1, step: 0.05 },
+    })),
+  },
+  {
+    label: "Full-detail streamlines",
+    toolJson: json_keys.ROI_HIGH_DETAIL_BUDGET_JSON_KEY,
+    isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
+    title:
+      "How many streamlines may be loaded at full resolution on top of the " +
+      "rendered pyramid level. Counted in streamlines, not bytes, because a " +
+      "tract is fetched whole however little of it is in view. 0 disables " +
+      "full-detail loading.",
+    ...rangeLayerControl((layer) => ({
+      value: layer.displayState.roiHighDetailBudget,
+      options: { min: 0, max: 200000, step: 1000 },
+    })),
+  },
+  {
+    label: "Ignore memory ceiling",
+    toolJson: json_keys.IGNORE_SKELETON_MEMORY_CEILING_JSON_KEY,
+    // Only meaningful where a pyramid is being budgeted at all.
+    isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
+    title:
+      "Allow finer pyramid levels than the GPU memory budget nominally " +
+      "permits. The budget compares against a whole-level estimate, so a " +
+      "zoomed-in view is refused detail it would never actually fetch. With " +
+      "this on, a wide view of a dense level can exhaust GPU memory.",
+    ...checkboxLayerControl(
+      (layer) => layer.displayState.ignoreSpatialSkeletonMemoryCeiling,
+    ),
   },
   {
     label: "Base segment coloring",

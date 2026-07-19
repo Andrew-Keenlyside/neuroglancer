@@ -41,7 +41,6 @@ from . import local_volume, skeleton
 from .json_utils import encode_json, json_encoder_default
 from .trackable_state import ConcurrentModificationError
 
-
 # Path regexes (same patterns as server.py)
 _INFO_RE = re.compile(r"^/neuroglancer/info/(?P<token>[^/?]+)")
 _SKELETON_INFO_RE = re.compile(r"^/neuroglancer/skeletoninfo/(?P<token>[^/?]+)")
@@ -82,9 +81,11 @@ class BrowserViewerServer:
         self._setup_js_bridge()
 
     def _setup_js_bridge(self):
-        import __main__
         import js  # type: ignore[import]
         from pyodide.ffi import create_proxy  # type: ignore[import]
+
+        import __main__
+
         # Keep a Python reference to the proxy so it is not garbage collected.
         self._handle_request_proxy = create_proxy(self._js_handle_request)
         # Expose in Python's __main__ globals so the JS worker can retrieve it
@@ -116,7 +117,7 @@ class BrowserViewerServer:
             # has no `to_py`, so test for convertibility rather than identity.
             if body_js is None:
                 body_bytes = b""
-            elif isinstance(body_js, (bytes, bytearray, memoryview)):
+            elif isinstance(body_js, bytes | bytearray | memoryview):
                 body_bytes = bytes(body_js)
             elif not hasattr(body_js, "to_py"):
                 body_bytes = b""
@@ -126,7 +127,7 @@ class BrowserViewerServer:
             status, content_type, response_body = self._route_request(
                 url, method, body_bytes
             )
-        except BaseException as exc:
+        except BaseException:
             import traceback
 
             tb = traceback.format_exc()
@@ -150,7 +151,7 @@ class BrowserViewerServer:
     ) -> tuple[int, str, bytes]:
         # Strip the origin and query string from the URL to get just the path.
         try:
-            from urllib.parse import urlparse, parse_qs
+            from urllib.parse import parse_qs, urlparse
 
             parsed = urlparse(url)
             path = parsed.path
@@ -393,9 +394,7 @@ class BrowserViewerServer:
         viewer._handle_volume_chunk_reply(request_id, params, body)
         return 200, "text/plain", b""
 
-    def _handle_events(
-        self, viewer_token: str, query: dict
-    ) -> tuple[int, str, bytes]:
+    def _handle_events(self, viewer_token: str, query: dict) -> tuple[int, str, bytes]:
         """Send current state immediately when the SSE connection is established.
 
         The actual SSE stream is maintained by the Service Worker.  This handler

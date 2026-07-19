@@ -41,6 +41,8 @@ import {
 import type { RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import { StreamlineFilterTab } from "#src/datasource/zarr-vectors/streamline_filter_tab.js";
+import { StreamlineGuideTab } from "#src/datasource/zarr-vectors/streamline_guide_tab.js";
+import { TractExportTab } from "#src/datasource/zarr-vectors/tract_export_tab.js";
 import type {
   LayerActionContext,
   ManagedUserLayer,
@@ -778,6 +780,25 @@ function rebuildRoiAnnotations(
   }
 }
 
+/**
+ * Default full-detail cap, in streamlines.
+ *
+ * ~50k tracts at a whole-brain tractogram's ~200 vertices each is ~10M
+ * vertices -- a few hundred MB once positions, tangents and the segment column
+ * are counted, so it sits well inside a 1 GB GPU budget while being far more
+ * than the ~5k a mid pyramid level holds.
+ */
+const DEFAULT_ROI_HIGH_DETAIL_BUDGET = 50000;
+
+/**
+ * Half the GPU pool to full-resolution streamlines by default.
+ *
+ * An even split is the honest starting point: neither pass is inherently more
+ * important, and which one the user is actually looking at depends entirely on
+ * whether they are inspecting a dissection or navigating the whole brain.
+ */
+const DEFAULT_ROI_FULL_DETAIL_MEMORY_SHARE = 0.5;
+
 class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   constructor(public layer: SegmentationUserLayer) {
     // Even though `SegmentationUserLayer` assigns this to its `displayState` property, redundantly
@@ -1033,6 +1054,50 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   // controlled behavior for layers that don't want this (CATMAID).
   autoSpatialSkeletonGridLevel2d = new TrackableBoolean(false, false);
   autoSpatialSkeletonGridLevel3d = new TrackableBoolean(false, false);
+  /**
+   * Drop the memory ceiling on grid-level selection.
+   *
+   * The ceiling refuses any level whose *fully resident* estimate exceeds the
+   * GPU budget -- for a whole-brain tractogram that is level 0 at ~4 GB against
+   * 1 GB. But only chunks in view are ever fetched, so a tight crop would fetch
+   * a small fraction of that and is refused for a cost it will never pay. Until
+   * the estimate is view-scoped (which needs a per-level in-view chunk count the
+   * store does not stamp), this lets the user take that judgement themselves.
+   *
+   * Off by default: with it on, a wide view of a dense level really can exhaust
+   * GPU memory, which is the failure the ceiling exists to prevent.
+   */
+  ignoreSpatialSkeletonMemoryCeiling = new TrackableBoolean(false, false);
+  /**
+   * Fraction of the GPU pool reserved for full-resolution streamlines.
+   *
+   * The coarse pyramid pass and the object-keyed full-detail pass draw from one
+   * pool. Splitting it explicitly is what stops each sizing itself as though it
+   * owned the whole thing and then evicting the other.
+   */
+  roiFullDetailMemoryShare = new TrackableValue<number>(
+    DEFAULT_ROI_FULL_DETAIL_MEMORY_SHARE,
+    verifyFiniteNonNegativeFloat,
+    DEFAULT_ROI_FULL_DETAIL_MEMORY_SHARE,
+  );
+  /**
+   * Derive the streamline budget from the memory limit instead of using the
+   * manual figure. Off means `roiHighDetailBudget` is taken literally.
+   */
+  autoRoiHighDetailBudget = new TrackableBoolean(true, true);
+  /**
+   * How many streamlines pass 2 may hold at full resolution.
+   *
+   * A streamline count, not a byte budget: pass 2 loads whole objects, so a
+   * tract clipping the view costs its entire length no matter how little is on
+   * screen -- an in-view or per-chunk estimate systematically understates it.
+   * 0 disables full-detail loading entirely.
+   */
+  roiHighDetailBudget = new TrackableValue<number>(
+    DEFAULT_ROI_HIGH_DETAIL_BUDGET,
+    verifyNonnegativeInt,
+    DEFAULT_ROI_HIGH_DETAIL_BUDGET,
+  );
   spatialSkeletonGridRenderScaleHistogram2d = new RenderScaleHistogram();
   spatialSkeletonGridRenderScaleHistogram3d = new RenderScaleHistogram();
   spatialSkeletonLod2d = new WatchableValue<number>(0);
@@ -1115,14 +1180,21 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
     }
     this.spatialSkeletonGridLevels.value = levels;
     if (levels.length === 0) return;
-    const budgeted =
-      levelCostsBytes !== undefined &&
-      levelCostsBytes.length === levels.length &&
-      budgetBytes !== undefined &&
-      Number.isFinite(budgetBytes)
-        ? selectSpatialSkeletonGridLevelByBudget(levelCostsBytes, budgetBytes)
+    // Kept so the ceiling can be recomputed later without re-activating the
+    // datasource -- see `updateSpatialSkeletonBudget`.
+    this.spatialSkeletonLevelCostsBytes =
+      levelCostsBytes !== undefined && levelCostsBytes.length === levels.length
+        ? levelCostsBytes.slice()
         : undefined;
+    this.spatialSkeletonBudgetBytes = budgetBytes;
+    const budgeted = this.computeSpatialSkeletonBudgetLevel(budgetBytes);
     this.spatialSkeletonBudgetLevel = budgeted;
+    // Initial selection SUBSTITUTES the ceiling, where later changes clamp to
+    // it (`applySpatialSkeletonResolutionTarget`). That difference is
+    // deliberate: the resolution targets still hold their default of 1 at
+    // activation, because under auto-LOD the render layer only starts deriving
+    // them from the camera once it has drawn a frame. Clamping against a
+    // not-yet-meaningful target would pick a level from a placeholder.
     const target3dIndex =
       budgeted ??
       findClosestSpatialSkeletonGridLevelBySpacing(
@@ -1137,6 +1209,95 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
         this.spatialSkeletonGridResolutionTarget2d.value,
       );
     this.setSpatialSkeletonGridLevel("2d", target2dIndex);
+  }
+
+  /** Per-level fully-resident cost estimates, coarsest first; see the ctor. */
+  private spatialSkeletonLevelCostsBytes: number[] | undefined;
+  /** Budget the ceiling was last computed against, so a toggle can reuse it. */
+  private spatialSkeletonBudgetBytes: number | undefined;
+
+  private computeSpatialSkeletonBudgetLevel(
+    budgetBytes: number | undefined,
+  ): number | undefined {
+    // `undefined` means "no ceiling", which is exactly what the override wants:
+    // `applySpatialSkeletonResolutionTarget` then passes the requested level
+    // through unclamped.
+    if (this.ignoreSpatialSkeletonMemoryCeiling.value) return undefined;
+    const costs = this.spatialSkeletonLevelCostsBytes;
+    if (
+      costs === undefined ||
+      budgetBytes === undefined ||
+      !Number.isFinite(budgetBytes)
+    ) {
+      return undefined;
+    }
+    return selectSpatialSkeletonGridLevelByBudget(costs, budgetBytes);
+  }
+
+  /**
+   * Recompute the memory ceiling against a possibly-changed budget.
+   *
+   * The ceiling used to be decided exactly once, inside the datasource
+   * activation path, so raising the GPU memory limit changed nothing until the
+   * layer was reloaded -- the limit is user-editable, but the level it gated
+   * was not re-derived from it.
+   *
+   * Re-applies the current resolution targets rather than substituting the new
+   * ceiling: by the time this runs the targets are live (camera-derived under
+   * auto-LOD, or user-set), so clamping respects them while still refusing
+   * anything that does not fit.
+   */
+  /** Bytes one full-resolution streamline costs; see the datasource. */
+  private fullDetailBytesPerStreamline: number | undefined;
+
+  setFullDetailBytesPerStreamline(bytes: number | undefined) {
+    this.fullDetailBytesPerStreamline = bytes;
+    this.updateAutoRoiHighDetailBudget();
+  }
+
+  /**
+   * Recompute the streamline budget from the memory limit and its share.
+   *
+   * Counted in streamlines because the object-keyed pass fetches whole tracts: a
+   * tract clipping the view costs its entire length, so bytes-in-view would
+   * understate it systematically.
+   *
+   * Declines silently when the store cannot say what a streamline costs -- the
+   * manual figure stands rather than being overwritten with a guess.
+   */
+  updateAutoRoiHighDetailBudget(gpuLimitBytes?: number) {
+    if (!this.autoRoiHighDetailBudget.value) return;
+    const perStreamline = this.fullDetailBytesPerStreamline;
+    if (perStreamline === undefined || !(perStreamline > 0)) return;
+    const limit = gpuLimitBytes ?? this.spatialSkeletonGpuLimitBytes;
+    if (limit === undefined || !Number.isFinite(limit)) return;
+    const share = this.roiFullDetailMemoryShare.value;
+    const budget = Math.max(0, Math.floor((limit * share) / perStreamline));
+    if (this.roiHighDetailBudget.value !== budget) {
+      this.roiHighDetailBudget.value = budget;
+    }
+  }
+
+  /** Last GPU limit seen, so the auto budget can be recomputed on its own. */
+  spatialSkeletonGpuLimitBytes: number | undefined;
+
+  updateSpatialSkeletonBudget(budgetBytes?: number | undefined) {
+    if (this.spatialSkeletonGridLevels.value.length === 0) return;
+    if (budgetBytes !== undefined)
+      this.spatialSkeletonBudgetBytes = budgetBytes;
+    const next = this.computeSpatialSkeletonBudgetLevel(
+      this.spatialSkeletonBudgetBytes,
+    );
+    if (next === this.spatialSkeletonBudgetLevel) return;
+    this.spatialSkeletonBudgetLevel = next;
+    this.applySpatialSkeletonResolutionTarget(
+      "3d",
+      this.spatialSkeletonGridResolutionTarget3d.value,
+    );
+    this.applySpatialSkeletonResolutionTarget(
+      "2d",
+      this.spatialSkeletonGridResolutionTarget2d.value,
+    );
   }
 
   private setSpatialSkeletonGridLevel(kind: "2d" | "3d", index: number) {
@@ -1665,6 +1826,22 @@ export class SegmentationUserLayer extends Base {
       getter: () => new StreamlineFilterTab(this),
       hidden: hideFilterTab,
     });
+    // Same visibility condition as the Filter tab: there is nothing to export
+    // without a dissection to export, and both need `roiFilter` to exist.
+    this.tabs.add("export", {
+      label: "Export",
+      order: -38,
+      getter: () => new TractExportTab(this),
+      hidden: hideFilterTab,
+    });
+    // Shares the Filter tab's visibility condition: the guide documents that
+    // panel, so it should never appear without it.
+    this.tabs.add("filterGuide", {
+      label: "Guide",
+      order: -39,
+      getter: () => new StreamlineGuideTab(),
+      hidden: hideFilterTab,
+    });
     const hideGraphTab = this.registerDisposer(
       makeCachedDerivedWatchableValue(
         (x) => x === undefined,
@@ -1677,6 +1854,35 @@ export class SegmentationUserLayer extends Base {
       getter: () => new SegmentationGraphSourceTab(this),
       hidden: hideGraphTab,
     });
+    // The memory ceiling on spatially-indexed skeleton levels is derived from
+    // the GPU capacity, which the user can edit at runtime. Without this the
+    // ceiling kept whatever value it was given during datasource activation, so
+    // raising the limit appeared to do nothing to a tractogram.
+    {
+      const gpuLimit =
+        this.manager.chunkManager.chunkQueueManager.capacities.gpuMemory
+          .sizeLimit;
+      const share = this.displayState.roiFullDetailMemoryShare;
+      const reapplyBudgets = () => {
+        this.displayState.spatialSkeletonGpuLimitBytes = gpuLimit.value;
+        // The coarse pass gets what the full-detail pass does not.
+        this.displayState.updateSpatialSkeletonBudget(
+          gpuLimit.value * (1 - share.value),
+        );
+        this.displayState.updateAutoRoiHighDetailBudget(gpuLimit.value);
+      };
+      this.displayState.spatialSkeletonGpuLimitBytes = gpuLimit.value;
+      this.registerDisposer(gpuLimit.changed.add(reapplyBudgets));
+      this.registerDisposer(share.changed.add(reapplyBudgets));
+      this.registerDisposer(
+        this.displayState.autoRoiHighDetailBudget.changed.add(reapplyBudgets),
+      );
+      this.registerDisposer(
+        this.displayState.ignoreSpatialSkeletonMemoryCeiling.changed.add(() =>
+          this.displayState.updateSpatialSkeletonBudget(),
+        ),
+      );
+    }
     this.tabs.default = "rendering";
     this.updateSpatialSkeletonChunkLoadState();
     this.updateSpatialSkeletonSourceState();
@@ -2109,10 +2315,9 @@ export class SegmentationUserLayer extends Base {
     let hasVolume = false;
     let spatialSkeletonGridSizes: SpatialSkeletonGridSize[] | undefined;
     let spatialSkeletonLevelCostsBytes: number[] | undefined;
-    let spatialSkeletonLevelObjectCounts:
-      | (number | undefined)[]
-      | undefined;
+    let spatialSkeletonLevelObjectCounts: (number | undefined)[] | undefined;
     let spatialSkeletonBudgetBytes: number | undefined;
+    let spatialSkeletonBytesPerStreamline: number | undefined;
     // A datasource-preferred default shader, and whether any subsource would be
     // One entry per skeleton subsource: the shader it nominates as the layer
     // default, or `undefined` for no opinion. Resolved after the loop, once
@@ -2183,10 +2388,23 @@ export class SegmentationUserLayer extends Base {
           ).getSpatialSkeletonLevelCostsBytes?.();
           if (costs !== undefined) {
             spatialSkeletonLevelCostsBytes = costs;
+            // Only the coarse pass's SHARE of the GPU pool. The two passes draw
+            // from one budget: pass 1 used to size its level against the whole
+            // limit, then the object-keyed pass landed full-resolution tracts in
+            // the same pool, and they evicted each other.
             spatialSkeletonBudgetBytes =
               this.manager.chunkManager.chunkQueueManager.capacities.gpuMemory
-                .sizeLimit.value;
+                .sizeLimit.value *
+              (1 - this.displayState.roiFullDetailMemoryShare.value);
           }
+          // Bytes per full-resolution streamline, which turns the object-keyed
+          // pass's share of the pool into a streamline count. `undefined` when
+          // the store lacks the metadata to say -- the manual budget stands.
+          spatialSkeletonBytesPerStreamline = (
+            mesh as {
+              getFullDetailBytesPerStreamline?: () => number | undefined;
+            }
+          ).getFullDetailBytesPerStreamline?.();
           // Objects per level, when the source can say. Sizes the resolution
           // histogram's bars by how many streamlines each level holds, which is
           // what a user means by "how big is this level".
@@ -2455,6 +2673,9 @@ export class SegmentationUserLayer extends Base {
       spatialSkeletonBudgetBytes,
       spatialSkeletonLevelObjectCounts,
     );
+    this.displayState.setFullDetailBytesPerStreamline(
+      spatialSkeletonBytesPerStreamline,
+    );
     this.displayState.hasVolume.value = hasVolume;
     this.updateSpatialSkeletonChunkLoadState();
   }
@@ -2596,6 +2817,29 @@ export class SegmentationUserLayer extends Base {
       json_keys.ROI_FILTER_JSON_KEY,
       (value) => this.displayState.roiFilter.restoreState(value),
     );
+    verifyOptionalObjectProperty(
+      specification,
+      json_keys.IGNORE_SKELETON_MEMORY_CEILING_JSON_KEY,
+      (value) =>
+        this.displayState.ignoreSpatialSkeletonMemoryCeiling.restoreState(
+          value,
+        ),
+    );
+    verifyOptionalObjectProperty(
+      specification,
+      json_keys.ROI_HIGH_DETAIL_BUDGET_JSON_KEY,
+      (value) => this.displayState.roiHighDetailBudget.restoreState(value),
+    );
+    verifyOptionalObjectProperty(
+      specification,
+      json_keys.ROI_FULL_DETAIL_MEMORY_SHARE_JSON_KEY,
+      (value) => this.displayState.roiFullDetailMemoryShare.restoreState(value),
+    );
+    verifyOptionalObjectProperty(
+      specification,
+      json_keys.AUTO_ROI_HIGH_DETAIL_BUDGET_JSON_KEY,
+      (value) => this.displayState.autoRoiHighDetailBudget.restoreState(value),
+    );
     this.displayState.spatialSkeletonGridResolutionTarget2d.restoreState(
       specification[json_keys.SKELETON_CROSS_SECTION_RENDER_SCALE_JSON_KEY],
     );
@@ -2676,6 +2920,14 @@ export class SegmentationUserLayer extends Base {
     x[json_keys.SPATIAL_SKELETON_NODE_FILTER_JSON_KEY] =
       this.displayState.spatialSkeletonNodeFilter.toJSON();
     x[json_keys.ROI_FILTER_JSON_KEY] = this.displayState.roiFilter.toJSON();
+    x[json_keys.IGNORE_SKELETON_MEMORY_CEILING_JSON_KEY] =
+      this.displayState.ignoreSpatialSkeletonMemoryCeiling.toJSON();
+    x[json_keys.ROI_HIGH_DETAIL_BUDGET_JSON_KEY] =
+      this.displayState.roiHighDetailBudget.toJSON();
+    x[json_keys.ROI_FULL_DETAIL_MEMORY_SHARE_JSON_KEY] =
+      this.displayState.roiFullDetailMemoryShare.toJSON();
+    x[json_keys.AUTO_ROI_HIGH_DETAIL_BUDGET_JSON_KEY] =
+      this.displayState.autoRoiHighDetailBudget.toJSON();
     x[json_keys.HIDDEN_OPACITY_3D_JSON_KEY] =
       this.displayState.hiddenObjectAlpha.toJSON();
     x[json_keys.SKELETON_CROSS_SECTION_RENDER_SCALE_JSON_KEY] =

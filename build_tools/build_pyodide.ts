@@ -28,6 +28,7 @@
  *
  * Usage:
  *   node build_tools/build_pyodide.ts [--watch] [--mode=development|production]
+ *                                     [--define KEY=VALUE]...
  */
 
 import { execFileSync } from "node:child_process";
@@ -36,7 +37,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import type { Configuration, Stats } from "@rspack/core";
-import { rspack, HtmlRspackPlugin } from "@rspack/core";
+import { rspack, HtmlRspackPlugin, DefinePlugin } from "@rspack/core";
 import packageJson from "../package.json" with { type: "json" };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -45,6 +46,42 @@ const outDir = path.resolve(repoRoot, "dist", "pyodide");
 const args = process.argv.slice(2);
 const watchMode = args.includes("--watch");
 const mode = args.includes("--mode=development") ? "development" : "production";
+
+/**
+ * Build-time defines, in the same `KEY=VALUE` form `build_tools/cli.ts` accepts.
+ *
+ * Without this the pyodide bundle has no way to receive a define at all, so
+ * every optionally-configured feature — the shared ROI group store, state
+ * servers, credit links — is silently absent from this deployment however it is
+ * configured elsewhere.  VALUE is substituted verbatim, so string values need
+ * to be valid JS literals: `--define 'ROI_STORE={"bucket":"my-bucket"}'`.
+ */
+function parseDefines(argv: string[]): Record<string, string> {
+  const defines: Record<string, string> = {};
+  for (let i = 0; i < argv.length; ++i) {
+    let entry: string | undefined;
+    if (argv[i] === "--define") {
+      entry = argv[++i];
+    } else if (argv[i].startsWith("--define=")) {
+      entry = argv[i].substring("--define=".length);
+    }
+    if (entry === undefined) {
+      // Fail loudly. Silently dropping the define would produce a build that
+      // looks fine and is missing the feature — exactly the failure this
+      // wiring exists to prevent.
+      throw new Error("--define requires an argument, e.g. --define KEY=VALUE");
+    }
+    const splitPoint = entry.indexOf("=");
+    if (splitPoint === -1) {
+      defines[entry] = "true";
+    } else {
+      defines[entry.substring(0, splitPoint)] = entry.substring(splitPoint + 1);
+    }
+  }
+  return defines;
+}
+
+const defines = parseDefines(args);
 
 // ---------------------------------------------------------------------------
 // Shared rspack module rules
@@ -115,11 +152,18 @@ const mainConfig: Configuration = {
   experiments: { css: true },
   plugins: [
     new HtmlRspackPlugin({
-      template: path.resolve(repoRoot, "python", "examples", "pyodide", "index.html"),
+      template: path.resolve(
+        repoRoot,
+        "python",
+        "examples",
+        "pyodide",
+        "index.html",
+      ),
       filename: "index.html",
       chunks: ["main_pyodide"],
       scriptLoading: "module",
     }),
+    ...(Object.keys(defines).length > 0 ? [new DefinePlugin(defines)] : []),
   ],
 };
 
@@ -190,7 +234,9 @@ function runCompiler(configs: Configuration[]): Promise<Stats[]> {
       // An array of configs yields a MultiCompiler, whose callback receives a
       // MultiStats -- an object with a `.stats` array, not an array itself.
       const multiStats = (stats as { stats?: Stats[] } | null)?.stats;
-      const statsList: Stats[] = Array.isArray(multiStats) ? multiStats : [stats];
+      const statsList: Stats[] = Array.isArray(multiStats)
+        ? multiStats
+        : [stats];
       let hasErrors = false;
       for (const s of statsList) {
         const info = s.toJson();
@@ -255,9 +301,13 @@ function createPythonZip() {
   // Remove existing zip if present
   if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
 
-  execFileSync(resolvePythonInterpreter(), ["-c", ZIP_PYTHON_SCRIPT, pythonDir, zipPath], {
-    stdio: "inherit",
-  });
+  execFileSync(
+    resolvePythonInterpreter(),
+    ["-c", ZIP_PYTHON_SCRIPT, pythonDir, zipPath],
+    {
+      stdio: "inherit",
+    },
+  );
   console.log("Created", zipPath);
 }
 
