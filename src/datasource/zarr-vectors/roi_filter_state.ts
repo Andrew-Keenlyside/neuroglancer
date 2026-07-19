@@ -170,11 +170,15 @@ function shapeFromJson(obj: any): RoiShape {
 }
 
 function entryToJson(roi: Roi): any {
-  return {
+  const json: any = {
     shape: shapeToJson(roi.shape),
     predicate: PREDICATE_TO_JSON[roi.predicate],
     operator: OPERATOR_TO_JSON[roi.operator],
   };
+  // Omitted when unnamed, matching the omit-defaults style of `groupToJson`:
+  // an unnamed ROI must not start carrying the UI's positional placeholder.
+  if (roi.name !== undefined) json.name = roi.name;
+  return json;
 }
 
 function entryFromJson(obj: any): Roi {
@@ -192,7 +196,12 @@ function entryFromJson(obj: any): Roi {
       throw new Error(`Unknown ROI operator: ${JSON.stringify(v)}`);
     return o;
   });
-  return { shape, predicate, operator };
+  const name = verifyOptionalObjectProperty(obj, "name", verifyString);
+  // Spread-free so an unnamed ROI has no `name` key at all, rather than one
+  // holding `undefined` -- `toStrictEqual` in the round-trip tests can tell.
+  return name === undefined
+    ? { shape, predicate, operator }
+    : { shape, predicate, operator, name };
 }
 
 /** One named, coloured dissection: an ordered ROI list evaluated as a fold. */
@@ -211,7 +220,11 @@ export interface RoiGroup {
 
 const DEFAULT_GROUP_OPACITY = 1;
 
-function groupToJson(group: RoiGroup): any {
+/**
+ * Serialises one group.  Also used by the shared ROI group store, so that a
+ * saved document and the URL carry byte-identical group JSON.
+ */
+export function groupToJson(group: RoiGroup): any {
   const json: any = {
     name: group.name,
     color: serializeColor(group.color),
@@ -223,12 +236,15 @@ function groupToJson(group: RoiGroup): any {
   return json;
 }
 
-function groupFromJson(obj: any, id: number): RoiGroup {
+/** Inverse of {@link groupToJson}; `id` is assigned by the caller. */
+export function groupFromJson(obj: any, id: number): RoiGroup {
   verifyObject(obj);
   return {
     id,
     name: verifyObjectProperty(obj, "name", verifyString),
-    color: verifyObjectProperty(obj, "color", (v) => parseHexColor(verifyString(v))),
+    color: verifyObjectProperty(obj, "color", (v) =>
+      parseHexColor(verifyString(v)),
+    ),
     visible:
       verifyOptionalObjectProperty(obj, "visible", (v) => v === true) ?? true,
     opacity:
@@ -237,7 +253,9 @@ function groupFromJson(obj: any, id: number): RoiGroup {
     highDetail:
       verifyOptionalObjectProperty(obj, "highDetail", (v) => v === true) ??
       false,
-    rois: verifyObjectProperty(obj, "rois", (v) => parseArray(v, entryFromJson)),
+    rois: verifyObjectProperty(obj, "rois", (v) =>
+      parseArray(v, entryFromJson),
+    ),
   };
 }
 
@@ -487,7 +505,8 @@ export class RoiFilterState {
       verifyOptionalObjectProperty(x, "ghostAlpha", verifyFiniteFloat) ??
       DEFAULT_GHOST_ALPHA;
     this.colorByGroup_ =
-      verifyOptionalObjectProperty(x, "colorByGroup", (v) => v === true) ?? true;
+      verifyOptionalObjectProperty(x, "colorByGroup", (v) => v === true) ??
+      true;
     this.hideOverlays2d_ =
       verifyOptionalObjectProperty(x, "hideOverlays2d", (v) => v === true) ??
       false;

@@ -34,6 +34,11 @@ export const ROI_FILTER_JSON_KEY = "roiFilter";
 // Tool identifier for the global "non-passing opacity" Render-tab control; the
 // value itself persists inside ROI_FILTER_JSON_KEY (RoiFilterState.ghostAlpha).
 export const ROI_NONPASSING_ALPHA_JSON_KEY = "roiNonPassingOpacity";
+export const IGNORE_SKELETON_MEMORY_CEILING_JSON_KEY =
+  "ignoreSkeletonMemoryCeiling";
+export const ROI_HIGH_DETAIL_BUDGET_JSON_KEY = "roiHighDetailBudget";
+export const ROI_FULL_DETAIL_MEMORY_SHARE_JSON_KEY = "roiFullDetailMemoryShare";
+export const AUTO_ROI_HIGH_DETAIL_BUDGET_JSON_KEY = "autoRoiHighDetailBudget";
 export const MESH_SILHOUETTE_RENDERING_JSON_KEY = "meshSilhouetteRendering";
 export const LINKED_SEGMENTATION_GROUP_JSON_KEY = "linkedSegmentationGroup";
 export const LINKED_SEGMENTATION_COLOR_GROUP_JSON_KEY =

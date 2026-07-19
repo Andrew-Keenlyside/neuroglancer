@@ -168,12 +168,25 @@
   gap: 4px;
 }
 
-.neuroglancer-streamline-filter-roi-label {
+.neuroglancer-streamline-filter-roi-name {
   flex: 1;
+  min-width: 0;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  border-radius: 2px;
+  color: #eee;
+  font-size: 11px;
+  padding: 1px 3px;
+}
+
+/* Derived geometry (e.g. "Sphere @ 100,200,300"), shown under the name input. */
+.neuroglancer-streamline-filter-roi-label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #ddd;
+  color: #999;
+  font-size: 10px;
+  padding: 1px 0 2px 3px;
 }
 
 .neuroglancer-streamline-filter-roi-controls {

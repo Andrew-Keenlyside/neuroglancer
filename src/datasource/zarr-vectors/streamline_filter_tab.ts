@@ -27,21 +27,42 @@
 import "#src/datasource/zarr-vectors/streamline_filter_tab.css";
 
 import {
+  labelled,
+  makeSelect,
+} from "#src/datasource/zarr-vectors/filter_widgets.js";
+import { ImportGroupDialog } from "#src/datasource/zarr-vectors/import_group_dialog.js";
+import {
   RoiOperator,
   RoiPredicate,
   type Roi,
   type RoiShape,
 } from "#src/datasource/zarr-vectors/roi.js";
 import {
+  groupFromJson,
+  groupToJson,
   RoiFilterState,
   type RoiGroup,
 } from "#src/datasource/zarr-vectors/roi_filter_state.js";
+import { StoreGroupPicker } from "#src/datasource/zarr-vectors/store_group_picker.js";
+import {
+  rememberSavedDocument,
+  savedDocumentFor,
+} from "#src/datasource/zarr-vectors/store_provenance.js";
 import { deleteLayer, makeLayer } from "#src/layer/index.js";
 import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
 import {
   LINKED_SEGMENTATION_GROUP_JSON_KEY,
   ROI_FILTER_JSON_KEY,
 } from "#src/layer/segmentation/json_keys.js";
+import { RoiGroupBrowseDialog } from "#src/roi_store/browse_dialog.js";
+import { roiStoreEnabled } from "#src/roi_store/config.js";
+import { getRoiStoreAuth } from "#src/roi_store/credentials.js";
+import { getRoiGroupStore } from "#src/roi_store/gcs_client.js";
+import {
+  makeRoiGroupDocument,
+  type RoiGroupDocument,
+} from "#src/roi_store/schema.js";
+import { StatusMessage } from "#src/status.js";
 import { TrackableBooleanCheckbox } from "#src/trackable_boolean.js";
 import type { WatchableValueInterface } from "#src/trackable_value.js";
 import type { Uint64Set } from "#src/uint64_set.js";
@@ -82,27 +103,19 @@ const ROLE_OPTIONS: { value: RoiOperator; label: string }[] = [
   { value: RoiOperator.OR, label: "Or" },
   { value: RoiOperator.ANDNOT, label: "Exclude" },
 ];
+/**
+ * Roles offered on the first ROI, which seeds the fold instead of folding into
+ * it: `Or` is degenerate there (`false || x === x`), so only the two seeding
+ * modes are meaningful.
+ */
+const SEED_ROLE_OPTIONS: { value: RoiOperator; label: string }[] = [
+  { value: RoiOperator.AND, label: "Include" },
+  { value: RoiOperator.ANDNOT, label: "Exclude" },
+];
 const PREDICATE_OPTIONS: { value: RoiPredicate; label: string }[] = [
   { value: RoiPredicate.ANY_SEGMENT, label: "Crosses" },
   { value: RoiPredicate.ANY_VERTEX, label: "Point inside" },
 ];
-
-function makeSelect<T extends number>(
-  options: { value: T; label: string }[],
-  current: T,
-  onChange: (v: T) => void,
-): HTMLSelectElement {
-  const select = document.createElement("select");
-  for (const opt of options) {
-    const el = document.createElement("option");
-    el.value = String(opt.value);
-    el.textContent = opt.label;
-    if (opt.value === current) el.selected = true;
-    select.appendChild(el);
-  }
-  select.addEventListener("change", () => onChange(Number(select.value) as T));
-  return select;
-}
 
 /** Parse `#rrggbb` (an `<input type=color>` value) into an rgb vec3 in [0,1]. */
 function parseHexColor(hex: string): vec3 {
@@ -116,10 +129,16 @@ function parseHexColor(hex: string): vec3 {
 
 // --- shape <-> (centre, radius/size) helpers --------------------------------
 
-function boxCentre(shape: { lower: Float32Array; upper: Float32Array }): number[] {
+function boxCentre(shape: {
+  lower: Float32Array;
+  upper: Float32Array;
+}): number[] {
   return Array.from(shape.lower, (lo, i) => (lo + shape.upper[i]) / 2);
 }
-function boxSize(shape: { lower: Float32Array; upper: Float32Array }): number[] {
+function boxSize(shape: {
+  lower: Float32Array;
+  upper: Float32Array;
+}): number[] {
   return Array.from(shape.lower, (lo, i) => shape.upper[i] - lo);
 }
 function boxFrom(centre: ArrayLike<number>, size: ArrayLike<number>): RoiShape {
@@ -143,7 +162,10 @@ function shapeLabel(shape: RoiShape): string {
       const size = boxSize(shape);
       const thin = size.findIndex((s) => s <= DEFAULT_PLANE_THICKNESS + 1e-6);
       const axisName = ["x", "y", "z"];
-      if (thin >= 0 && size.filter((s) => s > DEFAULT_PLANE_THICKNESS + 1e-6).length === 2) {
+      if (
+        thin >= 0 &&
+        size.filter((s) => s > DEFAULT_PLANE_THICKNESS + 1e-6).length === 2
+      ) {
         return `Plane ⊥${axisName[thin] ?? thin} @ ${fmt(boxCentre(shape))}`;
       }
       return `Box @ ${fmt(boxCentre(shape))}`;
@@ -175,6 +197,11 @@ export class StreamlineFilterTab extends Tab {
   /** Disposers for the widgets in the current body build. */
   private bodyContext = new RefCounted();
 
+  /** Groups with a save in flight, so a second click cannot double-write. */
+  private savesInFlight = new Set<number>();
+  /** Abandons in-flight saves when the tab goes away. */
+  private saveAbortController = new AbortController();
+
   constructor(public layer: SegmentationUserLayer) {
     super();
     this.roiFilter = layer.displayState.roiFilter;
@@ -183,6 +210,23 @@ export class StreamlineFilterTab extends Tab {
     element.classList.add("neuroglancer-streamline-filter-tab");
 
     element.appendChild(this.makeHeader());
+
+    // Built once and kept outside `bodyEl`: it does network I/O, and rebuilding
+    // it on every structural change would re-list the bucket on each edit.
+    if (roiStoreEnabled) {
+      const picker = this.registerDisposer(
+        new StoreGroupPicker({
+          roiFilter: this.roiFilter,
+          getSourceUrl: () => this.currentSourceUrl(),
+          onGroupInserted: (groupId) => {
+            this.expandedGroupIds.add(groupId);
+            this.onChanged();
+          },
+        }),
+      );
+      element.appendChild(picker.element);
+    }
+
     this.bodyEl = document.createElement("div");
     this.bodyEl.classList.add("neuroglancer-streamline-filter-body");
     element.appendChild(this.bodyEl);
@@ -196,6 +240,12 @@ export class StreamlineFilterTab extends Tab {
       this.registerDisposer(
         this.passingSegments.changed.add(() => this.updateCount()),
       );
+    }
+    // The two sets change independently -- the budget can be re-spent without
+    // the dissection changing -- so the label needs both signals.
+    const highDetail = this.layer.displayState.roiHighDetailSegments;
+    if (highDetail !== undefined) {
+      this.registerDisposer(highDetail.changed.add(() => this.updateCount()));
     }
     // Open with the last group expanded so its ROIs are immediately visible
     // (others start collapsed; each has a caret to expand/collapse on demand).
@@ -222,7 +272,11 @@ export class StreamlineFilterTab extends Tab {
       ),
     );
     header.appendChild(
-      labelled("Active", active.element, "neuroglancer-streamline-filter-active"),
+      labelled(
+        "Active",
+        active.element,
+        "neuroglancer-streamline-filter-active",
+      ),
     );
 
     const colorByGroup = this.registerDisposer(
@@ -257,8 +311,9 @@ export class StreamlineFilterTab extends Tab {
     // Include each ROI's shape kind so a restore that keeps ids + counts but
     // changes a kind still rebuilds (the sliders are wired per kind), and each
     // group's expanded state (its ROI section is only in the DOM when open);
-    // exclude group colour/name/visibility/opacity (bound live to inputs —
-    // rebuilding on those would recreate an input mid-edit).
+    // exclude group colour/name/visibility/opacity and ROI name (all bound live
+    // to inputs — rebuilding on those would recreate an input mid-edit, so a
+    // rename would lose focus on the first keystroke that commits).
     return this.roiFilter.groups
       .map(
         (g) =>
@@ -339,7 +394,178 @@ export class StreamlineFilterTab extends Tab {
     addRow.classList.add("neuroglancer-streamline-filter-add-row");
     addRow.appendChild(addGroup);
     addRow.appendChild(addGroupAsLayer);
+    // Not gated on `roiStoreEnabled`: pasting JSON needs no bucket, and is the
+    // only import path in a build with the store compiled out.
+    addRow.appendChild(
+      makeIcon({
+        text: "+ From JSON…",
+        title:
+          "Add a group by pasting or uploading JSON — one group, an array of " +
+          "groups, or a saved group document.",
+        onClick: () => this.openImportDialog(),
+      }),
+    );
+    if (roiStoreEnabled) {
+      addRow.appendChild(
+        makeIcon({
+          text: "Browse saved…",
+          title:
+            "Open the shared library of saved groups. Browsing and loading " +
+            "need no sign-in.",
+          onClick: () => this.openBrowseDialog(),
+        }),
+      );
+    }
     el.appendChild(addRow);
+  }
+
+  // --- shared ROI group store ----------------------------------------------
+
+  /** The data source these ROIs were drawn against, if it is resolved. */
+  private currentSourceUrl(): string | undefined {
+    return this.layer.dataSources[0]?.spec.url;
+  }
+
+  /**
+   * Write one group to the shared store.
+   *
+   * The group JSON is `groupToJson` output, identical to what the URL carries,
+   * so there is a single serialisation to keep correct.
+   */
+  private async saveGroup(id: number): Promise<void> {
+    if (this.savesInFlight.has(id)) return;
+    const sourceUrl = this.currentSourceUrl();
+    if (sourceUrl === undefined) {
+      StatusMessage.showTemporaryMessage(
+        "Cannot save: this layer has no resolved data source.",
+        5000,
+      );
+      return;
+    }
+    const store = getRoiGroupStore();
+    const auth = getRoiStoreAuth();
+    const { signal } = this.saveAbortController;
+
+    this.savesInFlight.add(id);
+    const status = new StatusMessage(/*delay=*/ true);
+    status.setText("Saving…");
+    try {
+      // Obtain the token BEFORE building the document. Saving is what triggers
+      // sign-in, and `auth.email` is undefined until it completes — reading it
+      // first left the first save of every session with no author recorded.
+      await auth.getAccessToken(signal);
+      if (this.wasDisposed) return;
+
+      // Re-read the group only now: the user may have renamed, edited or
+      // deleted it while the sign-in popup was open.
+      const group = this.currentGroup(id);
+      if (group === undefined) {
+        StatusMessage.showTemporaryMessage(
+          "Cannot save: that group no longer exists.",
+          5000,
+        );
+        return;
+      }
+      status.setText(`Saving “${group.name}”…`);
+
+      const previous = savedDocumentFor(this.roiFilter, id);
+      const doc = makeRoiGroupDocument({
+        group: groupToJson(group),
+        source: { url: sourceUrl },
+        scene: {
+          // The URL hash is neuroglancer's own serialisation of the scene.
+          url: window.location.href,
+          layerName: this.layer.managedLayer.name,
+        },
+        createdBy: auth.email,
+        id: previous?.id,
+        createdAt: previous?.createdAt,
+      });
+      await store.save(doc, signal);
+      rememberSavedDocument(this.roiFilter, id, {
+        id: doc.id,
+        createdAt: doc.createdAt,
+      });
+      if (this.wasDisposed) return;
+      StatusMessage.showTemporaryMessage(`Saved “${group.name}”.`, 3000);
+    } catch (e) {
+      if (this.wasDisposed || signal.aborted) return;
+      StatusMessage.showTemporaryMessage(
+        `Could not save: ${(e as Error).message}`,
+        6000,
+      );
+    } finally {
+      // Always retire the status and the in-flight mark, including when the
+      // sign-in is abandoned — otherwise the modal lingers and the group can
+      // never be saved again.
+      status.dispose();
+      this.savesInFlight.delete(id);
+    }
+  }
+
+  private openBrowseDialog(): void {
+    new RoiGroupBrowseDialog({
+      store: getRoiGroupStore(),
+      auth: getRoiStoreAuth(),
+      currentSourceUrl: this.currentSourceUrl(),
+      onLoad: (doc) => this.loadDocument(doc),
+    });
+  }
+
+  /**
+   * Append a saved group to this layer.
+   *
+   * Uses `insertGroup` rather than `restoreState`: restoring would rebuild the
+   * whole group list and renumber ids from 1, invalidating the ids this tab
+   * holds in `expandedGroupIds` and re-reads at click time.  Appending assigns
+   * a fresh id and leaves every existing group untouched.
+   */
+  private loadDocument(doc: RoiGroupDocument): string {
+    // `id` is assigned by insertGroup; groupFromJson needs a placeholder.
+    const { id: _placeholder, ...group } = groupFromJson(doc.group, 0);
+    const [groupId] = this.appendGroups([group]);
+    // Record where it came from, so re-saving updates this document instead of
+    // adding a copy, and the store checklist shows it as loaded.
+    rememberSavedDocument(this.roiFilter, groupId, {
+      id: doc.id,
+      createdAt: doc.createdAt,
+    });
+    return `Loaded “${group.name}”.`;
+  }
+
+  /**
+   * Append already-parsed groups and reveal them; returns their new ids.
+   *
+   * The single insert path: both the store's browse dialog and the local JSON
+   * import land here, so the "turn the filter on, expand what you just added"
+   * behaviour cannot drift between them.
+   */
+  private appendGroups(groups: readonly Omit<RoiGroup, "id">[]): number[] {
+    const ids: number[] = [];
+    for (const group of groups) {
+      // insertGroup dispatches `changed` once per group rather than once per
+      // ROI, so a multi-group import costs one recompute per group, not per
+      // region.
+      const id = this.roiFilter.insertGroup(group);
+      ids.push(id);
+      this.expandedGroupIds.add(id);
+    }
+    // A loaded dissection is only visible with the filter on, and the user
+    // just asked for it — turning it on is what they meant.
+    this.roiFilter.active = true;
+    this.onChanged();
+    return ids;
+  }
+
+  private openImportDialog(): void {
+    new ImportGroupDialog({
+      onImport: (groups) => {
+        this.appendGroups(groups);
+        return groups.length === 1
+          ? `Added “${groups[0].name}”.`
+          : `Added ${groups.length} groups.`;
+      },
+    });
   }
 
   /**
@@ -491,7 +717,9 @@ export class StreamlineFilterTab extends Tab {
     swatch.value = serializeColor(group.color);
     swatch.title = "Group colour";
     swatch.addEventListener("input", () =>
-      this.roiFilter.updateGroup(group.id, { color: parseHexColor(swatch.value) }),
+      this.roiFilter.updateGroup(group.id, {
+        color: parseHexColor(swatch.value),
+      }),
     );
     row.appendChild(swatch);
 
@@ -548,6 +776,23 @@ export class StreamlineFilterTab extends Tab {
       });
       merge.classList.add("neuroglancer-streamline-filter-group-action");
       row.appendChild(merge);
+    }
+
+    if (roiStoreEnabled) {
+      const save = makeIcon({
+        text: "Save to store",
+        title:
+          "Save this group to the shared store, so it can be reloaded later " +
+          "or opened by someone else. Prompts for Google sign-in the first " +
+          "time; re-saving updates the same entry rather than adding a copy.",
+        onClick: (e) => {
+          e.stopPropagation();
+          // Re-read by id; see the note on the separate action above.
+          void this.saveGroup(group.id);
+        },
+      });
+      save.classList.add("neuroglancer-streamline-filter-group-action");
+      row.appendChild(save);
     }
 
     row.appendChild(
@@ -647,12 +892,28 @@ export class StreamlineFilterTab extends Tab {
     const card = document.createElement("div");
     card.classList.add("neuroglancer-streamline-filter-roi-card");
 
+    const geometry = shapeLabel(roi.shape);
+    const fallbackName = `ROI ${index + 1}`;
+
     const head = document.createElement("div");
     head.classList.add("neuroglancer-streamline-filter-roi-head");
-    const label = document.createElement("span");
-    label.classList.add("neuroglancer-streamline-filter-roi-label");
-    label.textContent = shapeLabel(roi.shape);
-    head.appendChild(label);
+    const name = document.createElement("input");
+    name.type = "text";
+    name.classList.add("neuroglancer-streamline-filter-roi-name");
+    // Unnamed ROIs show the positional fallback as a *placeholder*, not a
+    // value: it tracks the current index, and clearing the field reverts to it
+    // instead of storing an empty name.
+    name.value = roi.name ?? "";
+    name.placeholder = fallbackName;
+    name.title = geometry;
+    name.addEventListener("change", () => {
+      const trimmed = name.value.trim();
+      name.value = trimmed;
+      this.roiFilter.updateRoi(groupId, index, {
+        name: trimmed === "" ? undefined : trimmed,
+      });
+    });
+    head.appendChild(name);
     head.appendChild(
       makeDeleteButton({
         title: "Delete ROI",
@@ -661,16 +922,27 @@ export class StreamlineFilterTab extends Tab {
     );
     card.appendChild(head);
 
+    // The derived geometry string is still the only way to tell two identically
+    // named regions apart, so it stays visible as a subtitle rather than moving
+    // entirely into the input's tooltip.
+    const label = document.createElement("div");
+    label.classList.add("neuroglancer-streamline-filter-roi-label");
+    label.textContent = geometry;
+    card.appendChild(label);
+
     const controls = document.createElement("div");
     controls.classList.add("neuroglancer-streamline-filter-roi-controls");
-    // Role: the first ROI seeds the fold, so its operator is ignored — always
-    // show it as Include (even if a reorder left a stale operator on it).
+    // Role: the first ROI seeds the fold rather than folding into it, so it
+    // offers only Include/Exclude. A stale `Or` left at index 0 by a reorder is
+    // shown (and evaluated) as Include.
+    const isSeed = index === 0;
     const role = makeSelect(
-      ROLE_OPTIONS,
-      index === 0 ? RoiOperator.AND : roi.operator,
+      isSeed ? SEED_ROLE_OPTIONS : ROLE_OPTIONS,
+      isSeed && roi.operator !== RoiOperator.ANDNOT
+        ? RoiOperator.AND
+        : roi.operator,
       (v) => this.roiFilter.updateRoi(groupId, index, { operator: v }),
     );
-    if (index === 0) role.disabled = true;
     controls.appendChild(labelled("Role", role));
     controls.appendChild(
       labelled(
@@ -696,7 +968,11 @@ export class StreamlineFilterTab extends Tab {
     box.classList.add("neuroglancer-streamline-filter-sliders");
     const axisName = ["x", "y", "z"];
     const rank =
-      shape.kind === "ellipsoid" ? shape.center.length : shape.kind === "box" ? shape.lower.length : 3;
+      shape.kind === "ellipsoid"
+        ? shape.center.length
+        : shape.kind === "box"
+          ? shape.lower.length
+          : 3;
 
     const slider = (
       title: string,
@@ -894,23 +1170,25 @@ export class StreamlineFilterTab extends Tab {
       this.countEl.textContent = "";
       return;
     }
-    const n = this.passingSegments?.size ?? 0;
-    this.countEl.textContent = `${n.toLocaleString()} streamline${n === 1 ? "" : "s"} pass (this level)`;
+    // The dissection is evaluated at the finest level whose regional geometry is
+    // resident, so the passing count is no longer "this level" -- it can name
+    // tracts that exist only at levels far finer than the one being drawn. Only
+    // those the full-detail budget admits are actually shown, so reporting the
+    // pass count alone would look like most of them had silently vanished.
+    const passing = this.passingSegments?.size ?? 0;
+    const shown = this.layer.displayState.roiHighDetailSegments?.size;
+    const plural = passing === 1 ? "" : "s";
+    this.countEl.textContent =
+      shown === undefined
+        ? `${passing.toLocaleString()} streamline${plural} pass`
+        : `${passing.toLocaleString()} streamline${plural} pass · ` +
+          `${shown.toLocaleString()} at full detail`;
   }
-}
 
-/** Wrap a control in a `<label>` with leading text. */
-function labelled(
-  text: string,
-  control: HTMLElement,
-  className?: string,
-): HTMLElement {
-  const label = document.createElement("label");
-  label.classList.add("neuroglancer-streamline-filter-field");
-  if (className !== undefined) label.classList.add(className);
-  const span = document.createElement("span");
-  span.textContent = text;
-  label.appendChild(span);
-  label.appendChild(control);
-  return label;
+  disposed() {
+    // Abandon any save still waiting on sign-in or the network, so it cannot
+    // report against a panel that has gone away.
+    this.saveAbortController.abort();
+    super.disposed();
+  }
 }

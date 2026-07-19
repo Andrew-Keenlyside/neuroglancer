@@ -90,9 +90,9 @@ describe("RoiFilterState groups", () => {
 
   it("addRoi to a missing group is a no-op returning -1", () => {
     const s = new RoiFilterState();
-    expect(countChanges(s, () => expect(s.addRoi(999, ellipsoid)).toBe(-1))).toBe(
-      0,
-    );
+    expect(
+      countChanges(s, () => expect(s.addRoi(999, ellipsoid)).toBe(-1)),
+    ).toBe(0);
   });
 
   it("updates group name/colour/visibility", () => {
@@ -131,7 +131,11 @@ describe("RoiFilterState groups", () => {
     const g = s.addGroup();
     s.addRoi(g, ellipsoid);
     const before = s.groups;
-    expect(countChanges(s, () => s.updateRoi(g, 0, { predicate: RoiPredicate.ANY_VERTEX }))).toBe(1);
+    expect(
+      countChanges(s, () =>
+        s.updateRoi(g, 0, { predicate: RoiPredicate.ANY_VERTEX }),
+      ),
+    ).toBe(1);
     expect(s.groups).not.toBe(before); // new array reference
   });
 });
@@ -188,6 +192,32 @@ describe("RoiFilterState serialization", () => {
     const json = s.toJSON();
     expect("opacity" in json.groups[0]).toBe(false);
     expect("highDetail" in json.groups[0]).toBe(false);
+  });
+
+  it("round-trips ROI names, omitting the key when unnamed", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.addRoi(g, { ...ellipsoid, name: "Motor CST" });
+    s.addRoi(g, box); // unnamed
+
+    const json = s.toJSON();
+    expect(json.groups[0].rois[0].name).toBe("Motor CST");
+    // Absent, not `undefined`: the UI's positional placeholder must never be
+    // persisted, or a later delete would leave "ROI 2" sitting at index 0.
+    expect("name" in json.groups[0].rois[1]).toBe(false);
+
+    const restored = new RoiFilterState();
+    restored.restoreState(json);
+    expect(restored.groups[0].rois[0].name).toBe("Motor CST");
+    expect("name" in restored.groups[0].rois[1]).toBe(false);
+  });
+
+  it("clearing an ROI name drops it from JSON again", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.addRoi(g, { ...ellipsoid, name: "temp" });
+    s.updateRoi(g, 0, { name: undefined });
+    expect("name" in s.toJSON().groups[0].rois[0]).toBe(false);
   });
 
   it("omits ghostAlpha/colorByGroup from JSON at their defaults", () => {
