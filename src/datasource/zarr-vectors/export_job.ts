@@ -49,10 +49,65 @@ export interface ExportSpecOptions {
   format: ExportFormat;
   /** Where the *exporter* writes, on its own filesystem. */
   outputPath: string;
+  /**
+   * Voxel→RAS 4×4 to stamp into the TRK header, row-major.  Omitted means the
+   * exporter defaults to identity — which for TRK means the streamlines carry
+   * no world transform and downstream tools place them in voxel space.  The
+   * tab pre-fills this from the layer's coordinate space, so a spec built
+   * through the UI carries a real transform rather than silently defaulting.
+   */
+  affine?: readonly (readonly number[])[];
+}
+
+/**
+ * Parse an affine typed into the Export tab into a 4×4, or undefined if blank.
+ *
+ * Accepts a JSON matrix (`[[1,0,0,0],...]`), a flat JSON array of 16, or 16
+ * whitespace/comma-separated numbers.  Throws a user-facing message on anything
+ * that is not exactly 16 finite numbers.  Pure, so it is unit-tested directly.
+ */
+export function parseAffineText(
+  text: string,
+): readonly (readonly number[])[] | undefined {
+  const trimmed = text.trim();
+  if (trimmed === "") return undefined;
+  let nums: number[];
+  try {
+    const parsed = JSON.parse(trimmed);
+    nums = (Array.isArray(parsed) ? parsed.flat(Infinity) : [parsed]).map(
+      Number,
+    );
+  } catch {
+    nums = trimmed.split(/[\s,]+/).map(Number);
+  }
+  if (nums.length !== 16 || nums.some((n) => !Number.isFinite(n))) {
+    throw new Error("Affine must be 16 finite numbers (a 4×4 matrix).");
+  }
+  return [
+    nums.slice(0, 4),
+    nums.slice(4, 8),
+    nums.slice(8, 12),
+    nums.slice(12, 16),
+  ];
+}
+
+/** Format a 4×4 as four lines, for pre-filling the Export tab's affine field. */
+export function formatAffineText(m: readonly (readonly number[])[]): string {
+  return m.map((row) => row.join(" ")).join("\n");
+}
+
+/** Whether a 4×4 is exactly the identity, so an identity affine is not emitted. */
+function isIdentity4x4(m: readonly (readonly number[])[]): boolean {
+  for (let r = 0; r < 4; ++r) {
+    for (let c = 0; c < 4; ++c) {
+      if (m[r][c] !== (r === c ? 1 : 0)) return false;
+    }
+  }
+  return true;
 }
 
 export function buildExportSpec(options: ExportSpecOptions): any {
-  const { sourceUrl, groups, format, outputPath } = options;
+  const { sourceUrl, groups, format, outputPath, affine } = options;
   if (sourceUrl === "") {
     throw new Error("This layer has no resolved data source.");
   }
@@ -70,7 +125,7 @@ export function buildExportSpec(options: ExportSpecOptions): any {
         `streamline in the dataset.`,
     );
   }
-  return {
+  const spec: any = {
     schemaVersion: JOB_SCHEMA_VERSION,
     // Level 0 always: the export is of the data, not of what is on screen.
     source: { url: sourceUrl, level: 0 },
@@ -78,4 +133,10 @@ export function buildExportSpec(options: ExportSpecOptions): any {
     format,
     destination: { kind: "local", path: outputPath },
   };
+  // Only emit a non-identity affine: identity is the exporter's default, and
+  // omitting it keeps the golden-fixture spec (which has no affine) unchanged.
+  if (affine !== undefined && !isIdentity4x4(affine)) {
+    spec.affine = affine.map((row) => [...row]);
+  }
+  return spec;
 }

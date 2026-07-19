@@ -60,12 +60,31 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--port", type=int, default=None, help="Port for --serve.")
+    parser.add_argument(
+        "--bind",
+        default=None,
+        help="Bind address for --serve (default loopback).",
+    )
+    parser.add_argument(
+        "--allow-origin",
+        default=None,
+        help="Origin allowed to call the exporter, for --serve.",
+    )
     args = parser.parse_args(argv)
 
     if args.serve:
         from neuroglancer.tract_export import serve as serve_mod
 
-        return serve_mod.main([] if args.port is None else ["--port", str(args.port)])
+        # Forward every serve-relevant flag; previously only --port reached the
+        # sub-command, so --bind and --allow-origin were silently ignored.
+        serve_argv: list[str] = []
+        if args.port is not None:
+            serve_argv += ["--port", str(args.port)]
+        if args.bind is not None:
+            serve_argv += ["--bind", args.bind]
+        if args.allow_origin is not None:
+            serve_argv += ["--allow-origin", args.allow_origin]
+        return serve_mod.main(serve_argv)
     if args.job is None:
         parser.error("a job spec is required unless --serve is given")
 

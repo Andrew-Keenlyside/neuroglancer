@@ -35,6 +35,8 @@ import "#src/datasource/zarr-vectors/tract_export_tab.css";
 
 import {
   buildExportSpec,
+  formatAffineText,
+  parseAffineText,
   type ExportFormat,
 } from "#src/datasource/zarr-vectors/export_job.js";
 import {
@@ -113,6 +115,13 @@ export class TractExportTab extends Tab {
   private selectedGroupIds = new Set<number>();
   private format: ExportFormat = "trk";
   private outputPath = "";
+  /**
+   * Voxel→RAS affine typed by the user, for the TRK header. Blank means
+   * identity (the exporter's default), so nothing is emitted and the streamline
+   * export lands in voxel space -- which is why the field is pre-filled from the
+   * layer's scales rather than left empty.
+   */
+  private affineText = "";
   /** Cleared and rebuilt whenever the group list changes structurally. */
   private bodyContext = new RefCounted();
   private bodyEl = document.createElement("div");
@@ -283,6 +292,27 @@ export class TractExportTab extends Tab {
       "A path on the machine running the exporter, not in the browser.";
     el.appendChild(hint);
 
+    // Affine only applies to TRK (ZVF stores coordinates directly).
+    if (this.format === "trk") {
+      if (this.affineText === "") this.affineText = this.defaultAffineText();
+      const affine = document.createElement("textarea");
+      affine.classList.add("neuroglancer-tract-export-affine");
+      affine.rows = 4;
+      affine.spellcheck = false;
+      affine.value = this.affineText;
+      affine.addEventListener("change", () => {
+        this.affineText = affine.value;
+      });
+      el.appendChild(labelled("Voxel→RAS", affine));
+
+      const affineNote = document.createElement("div");
+      affineNote.classList.add("neuroglancer-tract-export-note");
+      affineNote.textContent =
+        "4×4 written into the TRK header. Pre-filled from the layer's scales; " +
+        "edit for orientation, or clear for identity (voxel space).";
+      el.appendChild(affineNote);
+    }
+
     // A statically served build has no viewer server, so it needs a sidecar.
     // Offer the field there rather than only reporting the absence: the writers
     // genuinely cannot run in the page (zarr drives a dedicated IO thread that
@@ -400,7 +430,37 @@ export class TractExportTab extends Tab {
       groups: this.selectedGroups(),
       format: this.format,
       outputPath: this.outputPath || this.defaultOutputPath(),
+      // Only TRK carries an affine header; parseAffineText throws a user-facing
+      // message on malformed input, surfaced by the callers of buildSpec.
+      affine:
+        this.format === "trk" ? parseAffineText(this.affineText) : undefined,
     });
+  }
+
+  /**
+   * A diagonal voxel→RAS from the layer's coordinate-space scales, as a
+   * starting point the user edits.  Orientation and any axis permutation are
+   * the user's to set -- this only seeds the diagonal, and returns identity if
+   * the space cannot be read.
+   */
+  private defaultAffineText(): string {
+    const identity = [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1],
+    ];
+    try {
+      const scales = this.layer.manager.root.coordinateSpace.value?.scales;
+      if (scales === undefined || scales.length < 3) {
+        return formatAffineText(identity);
+      }
+      const m = identity.map((row) => [...row]);
+      for (let i = 0; i < 3; ++i) m[i][i] = scales[i];
+      return formatAffineText(m);
+    } catch {
+      return formatAffineText(identity);
+    }
   }
 
   private downloadSpec(): void {

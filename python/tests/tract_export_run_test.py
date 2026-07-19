@@ -23,7 +23,7 @@ import copy
 
 import numpy as np
 import pytest
-from neuroglancer.tract_export import parse_job
+from neuroglancer.tract_export import JobSpecError, parse_job
 from neuroglancer.tract_export import run as run_mod
 from neuroglancer.tract_export.run import (
     ExportRunError,
@@ -315,21 +315,16 @@ class TestEmptySelection:
         assert summary["object_count"] == 0
         assert not out.exists()
 
-    def test_rejects_a_non_local_destination(self, monkeypatch):
-        self_patch = lambda store, *, level, **kwargs: {  # noqa: E731
-            "polylines": [],
-            "object_ids": [],
-            "polyline_count": 0,
-            "vertex_count": 0,
-        }
-        monkeypatch.setattr(run_mod, "_require_zarr_vectors", lambda: self_patch)
+    def test_rejects_a_non_local_destination(self):
+        # gcs is now rejected at parse -- before the expensive read+fold -- so
+        # no monkeypatched reader or run is needed. See job.py.
         spec = copy.deepcopy(BASE)
         spec["groups"] = [
             {"name": "g", "color": "#ff0000", "rois": [sphere((0, 0, 0), 2)]}
         ]
         spec["destination"] = {"kind": "gcs", "path": "gs://b/out.trk"}
-        with pytest.raises(ExportRunError, match="not supported yet"):
-            run_mod.run_job(parse_job(spec))
+        with pytest.raises(JobSpecError, match="not supported yet"):
+            parse_job(spec)
 
 
 class TestCliSummaryShape:

@@ -150,6 +150,12 @@ class TestRejections:
         with pytest.raises(JobSpecError, match="destination.kind"):
             parse_job(spec(destination={"kind": "s3", "path": "x"}))
 
+    def test_rejects_gcs_at_parse_before_the_read(self):
+        # A known-but-unimplemented kind fails fast with the workaround, rather
+        # than after run_job reads and folds the whole level.
+        with pytest.raises(JobSpecError, match="not supported yet"):
+            parse_job(spec(destination={"kind": "gcs", "path": "gs://b/x.trk"}))
+
     def test_rejects_a_missing_source_url(self):
         with pytest.raises(JobSpecError, match="url"):
             parse_job(spec(source={"level": 0}))

@@ -15,7 +15,11 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { buildExportSpec } from "#src/datasource/zarr-vectors/export_job.js";
+import {
+  buildExportSpec,
+  formatAffineText,
+  parseAffineText,
+} from "#src/datasource/zarr-vectors/export_job.js";
 import { RoiOperator, RoiPredicate } from "#src/datasource/zarr-vectors/roi.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import { vec3 } from "#src/util/geom.js";
@@ -157,5 +161,84 @@ describe("buildExportSpec", () => {
         outputPath: "o.trk",
       }),
     ).toThrow(/every streamline/);
+  });
+
+  it("emits a non-identity affine but omits identity and absent", () => {
+    const s = stateWithGroup("g");
+    const base = {
+      sourceUrl: "zarr-vectors://x",
+      groups: s.groups,
+      format: "trk" as const,
+      outputPath: "o.trk",
+    };
+    // Absent: no affine key (keeps the golden fixture unchanged).
+    expect("affine" in buildExportSpec(base)).toBe(false);
+    // Identity: also omitted, since it is the exporter's default.
+    const identity = [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1],
+    ];
+    expect("affine" in buildExportSpec({ ...base, affine: identity })).toBe(
+      false,
+    );
+    // A real transform is carried through.
+    const affine = [
+      [0.5, 0, 0, 1],
+      [0, 0.5, 0, 2],
+      [0, 0, 0.5, 3],
+      [0, 0, 0, 1],
+    ];
+    expect(buildExportSpec({ ...base, affine }).affine).toEqual(affine);
+  });
+});
+
+describe("parseAffineText", () => {
+  it("returns undefined for blank input", () => {
+    expect(parseAffineText("")).toBeUndefined();
+    expect(parseAffineText("   \n ")).toBeUndefined();
+  });
+
+  it("parses a JSON matrix", () => {
+    expect(
+      parseAffineText("[[1,0,0,4],[0,1,0,5],[0,0,1,6],[0,0,0,1]]"),
+    ).toEqual([
+      [1, 0, 0, 4],
+      [0, 1, 0, 5],
+      [0, 0, 1, 6],
+      [0, 0, 0, 1],
+    ]);
+  });
+
+  it("parses 16 whitespace-separated numbers", () => {
+    const m = parseAffineText("1 0 0 0\n0 1 0 0\n0 0 1 0\n0 0 0 1");
+    expect(m).toEqual([
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1],
+    ]);
+  });
+
+  it("round-trips through formatAffineText", () => {
+    const m = [
+      [2, 0, 0, 0],
+      [0, 3, 0, 0],
+      [0, 0, 4, 0],
+      [0, 0, 0, 1],
+    ];
+    expect(parseAffineText(formatAffineText(m))).toEqual(m);
+  });
+
+  it("rejects the wrong number of values", () => {
+    expect(() => parseAffineText("1 2 3")).toThrow(/16 finite numbers/);
+    expect(() => parseAffineText("[[1,0],[0,1]]")).toThrow(/16 finite numbers/);
+  });
+
+  it("rejects non-finite values", () => {
+    expect(() => parseAffineText("1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 x")).toThrow(
+      /16 finite numbers/,
+    );
   });
 });

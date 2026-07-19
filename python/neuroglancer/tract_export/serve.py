@@ -38,6 +38,7 @@ import logging
 import secrets
 
 import tornado.httpserver
+import tornado.ioloop
 import tornado.netutil
 import tornado.web
 
@@ -155,7 +156,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"    {url}\n")
     print("The token is per-run: restarting mints a new URL. Ctrl-C to stop.\n")
     try:
-        asyncio.get_event_loop().run_forever()
+        # The canonical Tornado blocking call. `asyncio.get_event_loop()` here
+        # raised on Python 3.14 (no running loop), and `IOLoop.current()` is
+        # what `serve()`'s `add_sockets` already scheduled on regardless.
+        tornado.ioloop.IOLoop.current().start()
     except KeyboardInterrupt:
         print("stopped")
     return 0

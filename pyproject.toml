@@ -29,6 +29,13 @@ webdriver = [
 osteoid = [
   "osteoid>=0.6.0",
 ]
+# The tract exporter (neuroglancer.tract_export) needs `zarr-vectors` and
+# `zarr-vectors-tools[trk]` for its writers. They are NOT declared as an extra
+# here on purpose: both are unreleased dev lines carrying the merged-links 0.9.0
+# format, not on PyPI at the required version, so an extra referencing them
+# makes `uv sync` (and therefore every nox session) fail to resolve. run.py
+# imports them lazily with an install hint instead; install from a source
+# checkout -- `pip install <path>/zarr-vectors-tools[trk]` -- to enable export.
 
 [project.urls]
 Repository = "https://github.com/google/neuroglancer"

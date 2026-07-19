@@ -213,6 +213,14 @@ def parse_job(obj: Any) -> ExportJob:
         raise JobSpecError(
             f"destination.kind: expected one of {DESTINATION_KINDS}, got {kind!r}"
         )
+    # Rejected here, before `run_job` reads the whole level and folds the
+    # dissection: only `local` is implemented, and a hand-written `gcs` spec
+    # should fail fast with the workaround rather than after minutes of work.
+    if kind != "local":
+        raise JobSpecError(
+            f"destination.kind {kind!r} is not supported yet; export locally "
+            f"and upload the result."
+        )
     path = _require(destination, "path", "destination")
     if not isinstance(path, str) or not path:
         raise JobSpecError("destination.path: expected a non-empty string")
