@@ -15,6 +15,7 @@
 import asyncio
 import concurrent.futures
 import json
+import logging
 import multiprocessing
 import os
 import re
@@ -65,6 +66,8 @@ EVENTS_PATH_REGEX = r"^/events/(?P<viewer_token>[^/]+)$"
 SET_STATE_PATH_REGEX = r"^/state/(?P<viewer_token>[^/]+)$"
 
 CREDENTIALS_PATH_REGEX = r"^/credentials/(?P<viewer_token>[^/]+)$"
+
+TRACT_EXPORT_PATH_REGEX = r"^/neuroglancer/export/tract/(?P<viewer_token>[^/]+)$"
 
 global_static_content_source = None
 
@@ -141,6 +144,7 @@ if not _PYODIDE:
                     (EVENTS_PATH_REGEX, EventStreamHandler, dict(server=self)),
                     (SET_STATE_PATH_REGEX, SetStateHandler, dict(server=self)),
                     (CREDENTIALS_PATH_REGEX, CredentialsHandler, dict(server=self)),
+                    (TRACT_EXPORT_PATH_REGEX, TractExportHandler, dict(server=self)),
                 ],
                 log_function=log_function,
             )
@@ -157,7 +161,9 @@ if not _PYODIDE:
 
             global global_static_content_source
             if global_static_content_source is None:
-                global_static_content_source = static.get_default_static_content_source()
+                global_static_content_source = (
+                    static.get_default_static_content_source()
+                )
             self.port = actual_port
             self.server_url = _get_server_url(self._bind_address, actual_port)
             self.regular_server_url = _get_regular_server_url(
@@ -205,6 +211,64 @@ if not _PYODIDE:
             self.set_header("Content-type", content_type)
             self.finish(data)
 
+    class TractExportHandler(BaseRequestHandler):
+        """Run an ROI-dissection export posted by the viewer's Export tab.
+
+        Deliberately blocking, on a thread: the writers pull whole objects out
+        of the store, so a real export is seconds-to-minutes of CPU and I/O and
+        would stall the event loop -- and with it every chunk request the viewer
+        is making -- if it ran inline.
+        """
+
+        async def post(self, viewer_token):
+            from .tract_export.job import JobSpecError, parse_job
+            from .tract_export.run import ExportRunError, run_job
+
+            # Token-scoped like every other route here. This one writes a file
+            # at a path the request chooses, so an unauthenticated version would
+            # let any page the user visits drop content anywhere the server can
+            # write -- the same check StaticPathHandler makes.
+            if (
+                viewer_token != self.server.token
+                and viewer_token not in self.server.viewers
+            ):
+                self.send_error(404)
+                return
+
+            try:
+                spec = json.loads(self.request.body)
+            except ValueError as e:
+                self.set_status(400)
+                self.finish(json.dumps({"error": f"Invalid JSON: {e}"}))
+                return
+
+            try:
+                job = parse_job(spec)
+            except JobSpecError as e:
+                # 400, not 500: the spec is the caller's to fix, and the message
+                # is written to be shown verbatim in the tab.
+                self.set_status(400)
+                self.finish(json.dumps({"error": str(e)}))
+                return
+
+            self.set_header("Content-Type", "application/json")
+            try:
+                summary = await asyncio.to_thread(run_job, job)
+            except ExportRunError as e:
+                self.set_status(422)
+                self.finish(json.dumps({"error": str(e)}))
+                return
+            except Exception as e:
+                # The ZVF path calls into zarr directly, which raises its own
+                # exception types; without this they escape as tornado's HTML
+                # 500 and the tab's `response.json()` fails on the error path.
+                logging.exception("tract export failed")
+                self.set_status(500)
+                self.finish(json.dumps({"error": f"Export failed: {e}"}))
+                return
+
+            self.finish(json.dumps(summary))
+
     class ActionHandler(BaseRequestHandler):
         def post(self, viewer_token):
             viewer = self.server.viewers.get(viewer_token)
@@ -225,7 +289,9 @@ if not _PYODIDE:
                 return
 
             info = json.loads(self.request.body)
-            self.server.loop.call_soon(viewer._handle_volume_info_reply, request_id, info)
+            self.server.loop.call_soon(
+                viewer._handle_volume_info_reply, request_id, info
+            )
             self.finish("")
 
     class VolumeChunkResponseHandler(BaseRequestHandler):
@@ -243,7 +309,9 @@ if not _PYODIDE:
             self.finish("")
 
     class EventStreamStateWatcher:
-        def __init__(self, key: str, client_id: str, state, last_generation: str, wake_up):
+        def __init__(
+            self, key: str, client_id: str, state, last_generation: str, wake_up
+        ):
             self.key = key
             self.state = state
             self.last_generation = last_generation
@@ -277,7 +345,9 @@ if not _PYODIDE:
             self.set_header("cache-control", "no-cache")
             must_flush = True
             wake_event = asyncio.Event()
-            self._wake_up = lambda: self.server.loop.call_soon_threadsafe(wake_event.set)
+            self._wake_up = lambda: self.server.loop.call_soon_threadsafe(
+                wake_event.set
+            )
             client_id = self.get_query_argument("c")
             if client_id is None:
                 raise tornado.web.HTTPError(400, "missing client_id")
@@ -349,7 +419,9 @@ if not _PYODIDE:
             client_id = msg["c"]
             try:
                 new_generation = viewer.set_state(
-                    state, f"{client_id}/{generation}", existing_generation=prev_generation
+                    state,
+                    f"{client_id}/{generation}",
+                    existing_generation=prev_generation,
                 )
                 self.set_header("Content-type", "application/json")
                 self.finish(json.dumps({"g": new_generation}))
@@ -448,7 +520,9 @@ if not _PYODIDE:
                 self.send_error(405, message="Meshes not supported for volume")
                 return
             except local_volume.InvalidObjectIdForMesh:
-                self.send_error(404, message="Mesh not available for specified object id")
+                self.send_error(
+                    404, message="Mesh not available for specified object id"
+                )
                 return
             except ValueError as e:
                 self.send_error(400, message=e.args[0])
