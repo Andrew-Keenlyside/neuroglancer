@@ -92,8 +92,24 @@ export const enum RoiOperator {
 export interface Roi {
   readonly shape: RoiShape;
   readonly predicate: RoiPredicate;
-  /** Ignored for the first region in a list, which seeds the verdict. */
+  /**
+   * How this region folds into the verdict accumulated so far. The *first*
+   * region in a list seeds the verdict instead of folding into one: `AND`
+   * seeds it to "passes this region", `ANDNOT` to "does not pass this region",
+   * which is how a dissection made only of exclusions is expressed. `OR` is
+   * degenerate in that position and is treated as `AND`. See
+   * {@link seedVerdict}.
+   */
   readonly operator: RoiOperator;
+  /**
+   * Optional display name. Absent means unnamed, and the UI shows a positional
+   * `ROI ${index + 1}` placeholder instead -- deliberately *not* stored, since
+   * persisting it would freeze "ROI 3" onto a region that a later delete moves
+   * to index 0.
+   *
+   * Display-only: it reaches neither the fold nor the Python wire format.
+   */
+  readonly name?: string;
 }
 
 /**
@@ -294,10 +310,29 @@ export function streamlinePassesRoi(
 }
 
 /**
+ * How the first region in a list seeds the fold, given whether the streamline
+ * passes it.
+ *
+ * `AND` seeds the verdict to "passes this region". `ANDNOT` seeds it to the
+ * negation, which is what makes a dissection of pure exclusions expressible:
+ * "everything except the tracts crossing here" needs no leading
+ * include-everything region. `OR` is degenerate in this position -- folding it
+ * into an empty verdict is `false || x === x` -- so it behaves as `AND` rather
+ * than being a third seeding mode.
+ *
+ * Both folds below route their seed through this, so they cannot disagree about
+ * what a leading `ANDNOT` means; the Python port in
+ * `neuroglancer/tractography/roi.py` mirrors it.
+ */
+function seedVerdict(passes: boolean, operator: RoiOperator): boolean {
+  return operator === RoiOperator.ANDNOT ? !passes : passes;
+}
+
+/**
  * Whether a streamline survives a list of regions.
  *
  * The list is evaluated as a left fold, in order: the first region seeds the
- * verdict (its operator is ignored) and each subsequent one folds in. This is
+ * verdict (see {@link seedVerdict}) and each subsequent one folds in. This is
  * how TrackVis and DSI Studio express dissections -- neither offers a nested
  * expression tree, and a left fold covers the dissections found in practice --
  * so region order is the whole of the syntax, and reordering the list is the
@@ -311,10 +346,9 @@ export function streamlinePassesRois(
   rois: readonly Roi[],
 ): boolean {
   if (rois.length === 0) return true;
-  let verdict = streamlinePassesRoi(
-    streamline,
-    rois[0].shape,
-    rois[0].predicate,
+  let verdict = seedVerdict(
+    streamlinePassesRoi(streamline, rois[0].shape, rois[0].predicate),
+    rois[0].operator,
   );
   for (let i = 1; i < rois.length; ++i) {
     const roi = rois[i];
@@ -361,7 +395,7 @@ export function combineRoiVerdicts(
       `combineRoiVerdicts: crossed has ${crossed.length} entries, expected ${rois.length}`,
     );
   }
-  let verdict = crossed[0];
+  let verdict = seedVerdict(crossed[0], rois[0].operator);
   for (let i = 1; i < rois.length; ++i) {
     switch (rois[i].operator) {
       case RoiOperator.AND:
@@ -376,4 +410,66 @@ export function combineRoiVerdicts(
     }
   }
   return verdict;
+}
+
+/**
+ * Axis-aligned world-space box enclosing every region in `rois`, or `undefined`
+ * when any of them is unbounded.
+ *
+ * Unions over **all** operators, including `ANDNOT`. That differs from the
+ * exporter's equivalent, and deliberately: this answers "which geometry must be
+ * present to decide the crossing tests", and deciding that a tract crosses an
+ * exclusion region needs that region's geometry just as much as an inclusion's.
+ * (The exporter's version asks a different question -- which tracts can
+ * possibly pass -- for which an exclusion's complement is unbounded.)
+ *
+ * A halfspace has no finite extent, so any list containing one yields
+ * `undefined`: the caller then has no bounded guarantee to offer and falls back
+ * to whatever the camera happens to make resident.
+ */
+export function roiRegionBounds(
+  rois: readonly Roi[],
+): { lower: Float32Array; upper: Float32Array } | undefined {
+  let lower: Float32Array | undefined;
+  let upper: Float32Array | undefined;
+  for (const { shape } of rois) {
+    let lo: Float32Array;
+    let hi: Float32Array;
+    switch (shape.kind) {
+      case "ellipsoid": {
+        const { center, radii } = shape;
+        lo = new Float32Array(center.length);
+        hi = new Float32Array(center.length);
+        for (let i = 0; i < center.length; ++i) {
+          const r = Math.abs(radii[i]);
+          lo[i] = center[i] - r;
+          hi[i] = center[i] + r;
+        }
+        break;
+      }
+      case "box": {
+        lo = new Float32Array(shape.lower.length);
+        hi = new Float32Array(shape.upper.length);
+        for (let i = 0; i < lo.length; ++i) {
+          lo[i] = Math.min(shape.lower[i], shape.upper[i]);
+          hi[i] = Math.max(shape.lower[i], shape.upper[i]);
+        }
+        break;
+      }
+      case "halfspace":
+        return undefined;
+    }
+    if (lower === undefined || upper === undefined) {
+      lower = lo;
+      upper = hi;
+      continue;
+    }
+    for (let i = 0; i < lower.length && i < lo.length; ++i) {
+      lower[i] = Math.min(lower[i], lo[i]);
+      upper[i] = Math.max(upper[i], hi[i]);
+    }
+  }
+  return lower === undefined || upper === undefined
+    ? undefined
+    : { lower, upper };
 }

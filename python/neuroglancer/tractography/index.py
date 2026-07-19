@@ -173,7 +173,7 @@ class TractIndex:
             + self.segment_object.nbytes
         )
 
-    def decimate(self, max_vertices: int) -> "TractIndex":
+    def decimate(self, max_vertices: int) -> TractIndex:
         """Return a copy with each tract resampled to at most `max_vertices`.
 
         Vertices are picked by evenly spaced index, always keeping both

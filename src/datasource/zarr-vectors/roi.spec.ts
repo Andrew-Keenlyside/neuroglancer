@@ -20,6 +20,7 @@ import {
   RoiOperator,
   RoiPredicate,
   streamlinePassesRoi,
+  roiRegionBounds,
   streamlinePassesRois,
   type Roi,
   type RoiShape,
@@ -247,11 +248,32 @@ describe("streamlinePassesRois — composition", () => {
     expect(streamlinePassesRois(line(99, 99, 99), [])).toBe(true);
   });
 
-  it("ignores the first region's operator (it seeds the verdict)", () => {
+  it("seeds the verdict from the first region, treating Or as Include", () => {
     const through = line(-5, 0, 0, 5, 0, 0);
-    for (const op of [RoiOperator.AND, RoiOperator.OR, RoiOperator.ANDNOT]) {
+    // Both seed to "passes this region": OR is degenerate at index 0
+    // (`false || x === x`), so it must not act as a third seeding mode.
+    for (const op of [RoiOperator.AND, RoiOperator.OR]) {
       expect(streamlinePassesRois(through, [roi(atOrigin, op)])).toBe(true);
     }
+  });
+
+  it("seeds from a leading ANDNOT, so a dissection can be pure exclusion", () => {
+    // "Everything except tracts crossing the origin" -- expressible without a
+    // leading include-everything region.
+    const rois = [roi(atOrigin, RoiOperator.ANDNOT)];
+    expect(streamlinePassesRois(line(-5, 0, 0, 5, 0, 0), rois)).toBe(false);
+    expect(streamlinePassesRois(line(9, 0, 0, 11, 0, 0), rois)).toBe(true);
+  });
+
+  it("folds subsequent regions into a leading exclusion", () => {
+    // NOT through the origin, AND through x=10.
+    const rois = [
+      roi(atOrigin, RoiOperator.ANDNOT),
+      roi(atTen, RoiOperator.AND),
+    ];
+    expect(streamlinePassesRois(line(9, 0, 0, 11, 0, 0), rois)).toBe(true);
+    expect(streamlinePassesRois(line(-5, 0, 0, 15, 0, 0), rois)).toBe(false);
+    expect(streamlinePassesRois(line(0, 50, 0, 1, 50, 0), rois)).toBe(false);
   });
 
   it("AND requires passing both regions", () => {
@@ -362,6 +384,17 @@ describe("combineRoiVerdicts — agrees with streamlinePassesRois (no drift)", (
     [roi(atOrigin, RoiOperator.AND), roi(atTen, RoiOperator.AND)],
     [roi(atOrigin, RoiOperator.AND), roi(atTen, RoiOperator.OR)],
     [roi(atOrigin, RoiOperator.AND), roi(atTen, RoiOperator.ANDNOT)],
+    // Seed-position operators. The first region seeds the fold rather than
+    // folding into it, so these are the cases that catch one fold being
+    // updated without the other -- with only AND at index 0 above, changing
+    // `streamlinePassesRois` alone would leave this suite green while the
+    // per-chunk filter (which uses `combineRoiVerdicts`) kept the old
+    // behaviour.
+    [roi(atOrigin, RoiOperator.OR)],
+    [roi(atOrigin, RoiOperator.ANDNOT)],
+    [roi(atOrigin, RoiOperator.ANDNOT), roi(atTen, RoiOperator.AND)],
+    [roi(atOrigin, RoiOperator.ANDNOT), roi(atTen, RoiOperator.OR)],
+    [roi(atOrigin, RoiOperator.ANDNOT), roi(atTen, RoiOperator.ANDNOT)],
   ];
   const streams: StreamlineRef[] = [
     line(-5, 0, 0, 5, 0, 0), // crosses origin only
@@ -400,5 +433,73 @@ describe("combineRoiVerdicts — agrees with streamlinePassesRois (no drift)", (
     // Neither fragment alone passes the AND.
     expect(combineRoiVerdicts(crossedA, rois)).toBe(false);
     expect(combineRoiVerdicts(crossedB, rois)).toBe(false);
+  });
+});
+
+describe("roiRegionBounds", () => {
+  const f = (...xs: number[]) => Float32Array.from(xs);
+  const mk = (shape: RoiShape, operator = RoiOperator.AND): Roi => ({
+    shape,
+    operator,
+    predicate: RoiPredicate.ANY_SEGMENT,
+  });
+
+  it("encloses an ellipsoid", () => {
+    const b = roiRegionBounds([
+      mk({ kind: "ellipsoid", center: f(10, 10, 10), radii: f(2, 3, 4) }),
+    ])!;
+    expect(Array.from(b.lower)).toEqual([8, 7, 6]);
+    expect(Array.from(b.upper)).toEqual([12, 13, 14]);
+  });
+
+  it("normalises an inverted box", () => {
+    const b = roiRegionBounds([
+      mk({ kind: "box", lower: f(9, 9, 9), upper: f(1, 1, 1) }),
+    ])!;
+    expect(Array.from(b.lower)).toEqual([1, 1, 1]);
+    expect(Array.from(b.upper)).toEqual([9, 9, 9]);
+  });
+
+  it("unions several regions", () => {
+    const b = roiRegionBounds([
+      mk({ kind: "box", lower: f(0, 0, 0), upper: f(1, 1, 1) }),
+      mk({ kind: "box", lower: f(5, 5, 5), upper: f(7, 7, 7) }),
+    ])!;
+    expect(Array.from(b.lower)).toEqual([0, 0, 0]);
+    expect(Array.from(b.upper)).toEqual([7, 7, 7]);
+  });
+
+  it("includes exclusion regions", () => {
+    // Unlike the exporter's bounds, which ask which tracts can pass: deciding
+    // that a tract crosses an exclusion needs that region's geometry resident.
+    const b = roiRegionBounds([
+      mk({ kind: "box", lower: f(0, 0, 0), upper: f(1, 1, 1) }),
+      mk(
+        { kind: "box", lower: f(50, 50, 50), upper: f(60, 60, 60) },
+        RoiOperator.ANDNOT,
+      ),
+    ])!;
+    expect(Array.from(b.upper)).toEqual([60, 60, 60]);
+  });
+
+  it("is undefined for a halfspace, which has no finite extent", () => {
+    expect(
+      roiRegionBounds([
+        mk({ kind: "halfspace", origin: f(0, 0, 0), normal: f(0, 0, 1) }),
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("is undefined when any region is unbounded", () => {
+    expect(
+      roiRegionBounds([
+        mk({ kind: "box", lower: f(0, 0, 0), upper: f(1, 1, 1) }),
+        mk({ kind: "halfspace", origin: f(0, 0, 0), normal: f(1, 0, 0) }),
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("is undefined for an empty list", () => {
+    expect(roiRegionBounds([])).toBeUndefined();
   });
 });

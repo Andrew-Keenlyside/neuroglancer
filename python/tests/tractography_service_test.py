@@ -26,8 +26,13 @@ import struct
 
 import numpy as np
 import pytest
-
-from neuroglancer.tractography import Ellipsoid, Roi, RoiOperator, RoiPredicate, TractIndex
+from neuroglancer.tractography import (
+    Ellipsoid,
+    Roi,
+    RoiOperator,
+    RoiPredicate,
+    TractIndex,
+)
 from neuroglancer.tractography.service import RoiFilterService, evaluate_groups
 from neuroglancer.tractography.wire import (
     RESPONSE_MAGIC,
@@ -229,7 +234,12 @@ class TestCrossLanguageGolden:
         body = bytes.fromhex(self.GOLDEN_CHUNK_HEX)
         assert len(body) % 8 == 0, "blobs must stay 8-aligned for the next uint64"
         query = json.dumps(
-            {"scope": "s", "chunkKeys": ["c0"], "uploads": [{"key": "c0"}], "groups": []}
+            {
+                "scope": "s",
+                "chunkKeys": ["c0"],
+                "uploads": [{"key": "c0"}],
+                "groups": [],
+            }
         )
         index = decode_request(query, body).uploads["c0"]
 
@@ -445,9 +455,7 @@ class TestService:
         both = self.run(service, rois)
         assert both == ([1], [], {1: 0xFF00FF00})
         # Now evaluate only c0, which does not contain x=10.
-        only_c0 = self.run(
-            service, rois, chunks=[self.chunks()[0]], cached=("c0",)
-        )
+        only_c0 = self.run(service, rois, chunks=[self.chunks()[0]], cached=("c0",))
         assert only_c0[0] == []
         # ...and back again, to prove the first result was not cached over.
         assert self.run(service, rois, cached=("c0", "c1")) == both
@@ -493,8 +501,13 @@ class TestService:
             np.concatenate(frags), offsets, np.array([1, 2, 1], dtype=np.uint64)
         )
         spec = RoiGroupSpec(
-            rois=(Roi(Ellipsoid(np.array([-10.0, 0, 0]), np.array([1.0, 1, 1])),
-                      RoiPredicate.ANY_SEGMENT, RoiOperator.AND),),
+            rois=(
+                Roi(
+                    Ellipsoid(np.array([-10.0, 0, 0]), np.array([1.0, 1, 1])),
+                    RoiPredicate.ANY_SEGMENT,
+                    RoiOperator.AND,
+                ),
+            ),
             color_packed=0x99,
             visible=True,
             high_detail=False,

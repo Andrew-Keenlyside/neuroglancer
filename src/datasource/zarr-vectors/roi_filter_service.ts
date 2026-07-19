@@ -42,7 +42,11 @@
  * If either side changes, both change together.
  */
 
-import type { Roi, RoiGroupConfig, RoiShape } from "#src/datasource/zarr-vectors/roi.js";
+import type {
+  Roi,
+  RoiGroupConfig,
+  RoiShape,
+} from "#src/datasource/zarr-vectors/roi.js";
 import type { RoiFilterableChunk } from "#src/datasource/zarr-vectors/roi_filter_backend.js";
 
 /** Endpoint prefix; matched by the Pyodide service worker's `shouldIntercept`. */

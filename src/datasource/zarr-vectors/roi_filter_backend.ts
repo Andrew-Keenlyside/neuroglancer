@@ -256,6 +256,7 @@ export function diffPassingSet(
 export function computeGroupedPassingSet(
   chunks: Iterable<RoiFilterableChunk>,
   groups: readonly RoiGroupConfig[],
+  highDetailBudget?: number,
 ): {
   passing: Set<bigint>;
   colorById: Map<bigint, number>;
@@ -278,5 +279,61 @@ export function computeGroupedPassingSet(
       if (group.highDetail) highDetail.add(id);
     }
   }
-  return { passing, colorById, highDetail };
+  return {
+    passing,
+    colorById,
+    highDetail: selectHighDetail(passing, highDetail, highDetailBudget),
+  };
+}
+
+/**
+ * Choose which streamlines to load at full resolution, within a budget counted
+ * in STREAMLINES.
+ *
+ * A count, not a byte figure: pass 2 fetches whole objects, so a tract that
+ * merely clips the view brings its entire length. Budgeting by bytes-in-view
+ * would systematically understate it.
+ *
+ * Two tiers, both filled in ascending id order:
+ *
+ *  1. `preferred` -- the passing tracts of groups flagged `highDetail`. An
+ *     explicit request keeps priority over the general fill.
+ *  2. the rest of `passing`, until the budget runs out.
+ *
+ * Tier 2 is what makes the pyramid mix at the OBJECT level. The dissection is
+ * evaluated at the finest level whose ROI-region chunks are resident, so
+ * `passing` can name tracts that exist only at levels far finer than the one
+ * being drawn -- and a tract absent from the drawn level has no chunk geometry
+ * at all, so pass 2 is the only thing that can show it. Filling from `passing`
+ * therefore spends the budget on real additional streamlines rather than
+ * re-rendering ones the chunk pass already covers.
+ *
+ * Ascending id, not proximity: the result is diffed against the resident set on
+ * every recompute, so an order that shifted with the camera would evict and
+ * refetch whole tracts on each pan. Stability is what keeps the budget spent on
+ * loading rather than churn.
+ */
+export function selectHighDetail(
+  passing: ReadonlySet<bigint>,
+  preferred: ReadonlySet<bigint>,
+  budget: number | undefined,
+): Set<bigint> {
+  const ascending = (a: bigint, b: bigint) => (a < b ? -1 : a > b ? 1 : 0);
+  if (budget === undefined || !Number.isFinite(budget)) {
+    // No budget: honour exactly the explicit request, as before. Filling from
+    // `passing` unbounded could try to fetch every tract in the dissection.
+    return new Set(preferred);
+  }
+  const kept = new Set<bigint>();
+  if (budget <= 0) return kept;
+  for (const id of [...preferred].sort(ascending)) {
+    kept.add(id);
+    if (kept.size >= budget) return kept;
+  }
+  for (const id of [...passing].sort(ascending)) {
+    if (kept.has(id)) continue;
+    kept.add(id);
+    if (kept.size >= budget) break;
+  }
+  return kept;
 }

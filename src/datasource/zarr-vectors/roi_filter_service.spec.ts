@@ -68,9 +68,24 @@ function segmentColumn(ids: bigint[]): Uint32Array {
  */
 function sampleChunk(): RoiFilterableChunk {
   const positions = Float32Array.from([
-    0, 0, 0, 1, 0, 0, 2, 0, 0, // object 7
-    10, 0, 0, 11, 0, 0, // object 9
-    99, 99, 99, // ghost
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    2,
+    0,
+    0, // object 7
+    10,
+    0,
+    0,
+    11,
+    0,
+    0, // object 9
+    99,
+    99,
+    99, // ghost
   ]);
   return {
     rank: 3,

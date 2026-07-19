@@ -15,13 +15,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { AnnotationType } from "#src/annotation/index.js";
 import type {
   Annotation,
   AxisAlignedBoundingBox,
   Ellipsoid,
   Line,
 } from "#src/annotation/index.js";
+import { AnnotationType } from "#src/annotation/index.js";
 import { RoiOperator, RoiPredicate } from "#src/datasource/zarr-vectors/roi.js";
 import {
   annotationToRoiShape,

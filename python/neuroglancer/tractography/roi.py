@@ -31,7 +31,8 @@ the state channel -- so it can be unit-tested directly.
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING, NamedTuple, Sequence, Union
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 
@@ -83,7 +84,7 @@ class Halfspace(NamedTuple):
     normal: np.ndarray
 
 
-RoiShape = Union[Ellipsoid, Box, Halfspace]
+RoiShape = Ellipsoid | Box | Halfspace
 
 
 class RoiPredicate(enum.IntEnum):
@@ -124,7 +125,14 @@ class Roi(NamedTuple):
     shape: RoiShape
     predicate: RoiPredicate = RoiPredicate.ANY_SEGMENT
     operator: RoiOperator = RoiOperator.AND
-    """Ignored for the first region in a list, which seeds the verdict."""
+    """How this region folds into the verdict accumulated so far.
+
+    The *first* region in a list seeds the verdict instead of folding into one:
+    ``AND`` seeds it to "passes this region", ``ANDNOT`` to its negation, which
+    is how a dissection made only of exclusions is expressed.  ``OR`` is
+    degenerate in that position and is treated as ``AND``.  See
+    :func:`_seed_verdict`.
+    """
 
 
 def _vertices_inside(shape: RoiShape, points: np.ndarray) -> np.ndarray:
@@ -167,7 +175,9 @@ def _segments_intersect(shape: RoiShape, a: np.ndarray, b: np.ndarray) -> np.nda
         # Project the origin onto the segment, clamping to its ends. A
         # degenerate (zero-length) segment clamps to t = 0, i.e. its endpoint.
         with np.errstate(divide="ignore", invalid="ignore"):
-            t = np.where(ab_dot_ab > 0, a_dot_ab / np.where(ab_dot_ab > 0, ab_dot_ab, 1.0), 0.0)
+            t = np.where(
+                ab_dot_ab > 0, a_dot_ab / np.where(ab_dot_ab > 0, ab_dot_ab, 1.0), 0.0
+            )
         np.clip(t, 0.0, 1.0, out=t)
         closest = pa + t[:, None] * d
         return np.sum(closest * closest, axis=-1) <= 1.0
@@ -205,7 +215,7 @@ def _segments_intersect(shape: RoiShape, a: np.ndarray, b: np.ndarray) -> np.nda
 
 
 def _any_per_object(
-    index: "TractIndex", flags: np.ndarray, owner: np.ndarray
+    index: TractIndex, flags: np.ndarray, owner: np.ndarray
 ) -> np.ndarray:
     """OR-reduce a per-element boolean mask into a per-object mask.
 
@@ -222,7 +232,7 @@ def _any_per_object(
 
 
 def streamlines_pass_roi(
-    index: "TractIndex",
+    index: TractIndex,
     shape: RoiShape,
     predicate: RoiPredicate = RoiPredicate.ANY_SEGMENT,
 ) -> np.ndarray:
@@ -280,22 +290,42 @@ def streamlines_pass_roi(
     return result
 
 
-def streamlines_pass_rois(index: "TractIndex", rois: Sequence[Roi]) -> np.ndarray:
+def _seed_verdict(passes: np.ndarray, operator: RoiOperator) -> np.ndarray:
+    """How the first region in a list seeds the fold.
+
+    ``AND`` seeds the verdict to "passes this region".  ``ANDNOT`` seeds it to
+    the negation, which is what makes a dissection of pure exclusions
+    expressible: "everything except the tracts crossing here" needs no leading
+    include-everything region.  ``OR`` is degenerate in this position -- folding
+    it into an empty verdict is ``False or x == x`` -- so it behaves as ``AND``
+    rather than being a third seeding mode.
+
+    Both folds below route their seed through this, so they cannot disagree
+    about what a leading ``ANDNOT`` means; the TypeScript original in
+    ``src/datasource/zarr-vectors/roi.ts`` mirrors it.
+    """
+    return ~passes if RoiOperator(operator) is RoiOperator.ANDNOT else passes
+
+
+def streamlines_pass_rois(index: TractIndex, rois: Sequence[Roi]) -> np.ndarray:
     """Boolean mask over `index`'s tracts of those surviving a list of regions.
 
     The list is evaluated as a left fold, in order: the first region seeds the
-    verdict (its operator is ignored) and each subsequent one folds in. This is
-    how TrackVis and DSI Studio express dissections -- neither offers a nested
-    expression tree, and a left fold covers the dissections found in practice --
-    so region order is the whole of the syntax, and reordering the list is the
-    only editing operation a user needs.
+    verdict (see :func:`_seed_verdict`) and each subsequent one folds in. This
+    is how TrackVis and DSI Studio express dissections -- neither offers a
+    nested expression tree, and a left fold covers the dissections found in
+    practice -- so region order is the whole of the syntax, and reordering the
+    list is the only editing operation a user needs.
 
     An empty list passes everything: no regions means no filtering, rather than
     filtering everything away.
     """
     if not rois:
         return np.ones(len(index), dtype=bool)
-    verdict = streamlines_pass_roi(index, rois[0].shape, rois[0].predicate)
+    verdict = _seed_verdict(
+        streamlines_pass_roi(index, rois[0].shape, rois[0].predicate),
+        rois[0].operator,
+    )
     for roi in rois[1:]:
         op = RoiOperator(roi.operator)
         # The reference implementation short-circuits per streamline; batching
@@ -335,7 +365,11 @@ def combine_roi_verdicts(
             f"combine_roi_verdicts: crossed has {len(crossed)} entries, "
             f"expected {len(rois)}"
         )
-    verdict = np.array(crossed[0], dtype=bool, copy=True)
+    # Copy first: the fold mutates `verdict` in place below, so it must not
+    # alias the caller's mask.
+    verdict = _seed_verdict(
+        np.array(crossed[0], dtype=bool, copy=True), rois[0].operator
+    )
     for mask, roi in zip(crossed[1:], rois[1:]):
         op = RoiOperator(roi.operator)
         if op is RoiOperator.AND:

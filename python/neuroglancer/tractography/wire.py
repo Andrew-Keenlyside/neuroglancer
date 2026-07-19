@@ -148,9 +148,7 @@ def _decode_chunk(body: memoryview, offset: int) -> tuple[TractIndex, int]:
     row_ids = np.frombuffer(body, dtype="<u8", count=num_fragments, offset=pos)
     pos += num_fragments * 8
 
-    row_offsets = np.frombuffer(
-        body, dtype="<u4", count=num_fragments + 1, offset=pos
-    )
+    row_offsets = np.frombuffer(body, dtype="<u4", count=num_fragments + 1, offset=pos)
     pos += (num_fragments + 1) * 4
 
     positions = np.frombuffer(

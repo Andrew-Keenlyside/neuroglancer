@@ -24,7 +24,6 @@ index; `test_batching_matches_one_at_a_time` covers the batching itself.
 
 import numpy as np
 import pytest
-
 from neuroglancer.tractography import (
     Box,
     Ellipsoid,
@@ -51,9 +50,7 @@ def lines(*tracts) -> TractIndex:
     arrays = [np.array(t, dtype=np.float32).reshape(-1, 3) for t in tracts]
     offsets = np.zeros(len(arrays) + 1, dtype=np.int64)
     np.cumsum([len(a) for a in arrays], out=offsets[1:])
-    positions = (
-        np.concatenate(arrays) if arrays else np.zeros((0, 3), dtype=np.float32)
-    )
+    positions = np.concatenate(arrays) if arrays else np.zeros((0, 3), dtype=np.float32)
     ids = np.arange(1, len(arrays) + 1, dtype=np.uint64)
     return TractIndex(positions, offsets, ids)
 
@@ -211,12 +208,31 @@ class TestComposition:
     def test_no_regions_passes_everything(self):
         assert list(streamlines_pass_rois(line(99, 99, 99), [])) == [True]
 
-    def test_first_operator_ignored(self):
+    def test_first_operator_seeds_verdict_or_treated_as_include(self):
+        # AND and OR both seed to "passes this region": OR is degenerate at
+        # index 0 (``False or x == x``), so it is not a third seeding mode.
         through = line(-5, 0, 0, 5, 0, 0)
-        for op in RoiOperator:
-            assert list(streamlines_pass_rois(through, [self.roi(self.at_origin, op)])) == [
-                True
-            ]
+        for op in (RoiOperator.AND, RoiOperator.OR):
+            assert list(
+                streamlines_pass_rois(through, [self.roi(self.at_origin, op)])
+            ) == [True]
+
+    def test_leading_andnot_seeds_a_pure_exclusion(self):
+        # "Everything except tracts crossing the origin" -- expressible without
+        # a leading include-everything region.
+        rois = [self.roi(self.at_origin, RoiOperator.ANDNOT)]
+        assert not streamlines_pass_rois(line(-5, 0, 0, 5, 0, 0), rois)[0]
+        assert streamlines_pass_rois(line(9, 0, 0, 11, 0, 0), rois)[0]
+
+    def test_folds_into_a_leading_exclusion(self):
+        # NOT through the origin, AND through x=10.
+        rois = [
+            self.roi(self.at_origin, RoiOperator.ANDNOT),
+            self.roi(self.at_ten, RoiOperator.AND),
+        ]
+        assert streamlines_pass_rois(line(9, 0, 0, 11, 0, 0), rois)[0]
+        assert not streamlines_pass_rois(line(-5, 0, 0, 15, 0, 0), rois)[0]
+        assert not streamlines_pass_rois(line(0, 50, 0, 1, 50, 0), rois)[0]
 
     def test_and(self):
         rois = [
@@ -299,7 +315,9 @@ class TestFragments:
 
     @staticmethod
     def fragmented(*runs_with_ids) -> TractIndex:
-        arrays = [np.array(r, dtype=np.float32).reshape(-1, 3) for r, _ in runs_with_ids]
+        arrays = [
+            np.array(r, dtype=np.float32).reshape(-1, 3) for r, _ in runs_with_ids
+        ]
         offsets = np.zeros(len(arrays) + 1, dtype=np.int64)
         np.cumsum([len(a) for a in arrays], out=offsets[1:])
         ids = np.array([i for _, i in runs_with_ids], dtype=np.uint64)
@@ -370,8 +388,7 @@ class TestBatching:
     def test_batching_matches_one_at_a_time(self):
         rng = np.random.default_rng(0)
         tracts = [
-            rng.normal(scale=6.0, size=(int(rng.integers(1, 12)), 3))
-            for _ in range(60)
+            rng.normal(scale=6.0, size=(int(rng.integers(1, 12)), 3)) for _ in range(60)
         ]
         index = lines(*[t.ravel() for t in tracts])
         shapes = [
@@ -403,7 +420,13 @@ class TestPlatformIndexDtypes:
 
     def test_index_arrays_are_intp(self):
         index = lines([0, 0, 0, 1, 0, 0], [2, 0, 0, 3, 0, 0, 4, 0, 0])
-        for name in ("offsets", "counts", "row_object", "vertex_object", "segment_object"):
+        for name in (
+            "offsets",
+            "counts",
+            "row_object",
+            "vertex_object",
+            "segment_object",
+        ):
             assert getattr(index, name).dtype == np.intp, name
         a, b = index.segment_endpoints
         assert a.dtype == np.intp and b.dtype == np.intp

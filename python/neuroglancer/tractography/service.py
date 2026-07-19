@@ -41,7 +41,7 @@ from __future__ import annotations
 import numpy as np
 
 from .index import TractIndex
-from .roi import Roi, streamlines_pass_rois
+from .roi import streamlines_pass_rois
 from .wire import RoiFilterRequest, encode_response
 
 __all__ = ["RoiFilterService", "evaluate_groups"]
@@ -79,9 +79,7 @@ def evaluate_groups(index: TractIndex, groups) -> tuple[np.ndarray, dict, np.nda
             high_detail |= member
 
     ids = index.object_ids
-    colors = {
-        int(i): int(c) for i, c in zip(ids[claimed], claimed_color[claimed])
-    }
+    colors = {int(i): int(c) for i, c in zip(ids[claimed], claimed_color[claimed])}
     return ids[passing], colors, ids[high_detail]
 
 

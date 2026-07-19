@@ -26,6 +26,7 @@ import {
 } from "#src/datasource/zarr-vectors/roi.js";
 import {
   computeChunkCrossings,
+  selectHighDetail,
   computeGroupedPassingSet,
   computePassingSet,
   diffPassingSet,
@@ -263,7 +264,10 @@ describe("computePassingSet", () => {
   // Two chunks of one object (id 42): frag in chunk 1 crosses A, frag in
   // chunk 2 crosses B. Under "A AND B", the object passes only when both
   // chunks are folded in — the whole point of recomputing over the batch.
-  const rois = [roi(sphere(0, 0, 0, 1), RoiOperator.AND), roi(sphere(10, 0, 0, 1), RoiOperator.AND)];
+  const rois = [
+    roi(sphere(0, 0, 0, 1), RoiOperator.AND),
+    roi(sphere(10, 0, 0, 1), RoiOperator.AND),
+  ];
   const chunkCrossesA: RoiFilterableChunk = {
     rank: 3,
     numVertices: 2,
@@ -281,9 +285,9 @@ describe("computePassingSet", () => {
 
   it("passes an object only when the whole batch satisfies the fold", () => {
     expect([...computePassingSet([chunkCrossesA], rois)]).toEqual([]);
-    expect([...computePassingSet([chunkCrossesA, chunkCrossesB], rois)]).toEqual([
-      42n,
-    ]);
+    expect([
+      ...computePassingSet([chunkCrossesA, chunkCrossesB], rois),
+    ]).toEqual([42n]);
   });
 
   it("is order-independent across chunks", () => {
@@ -429,9 +433,58 @@ describe("diffPassingSet", () => {
       1n,
       2n,
     ]);
-    expect(diffPassingSet(new Set(), new Set([1n, 2n])).removed.sort()).toEqual([
-      1n,
-      2n,
+    expect(diffPassingSet(new Set(), new Set([1n, 2n])).removed.sort()).toEqual(
+      [1n, 2n],
+    );
+  });
+});
+
+describe("selectHighDetail", () => {
+  const ids = (...xs: number[]) => new Set(xs.map((x) => BigInt(x)));
+  const nums = (s: Set<bigint>) => [...s].map(Number).sort((a, b) => a - b);
+  const none = new Set<bigint>();
+
+  it("honours only the explicit request when no budget is set", () => {
+    // Filling from `passing` unbounded could try to fetch the whole dissection.
+    expect(nums(selectHighDetail(ids(1, 2, 3, 4), ids(2), undefined))).toEqual([
+      2,
     ]);
+  });
+
+  it("a budget of 0 disables full detail entirely", () => {
+    expect(selectHighDetail(ids(1, 2, 3), ids(1), 0).size).toBe(0);
+  });
+
+  it("fills from the passing set once the preferred tier is exhausted", () => {
+    // The mixed-level case: `passing` names tracts that exist only at levels
+    // finer than the one drawn, and pass 2 is the only thing that can show them.
+    expect(nums(selectHighDetail(ids(1, 2, 3, 4, 5), ids(4), 3))).toEqual([
+      1, 2, 4,
+    ]);
+  });
+
+  it("spends the whole budget on preferred when it alone exceeds it", () => {
+    expect(nums(selectHighDetail(ids(1, 2, 3), ids(7, 8, 9), 2))).toEqual([
+      7, 8,
+    ]);
+  });
+
+  it("never duplicates an id present in both tiers", () => {
+    const got = selectHighDetail(ids(1, 2, 3), ids(2), 3);
+    expect(got.size).toBe(3);
+    expect(nums(got)).toEqual([1, 2, 3]);
+  });
+
+  it("caps at the budget even when everything passes", () => {
+    expect(selectHighDetail(ids(1, 2, 3, 4, 5, 6), none, 2).size).toBe(2);
+  });
+
+  it("is stable: the result does not depend on iteration order", () => {
+    // Diffed against the resident set each recompute, so a shifting order would
+    // evict and refetch whole tracts on every pan.
+    const a = selectHighDetail(ids(9, 4, 7, 1), none, 2);
+    const b = selectHighDetail(ids(1, 7, 4, 9), none, 2);
+    expect(nums(a)).toEqual(nums(b));
+    expect(nums(a)).toEqual([1, 4]);
   });
 });
