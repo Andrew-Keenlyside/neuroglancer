@@ -26,13 +26,42 @@ declare const ROI_STORE:
   | {
       /** Name of the public-read GCS bucket holding `groups/*.json`. */
       bucket: string;
-      /** OAuth2 client ID authorised for this origin and the storage scope. */
-      clientId: string;
+      /**
+       * Which sign-in backs writes.  Defaults to `google`.
+       *
+       * `google` — a Google OAuth2 token with a storage scope, written straight
+       * to the GCS JSON API. The only option that works in the cross-origin
+       * isolated (pyodide) build, because our own redirect page can broadcast
+       * the response past COOP.
+       *
+       * `middleauth` — reuse neuroglancer's existing CAVE/middleauth login (the
+       * same one `state_share` uses), so no separate OAuth client is needed.
+       * TWO constraints: the middleauth token is a CAVE bearer token, so the
+       * `endpoint` MUST be a server that accepts it (not raw GCS); and the
+       * login popup gets its response from the CAVE server's own page via
+       * `window.opener`, which COOP severs — so this does NOT work in the
+       * pyodide build.
+       */
+      provider?: "google" | "middleauth";
+      /**
+       * Sign in eagerly at viewer start rather than lazily on first save.
+       *
+       * This is the "authenticate on the wasm before adding the url" path: the
+       * token is ready before any listing, so a bucket that denies anonymous
+       * listing populates the picker without a later prompt.
+       */
+      eager?: boolean;
       /**
        * Storage endpoint override, for pointing development builds at a local
        * stand-in server instead of Google.  Defaults to Google Cloud Storage.
+       * For the `middleauth` provider this must be an endpoint that accepts a
+       * CAVE bearer token.
        */
       endpoint?: string;
+
+      // --- google provider ---
+      /** OAuth2 client ID authorised for this origin and the storage scope. */
+      clientId?: string;
       /**
        * OAuth scopes to request.  Defaults to the storage scopes.
        *
@@ -45,6 +74,13 @@ declare const ROI_STORE:
        * Storage MUST leave this unset.
        */
       scopes?: string[];
+
+      // --- middleauth provider ---
+      /**
+       * middleauth login server, e.g. `https://global.daf-apis.com`.  Required
+       * when `provider` is `middleauth`.
+       */
+      authServer?: string;
     }
   | undefined;
 
@@ -62,18 +98,34 @@ export const DEFAULT_SCOPES = [
 
 export interface RoiStoreConfig {
   bucket: string;
-  clientId: string;
   endpoint: string;
+  eager: boolean;
+  provider: "google" | "middleauth";
+  /** Set when `provider` is `google`. */
+  clientId?: string;
   scopes: string[];
+  /** Set when `provider` is `middleauth`. */
+  authServer?: string;
 }
 
 function readConfig(): RoiStoreConfig | undefined {
   if (typeof ROI_STORE === "undefined" || ROI_STORE === undefined) {
     return undefined;
   }
-  const { bucket, clientId, endpoint, scopes } = ROI_STORE;
+  const { bucket, clientId, endpoint, scopes, provider, eager, authServer } =
+    ROI_STORE;
   if (typeof bucket !== "string" || bucket.length === 0) return undefined;
-  if (typeof clientId !== "string" || clientId.length === 0) return undefined;
+
+  const resolvedProvider = provider === "middleauth" ? "middleauth" : "google";
+  // Each provider has a required field; without it the feature cannot work, so
+  // treat it as unconfigured (feature off) rather than half-mounting a UI that
+  // fails on first use.
+  if (resolvedProvider === "google") {
+    if (typeof clientId !== "string" || clientId.length === 0) return undefined;
+  } else if (typeof authServer !== "string" || authServer.length === 0) {
+    return undefined;
+  }
+
   const validScopes =
     Array.isArray(scopes) && scopes.every((s) => typeof s === "string")
       ? scopes.filter((s) => s.length > 0)
@@ -87,7 +139,13 @@ function readConfig(): RoiStoreConfig | undefined {
     typeof endpoint === "string" ? endpoint.replace(/\/+$/, "") : "";
   return {
     bucket,
-    clientId,
+    provider: resolvedProvider,
+    eager: eager === true,
+    clientId: resolvedProvider === "google" ? clientId : undefined,
+    authServer:
+      resolvedProvider === "middleauth"
+        ? (authServer as string).replace(/\/+$/, "")
+        : undefined,
     endpoint:
       trimmedEndpoint.length > 0 ? trimmedEndpoint : DEFAULT_STORAGE_ENDPOINT,
     scopes: validScopes.length > 0 ? validScopes : DEFAULT_SCOPES,

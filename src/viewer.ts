@@ -71,7 +71,7 @@ import {
 import { overlaysOpen } from "#src/overlay.js";
 import { ScreenshotHandler } from "#src/python_integration/screenshots.js";
 import { allRenderLayerRoles, RenderLayerRole } from "#src/renderlayer.js";
-import { roiStoreEnabled } from "#src/roi_store/config.js";
+import { getRoiStoreConfig, roiStoreEnabled } from "#src/roi_store/config.js";
 import { getRoiStoreAuth } from "#src/roi_store/credentials.js";
 import { RoiStoreSignInWidget } from "#src/roi_store/sign_in_widget.js";
 import { StatusMessage } from "#src/status.js";
@@ -785,10 +785,16 @@ export class Viewer extends RefCounted implements ViewerState {
     }
 
     if (roiStoreEnabled) {
-      const signIn = this.registerDisposer(
-        new RoiStoreSignInWidget(getRoiStoreAuth()),
-      );
+      const auth = getRoiStoreAuth();
+      const signIn = this.registerDisposer(new RoiStoreSignInWidget(auth));
       topRow.appendChild(signIn.element);
+      if (getRoiStoreConfig().eager && !auth.signedIn) {
+        // "Authenticate before adding the url": obtain the token at viewer
+        // start rather than lazily on first save, so a bucket that denies
+        // anonymous listing populates the picker without a later prompt.
+        // Non-fatal -- getCredentialsWithStatus drives its own retry UI.
+        auth.signIn().catch(() => {});
+      }
     }
 
     {

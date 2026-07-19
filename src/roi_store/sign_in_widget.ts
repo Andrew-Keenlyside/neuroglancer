@@ -41,8 +41,9 @@ export class RoiStoreSignInWidget extends RefCounted {
 
   private updateView() {
     removeChildren(this.element);
-    const { email } = this.auth;
-    if (email === undefined) {
+    // Keyed on `signedIn`, not `email`: the middleauth provider is signed in
+    // without exposing an email, so an email test would show it as signed out.
+    if (!this.auth.signedIn) {
       this.element.appendChild(
         makeIcon({
           text: "Sign in",
@@ -57,9 +58,13 @@ export class RoiStoreSignInWidget extends RefCounted {
       return;
     }
 
+    const { email } = this.auth;
     const label = document.createElement("span");
-    label.textContent = email;
-    label.title = `Signed in to the ROI group store as ${email}`;
+    label.textContent = email ?? "Signed in";
+    label.title =
+      email === undefined
+        ? "Signed in to the ROI group store"
+        : `Signed in to the ROI group store as ${email}`;
     label.style.fontFamily = "sans-serif";
     label.style.fontSize = "10pt";
     label.style.marginRight = "5px";

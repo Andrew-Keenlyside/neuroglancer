@@ -19,11 +19,44 @@ checklist and **Browse saved…** are all omitted from the UI.
 ```jsonc
 ROI_STORE = {
   "bucket": "my-roi-groups",                     // public-read GCS bucket
-  "clientId": "....apps.googleusercontent.com",  // OAuth2 client
+  "clientId": "....apps.googleusercontent.com",  // OAuth2 client (google provider)
   "endpoint": "http://localhost:9000",           // optional: local stand-in
-  "scopes": ["openid", "email"]                  // optional: LOCAL DEV ONLY
+  "scopes": ["openid", "email"],                 // optional: LOCAL DEV ONLY
+  "eager": false                                 // optional: sign in at startup
 }
 ```
+
+## Which sign-in (`provider`)
+
+`google` (the default) obtains a Google OAuth2 token with a storage scope and
+writes straight to the GCS JSON API. It is the only provider that works in the
+cross-origin isolated pyodide build, because our own redirect page can broadcast
+the response past COOP.
+
+`middleauth` reuses neuroglancer's existing CAVE/middleauth login — the same one
+`state_share` uses — so no separate OAuth client is needed:
+
+```jsonc
+ROI_STORE = {
+  "bucket": "my-roi-groups",
+  "provider": "middleauth",
+  "authServer": "https://global.daf-apis.com",
+  "endpoint": "https://my-middleauth-fronted-store"
+}
+```
+
+Two constraints make `middleauth` a `dist/client`-only option:
+
+- The token is a **CAVE bearer token**, not a Google one, so `endpoint` must be
+  a server that accepts it — not raw `storage.googleapis.com`.
+- The login popup gets its response from the CAVE server's own page via
+  `window.opener`, which **COOP severs**, so it cannot complete under
+  `ng-pyodide`. (We can only broadcast past COOP from a page we control, which
+  the CAVE server's is not.)
+
+`eager: true` signs in at viewer start rather than lazily on first save — the
+"authenticate on the wasm before adding the url" path — so a bucket that denies
+anonymous listing populates the picker without a later prompt.
 
 `dist/client` — set it in the `define:` block of `rspack.config.ts`, or pass it
 on the command line:

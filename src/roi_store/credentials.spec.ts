@@ -26,7 +26,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
   EXPIRY_MARGIN_MS,
   LOCAL_STORAGE_KEY,
-  RoiStoreAuth,
+  GoogleRoiStoreAuth,
 } from "#src/roi_store/credentials.js";
 
 function seed(value: unknown) {
@@ -48,27 +48,27 @@ function validToken(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe("RoiStoreAuth token cache", () => {
+describe("GoogleRoiStoreAuth token cache", () => {
   beforeEach(() => {
     localStorage.clear();
   });
 
   it("restores a valid cached token", () => {
     seed(validToken());
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     expect(auth.signedIn).toBe(true);
     expect(auth.email).toEqual("test@example.com");
   });
 
   it("starts signed out when nothing is cached", () => {
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     expect(auth.signedIn).toBe(false);
     expect(auth.email).toBeUndefined();
   });
 
   it("discards an expired token and clears it from storage", () => {
     seed(validToken({ expiresAt: Date.now() - 1000 }));
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     expect(auth.signedIn).toBe(false);
     expect(localStorage.getItem(LOCAL_STORAGE_KEY)).toBeNull();
   });
@@ -76,7 +76,7 @@ describe("RoiStoreAuth token cache", () => {
   it("treats a token inside the expiry margin as unusable", () => {
     // Not yet expired, but too close to risk starting a save with it.
     seed(validToken({ expiresAt: Date.now() + EXPIRY_MARGIN_MS - 1000 }));
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     expect(auth.signedIn).toBe(false);
   });
 
@@ -89,14 +89,14 @@ describe("RoiStoreAuth token cache", () => {
     ]) {
       localStorage.clear();
       seed(bad);
-      const auth = new RoiStoreAuth();
+      const auth = new GoogleRoiStoreAuth();
       expect(auth.signedIn).toBe(false);
     }
   });
 
   it("signOut clears storage and notifies", () => {
     seed(validToken());
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     let notified = 0;
     auth.changed.add(() => {
       ++notified;
@@ -109,7 +109,7 @@ describe("RoiStoreAuth token cache", () => {
   });
 
   it("signOut on an already signed-out instance does not notify", () => {
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     let notified = 0;
     auth.changed.add(() => {
       ++notified;
@@ -121,7 +121,7 @@ describe("RoiStoreAuth token cache", () => {
   it("invalidate drops a token the server has rejected", () => {
     // Expiry alone cannot catch revocation or a lost bucket grant.
     seed(validToken());
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     expect(auth.signedIn).toBe(true);
     auth.invalidate();
     expect(auth.signedIn).toBe(false);
@@ -133,14 +133,14 @@ describe("RoiStoreAuth token cache", () => {
     // matters is that the failed attempt is retired: a memoised in-flight
     // promise that is never cleared would leave every later call awaiting a
     // dead sign-in with no way to recover.
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     await expect(auth.getAccessToken()).rejects.toThrow(/not configured/);
     await expect(auth.getAccessToken()).rejects.toThrow(/not configured/);
     await expect(auth.signIn()).rejects.toThrow(/not configured/);
   });
 });
 
-describe("RoiStoreAuth expiry", () => {
+describe("GoogleRoiStoreAuth expiry", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.useFakeTimers();
@@ -154,7 +154,7 @@ describe("RoiStoreAuth expiry", () => {
     // Otherwise expiry is silent: `signedIn` flips but the chip keeps showing
     // an identity that no longer works.
     seed(validToken({ expiresAt: Date.now() + EXPIRY_MARGIN_MS + 1000 }));
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     expect(auth.signedIn).toBe(true);
 
     let notified = 0;
@@ -175,7 +175,7 @@ describe("RoiStoreAuth expiry", () => {
 
   it("does not fire the expiry timer after signOut", () => {
     seed(validToken({ expiresAt: Date.now() + EXPIRY_MARGIN_MS + 1000 }));
-    const auth = new RoiStoreAuth();
+    const auth = new GoogleRoiStoreAuth();
     let notified = 0;
     auth.changed.add(() => {
       ++notified;

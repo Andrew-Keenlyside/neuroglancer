@@ -31,7 +31,13 @@
  * and the `getCredentialsWithStatus` status-bar UI — are reused directly.
  */
 
+import { getDefaultCredentialsManager } from "#src/credentials_provider/default_manager.js";
+import type {
+  CredentialsProvider,
+  CredentialsWithGeneration,
+} from "#src/credentials_provider/index.js";
 import { getCredentialsWithStatus } from "#src/credentials_provider/interactive_credentials_provider.js";
+import type { MiddleAuthToken } from "#src/kvstore/middleauth/credentials_provider.js";
 import { getRoiStoreConfig } from "#src/roi_store/config.js";
 import { raceWithAbort } from "#src/util/abort.js";
 import {
@@ -113,11 +119,31 @@ function writeStoredToken(token: StoredToken | undefined) {
 }
 
 /**
- * Holds the Google token used to write to the ROI group store.
+ * The identity used to write to the ROI group store.
  *
- * Reads are anonymous, so this is only consulted on save.
+ * Reads are anonymous, so this is only consulted on save (and on a listing that
+ * a private bucket refuses anonymously).  Two implementations back it — a
+ * Google OAuth2 token and a reused middleauth/CAVE token — behind one interface
+ * so the sign-in chip, the store client and the picker are provider-agnostic.
  */
-export class RoiStoreAuth {
+export interface RoiStoreAuth {
+  /** Fires whenever the signed-in identity changes. */
+  readonly changed: NullarySignal;
+  readonly signedIn: boolean;
+  /** A human label for the signed-in identity, if the provider exposes one. */
+  readonly email: string | undefined;
+  /** A token if one is already held; never prompts. */
+  readonly cachedAccessToken: string | undefined;
+  getAccessToken(signal?: AbortSignal): Promise<string>;
+  signIn(signal?: AbortSignal): Promise<void>;
+  signOut(): void;
+  invalidate(): void;
+}
+
+/**
+ * Holds the Google OAuth2 token used to write to the ROI group store.
+ */
+export class GoogleRoiStoreAuth implements RoiStoreAuth {
   /** Fires whenever the signed-in identity changes. */
   changed = new NullarySignal();
 
@@ -288,6 +314,11 @@ export class RoiStoreAuth {
     prompt?: "select_account",
   ): Promise<StoredToken> {
     const { clientId, scopes } = getRoiStoreConfig();
+    // The factory only constructs this class for the google provider, where
+    // clientId is required and validated in config.ts.
+    if (clientId === undefined) {
+      throw new Error("ROI store google provider has no client ID");
+    }
     const oauthToken = await getCredentialsWithStatus<OAuth2Token>(
       {
         description: "ROI group store",
@@ -307,15 +338,121 @@ export class RoiStoreAuth {
   }
 }
 
+/**
+ * Reuses neuroglancer's existing middleauth/CAVE login for the ROI store.
+ *
+ * Delegates to the shared `MiddleAuthCredentialsProvider` from the default
+ * credentials manager, so a user who has already signed in to reach a
+ * middleauth-protected data source (or to share state) is signed in here too,
+ * with no separate OAuth client.
+ *
+ * Constraints, both enforced by the deployment rather than here: the token is a
+ * CAVE bearer token, so `endpoint` must accept it (not raw GCS); and the login
+ * popup receives its response from the CAVE server's page via `window.opener`,
+ * which COOP severs, so this cannot complete in the pyodide build.
+ */
+export class MiddleAuthRoiStoreAuth implements RoiStoreAuth {
+  changed = new NullarySignal();
+
+  private provider: CredentialsProvider<MiddleAuthToken>;
+  private current: CredentialsWithGeneration<MiddleAuthToken> | undefined;
+  /** Creds to present as stale on the next get, to force a refresh. */
+  private invalidated: CredentialsWithGeneration<MiddleAuthToken> | undefined;
+  private pending: Promise<string> | undefined;
+
+  constructor(private authServer: string) {
+    this.provider =
+      getDefaultCredentialsManager().getCredentialsProvider<MiddleAuthToken>(
+        "middleauth",
+        authServer,
+      );
+  }
+
+  private get storageKey(): string {
+    // Mirrors the key the middleauth provider persists under, so `signedIn`
+    // can be answered synchronously without driving the provider.
+    return `auth_token_v2_${this.authServer}`;
+  }
+
+  get cachedAccessToken(): string | undefined {
+    if (this.current !== undefined) return this.current.credentials.accessToken;
+    try {
+      const raw = localStorage.getItem(this.storageKey);
+      if (raw === null) return undefined;
+      const parsed = JSON.parse(raw);
+      return typeof parsed?.accessToken === "string"
+        ? parsed.accessToken
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  get signedIn(): boolean {
+    return this.cachedAccessToken !== undefined;
+  }
+
+  // Middleauth tokens carry no email; the chip falls back to a generic label.
+  get email(): string | undefined {
+    return undefined;
+  }
+
+  async getAccessToken(signal?: AbortSignal): Promise<string> {
+    const cached = this.cachedAccessToken;
+    if (cached !== undefined && this.invalidated === undefined) return cached;
+    if (this.pending === undefined) {
+      const invalid = this.invalidated;
+      this.invalidated = undefined;
+      this.pending = this.provider
+        .get(invalid, signal ? { signal } : undefined)
+        .then((result) => {
+          this.current = result;
+          this.changed.dispatch();
+          return result.credentials.accessToken;
+        })
+        .finally(() => {
+          this.pending = undefined;
+        });
+    }
+    return raceWithAbort(this.pending, signal);
+  }
+
+  async signIn(signal?: AbortSignal): Promise<void> {
+    this.signOut();
+    await this.getAccessToken(signal);
+  }
+
+  signOut(): void {
+    this.invalidated = this.current;
+    this.current = undefined;
+    try {
+      // Clear the persisted token so a reload does not resurrect the identity.
+      localStorage.removeItem(this.storageKey);
+    } catch {
+      // Not fatal.
+    }
+    this.changed.dispatch();
+  }
+
+  invalidate(): void {
+    this.signOut();
+  }
+}
+
 let singleton: RoiStoreAuth | undefined;
 
 /**
- * The process-wide ROI store identity.  A singleton so that the sign-in chip
- * and every save action share one token and one popup.
+ * The process-wide ROI store identity, per the configured provider.  A
+ * singleton so the sign-in chip and every save action share one token and one
+ * popup.
  */
 export function getRoiStoreAuth(): RoiStoreAuth {
   if (singleton === undefined) {
-    singleton = new RoiStoreAuth();
+    const config = getRoiStoreConfig();
+    singleton =
+      config.provider === "middleauth"
+        ? new MiddleAuthRoiStoreAuth(config.authServer!)
+        : new GoogleRoiStoreAuth();
   }
   return singleton;
 }
