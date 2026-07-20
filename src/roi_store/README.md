@@ -180,17 +180,34 @@ EOF
 gcloud storage buckets update gs://my-roi-groups --cors-file=cors.json
 ```
 
-## Firebase hosting
+## Deploying
 
-`firebase.json` defines an `ng-pyodide` target, but `.firebaserc` has no
-mapping for it, so `firebase deploy --only hosting:ng-pyodide` fails. Create the
-site and map it once:
+`.firebaserc` already maps the `ng-pyodide` hosting target to a site named
+`ng-pyodide` under project `em-270621`. That site does not exist yet — create it
+once, then deploy:
 
 ```sh
-firebase target:apply hosting ng-pyodide <site-name>
+# One-time: create the hosting site the target maps to.
+firebase hosting:sites:create ng-pyodide --project em-270621
+
+# Stop any dev_server holding dist/pyodide as its CWD first (it makes the
+# build's clean step fail with EBUSY on Windows).
+
+# Build the pyodide bundle with the ROI store define and the zarr-vectors
+# packages bundled in, then publish.
+NEUROGLANCER_PYODIDE_PACKAGES="/path/to/zarr-vectors-py/zarr_vectors,/path/to/zarr-vectors-tools/zarr_vectors_tools" \
+  node build_tools/build_pyodide.ts \
+    --define 'ROI_STORE={"bucket":"hip_ct_zarr_vector_03987646472fethdsvdvdfg","provider":"middleauth","authServer":"https://global.daf-apis.com"}'
+firebase deploy --only hosting:ng-pyodide --project em-270621
 ```
 
-then commit the resulting `.firebaserc` change.
+The `dist/client` build (target `ng-zarr-vectors`) already carries the ROI store
+config from `rspack.config.ts`, so it deploys with `npm run build && firebase
+deploy --only hosting:ng-zarr-vectors --project em-270621`.
+
+Note the middleauth constraints above: browse/load work anonymously on both
+targets; save works only in `dist/client` and only once `endpoint` points at a
+middleauth-fronted store.
 
 ## Layout
 
