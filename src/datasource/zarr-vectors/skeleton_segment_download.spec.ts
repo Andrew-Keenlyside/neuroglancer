@@ -21,6 +21,7 @@ import {
   filterChunkByFragments,
   type OrderedManifestBlock,
 } from "#src/datasource/zarr-vectors/skeleton_segment_download.js";
+import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -213,6 +214,18 @@ function makeKvStore(map: Record<string, Uint8Array | undefined>) {
     encoded.set(cellPath, blob === undefined ? undefined : vlenChunk(blob));
   }
   return async (path: string) => encoded.get(path);
+}
+
+/** Adapt the subpath store into the `cellRead` contract for the per-chunk
+ * geometry arrays (`<array>/c/<i/j/k>`); zero-origin, unsharded fixtures. */
+function cellReadFrom(
+  read: (
+    subpath: string,
+    signal: AbortSignal,
+  ) => Promise<Uint8Array | undefined>,
+): CellReader {
+  return (arrayPath: string, chunkKey: string, signal: AbortSignal) =>
+    read(`${arrayPath}/c/${chunkKey.split(".").join("/")}`, signal);
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +436,7 @@ describe("downloadSegmentSkeleton", () => {
           sidNdim: rank,
           kvStoreRead,
         },
+        cellRead: cellReadFrom(kvStoreRead),
         rank,
         linkDtype: "int64",
         attributeNames,
@@ -491,6 +505,7 @@ describe("downloadSegmentSkeleton", () => {
           sidNdim: rank,
           kvStoreRead,
         },
+        cellRead: cellReadFrom(kvStoreRead),
         rank,
         linkDtype: "int64",
         attributeNames,
@@ -526,6 +541,7 @@ describe("downloadSegmentSkeleton", () => {
           sidNdim: rank,
           kvStoreRead,
         },
+        cellRead: cellReadFrom(kvStoreRead),
         rank,
         linkDtype: "int64",
         attributeNames,
@@ -577,6 +593,7 @@ describe("downloadSegmentSkeleton", () => {
           sidNdim: rank,
           kvStoreRead,
         },
+        cellRead: cellReadFrom(kvStoreRead),
         rank,
         linkDtype: "int64",
         attributeNames,
@@ -603,6 +620,7 @@ describe("downloadSegmentSkeleton", () => {
           sidNdim: rank,
           kvStoreRead,
         },
+        cellRead: cellReadFrom(kvStoreRead),
         rank,
         linkDtype: "int64",
         attributeNames,

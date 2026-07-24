@@ -45,14 +45,16 @@ ROI_STORE = {
 }
 ```
 
-Two constraints make `middleauth` a `dist/client`-only option:
+One constraint applies to `middleauth`:
 
 - The token is a **CAVE bearer token**, not a Google one, so `endpoint` must be
   a server that accepts it — not raw `storage.googleapis.com`.
-- The login popup gets its response from the CAVE server's own page via
-  `window.opener`, which **COOP severs**, so it cannot complete under
-  `ng-pyodide`. (We can only broadcast past COOP from a page we control, which
-  the CAVE server's is not.)
+
+The login popup gets its response from the CAVE server's own page via
+`window.opener`, which **COOP:same-origin severs**. `ng-pyodide` therefore
+deliberately does **not** set COOP/COEP (the runtime is single-threaded, so
+cross-origin isolation buys nothing — see `firebase.json`), and middleauth
+completes there just as it does in `dist/client`.
 
 `eager: true` signs in at viewer start rather than lazily on first save — the
 "authenticate on the wasm before adding the url" path — so a bucket that denies
@@ -208,6 +210,13 @@ deploy --only hosting:ng-zarr-vectors --project em-270621`.
 Note the middleauth constraints above: browse/load work anonymously on both
 targets; save works only in `dist/client` and only once `endpoint` points at a
 middleauth-fronted store.
+
+`firebase.json` gives `ng-pyodide` a `** → /index.html` rewrite so that
+share/continue links — which live under the `/v/pyodide/` path the app assigns
+itself at boot — load the app shell instead of 404ing. Those links carry the
+full viewer state including the ROI filter groups (positions, not the passing-ID
+set) in the `#!{…}` hash; see
+`python/examples/pyodide/README.md` → "Sharing a filter session via URL".
 
 ## Layout
 

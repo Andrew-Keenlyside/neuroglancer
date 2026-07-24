@@ -53,6 +53,7 @@ _SKELETON_RE = re.compile(
     r"^/neuroglancer/skeleton/(?P<key>[^/?]+)/(?P<object_id>[0-9]+)"
 )
 _ROI_FILTER_RE = re.compile(r"^/neuroglancer/roi_filter/(?P<scope>[^/?]+)")
+_EXPORT_RE = re.compile(r"^/neuroglancer/export/tract/(?P<token>[^/?]+)")
 _ACTION_RE = re.compile(r"^/action/(?P<viewer_token>[^/?]+)")
 _VOLUME_INFO_RESP_RE = re.compile(
     r"^/volume_response/(?P<viewer_token>[^/]+)/(?P<request_id>[^/]+)/info"
@@ -92,6 +93,23 @@ class BrowserViewerServer:
         # via pyodide.globals.get("pyodide_handle_request").  Writing to
         # js.globalThis from Python is unreliable for this direction.
         __main__.pyodide_handle_request = self._handle_request_proxy
+
+        # A SEPARATE entrypoint for tract export, invoked from JS via
+        # `callPromising` so a JSPI suspender is in scope. That suspender is
+        # what lets the async read and the synchronous zarr writer run to
+        # completion; the ordinary `pyodide_handle_request` above must stay a
+        # plain synchronous call (see the long note at its call site in
+        # pyodide_worker.ts). The JS side serialises every `callPromising` entry
+        # under a mutex, the proven guard against the concurrent-JSPI deadlock.
+        self._handle_export_proxy = create_proxy(self._js_handle_export)
+        __main__.pyodide_handle_export = self._handle_export_proxy
+
+        # A non-JSPI variant, awaited on the WebLoop where the runtime lacks
+        # WebAssembly stack switching. It handles TRK (async read + pure write);
+        # ZVF still needs JSPI (zarr's synchronous writer) and errors clearly.
+        self._handle_export_async_proxy = create_proxy(self._js_handle_export_async)
+        __main__.pyodide_handle_export_async = self._handle_export_async_proxy
+
         js.globalThis.pyodide_server_ready = True
 
     def _js_handle_request(self, url: str, method: str, body_js) -> dict:
@@ -111,19 +129,7 @@ class BrowserViewerServer:
         dict with keys ``status`` (int), ``contentType`` (str), ``body`` (bytes).
         """
         try:
-            # Pyodide <=0.27 converted JS `null` to Python `None`; newer
-            # versions hand over a `JsNull` sentinel instead, so that `null`
-            # and `undefined` stay distinguishable. `JsNull` is not `None` and
-            # has no `to_py`, so test for convertibility rather than identity.
-            if body_js is None:
-                body_bytes = b""
-            elif isinstance(body_js, bytes | bytearray | memoryview):
-                body_bytes = bytes(body_js)
-            elif not hasattr(body_js, "to_py"):
-                body_bytes = b""
-            else:
-                converted = body_js.to_py()
-                body_bytes = b"" if converted is None else bytes(converted)
+            body_bytes = self._body_to_bytes(body_js)
             status, content_type, response_body = self._route_request(
                 url, method, body_bytes
             )
@@ -134,13 +140,124 @@ class BrowserViewerServer:
             print(f"[browser_server] ERROR handling {method} {url}:\n{tb}")
             status, content_type, response_body = 500, "text/plain", tb.encode()
 
+        return self._js_response(status, content_type, response_body)
+
+    @staticmethod
+    def _body_to_bytes(body_js) -> bytes:
+        # Pyodide <=0.27 converted JS `null` to Python `None`; newer versions
+        # hand over a `JsNull` sentinel instead, so that `null` and `undefined`
+        # stay distinguishable. `JsNull` is not `None` and has no `to_py`, so
+        # test for convertibility rather than identity.
+        if body_js is None:
+            return b""
+        if isinstance(body_js, bytes | bytearray | memoryview):
+            return bytes(body_js)
+        if not hasattr(body_js, "to_py"):
+            return b""
+        converted = body_js.to_py()
+        return b"" if converted is None else bytes(converted)
+
+    @staticmethod
+    def _js_response(status: int, content_type: str, body: bytes):
         import js as _js
 
         result = _js.Object.new()
         result.status = status
         result.contentType = content_type
-        result.body = response_body
+        result.body = body
         return result
+
+    def _js_handle_export(self, url: str, method: str, body_js):
+        """Called from JS via ``callPromising`` for ``/neuroglancer/export/``.
+
+        A synchronous entry, but invoked with a JSPI suspender in scope, so it
+        can drive the *async* exporter to completion with
+        :func:`pyodide.ffi.run_sync`. The async read (``read_async``) never
+        touches zarr's ``sync()``; only the ``.zvf`` writer does, and the
+        suspender is what lets that run. The JS caller holds a mutex so only one
+        such entry is ever live -- the proven guard against the concurrent-JSPI
+        deadlock.
+        """
+        try:
+            body_bytes = self._body_to_bytes(body_js)
+            status, content_type, response_body = self._route_export(
+                url, method, body_bytes
+            )
+        except BaseException:
+            import traceback
+
+            tb = traceback.format_exc()
+            print(f"[browser_server] ERROR exporting {method} {url}:\n{tb}")
+            status, content_type, response_body = 500, "text/plain", tb.encode()
+
+        return self._js_response(status, content_type, response_body)
+
+    def _route_export(
+        self, url: str, method: str, body: bytes
+    ) -> tuple[int, str, bytes]:
+        from urllib.parse import urlparse
+
+        path = urlparse(url).path
+        m = _EXPORT_RE.match(path)
+        if not m or method != "POST":
+            return 404, "text/plain", b"no such export route"
+
+        from pyodide.ffi import run_sync  # type: ignore[import]
+
+        # run_sync drives the coroutine to completion, suspending the WASM stack
+        # (via the caller's JSPI suspender) for each awaited fetch and for the
+        # synchronous zarr write inside it.
+        return run_sync(self._handle_export_async(body))
+
+    async def _js_handle_export_async(self, url: str, method: str, body_js):
+        """Async export entry (no JSPI), awaited on the WebLoop by the worker.
+
+        Used where WebAssembly stack switching is unavailable. Handles TRK,
+        whose read is async and whose write is pure Python; ZVF reaches zarr's
+        synchronous writer, which needs JSPI, so :func:`export_async` returns a
+        clear error there.
+        """
+        try:
+            body_bytes = self._body_to_bytes(body_js)
+            from urllib.parse import urlparse
+
+            path = urlparse(url).path
+            m = _EXPORT_RE.match(path)
+            if not m or method != "POST":
+                status, content_type, response_body = (
+                    404,
+                    "text/plain",
+                    b"no such export route",
+                )
+            else:
+                status, content_type, response_body = await self._handle_export_async(
+                    body_bytes
+                )
+        except BaseException:
+            import traceback
+
+            tb = traceback.format_exc()
+            print(f"[browser_server] ERROR exporting {method} {url}:\n{tb}")
+            status, content_type, response_body = 500, "text/plain", tb.encode()
+
+        return self._js_response(status, content_type, response_body)
+
+    async def _handle_export_async(self, body: bytes) -> tuple[int, str, bytes]:
+        import json
+
+        from .tract_export.browser import export_async
+        from .tract_export.job import JobSpecError, parse_job
+        from .tract_export.run import ExportRunError
+
+        try:
+            job = parse_job(json.loads(body.decode("utf-8")))
+        except (JobSpecError, ValueError) as e:
+            return 400, "text/plain", str(e).encode()
+        try:
+            data, content_type, _summary = await export_async(job)
+        except ExportRunError as e:
+            return 400, "text/plain", str(e).encode()
+        return 200, content_type, data
 
     # ------------------------------------------------------------------
     # Routing

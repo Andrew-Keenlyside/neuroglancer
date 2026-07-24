@@ -221,6 +221,34 @@ export class RoiGroupStore {
     roiGroupStoreChanged.dispatch();
   }
 
+  /**
+   * Uploads an arbitrary export artifact (a `.trk`, or a zipped `.zvf`) to the
+   * bucket, under whatever `name` the caller chooses.
+   *
+   * Distinct from `save`: that writes a JSON *group document* under the
+   * `roi-groups/` prefix that the pickers list; this writes opaque file bytes
+   * (conventionally under an `exports/` prefix) and does NOT dispatch
+   * `roiGroupStoreChanged`, so it never disturbs the group listings. Reuses the
+   * same token machinery, so the sign-in prompt appears only when the user
+   * chooses "Save to GCS".
+   */
+  async putObject(
+    name: string,
+    data: Blob | ArrayBuffer,
+    contentType: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const url = new URL(this.uploadApiUrl);
+    url.searchParams.set("uploadType", "media");
+    url.searchParams.set("name", name);
+    await this.fetchWithToken(
+      url.toString(),
+      { method: "POST", body: data, headers: { "Content-Type": contentType } },
+      signal,
+    );
+    return name;
+  }
+
   /** Deletes a saved group.  Requires delete access to the bucket. */
   async delete(id: string, signal?: AbortSignal): Promise<void> {
     await this.fetchWithToken(

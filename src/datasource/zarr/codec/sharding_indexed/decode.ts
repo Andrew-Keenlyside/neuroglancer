@@ -90,7 +90,7 @@ function makeIndexCache<BaseKey>(
   });
 }
 
-class ShardedKvStore<BaseKey>
+export class ShardedKvStore<BaseKey>
   extends RefCounted
   implements ReadableKvStore<{ base: BaseKey; subChunk: number[] }>
 {

@@ -30,14 +30,77 @@
 
 import type { FragmentIndex } from "#src/datasource/zarr-vectors/fragment_index.js";
 import type {
+  LabelSampler,
   Roi,
   RoiGroupConfig,
+  RoiObjectAttrColumn,
   StreamlineRef,
 } from "#src/datasource/zarr-vectors/roi.js";
 import {
   combineRoiVerdicts,
   streamlinePassesRoi,
 } from "#src/datasource/zarr-vectors/roi.js";
+import { packColor } from "#src/util/color.js";
+import { vec4 } from "#src/util/geom.js";
+
+/** JS mirror of the GLSL `colormapJet` in `src/webgl/colormaps.ts`, so a tract's
+ * CPU-packed colour-by-attribute colour matches the shader's colourmap. */
+function colormapJet(x: number): [number, number, number] {
+  const clamp = (v: number) => Math.min(1, Math.max(0, v));
+  const r = x < 0.89 ? (x - 0.35) / 0.31 : 1.0 - ((x - 0.89) / 0.11) * 0.5;
+  const g = x < 0.64 ? (x - 0.125) * 4.0 : 1.0 - (x - 0.64) / 0.27;
+  const b = x < 0.34 ? 0.5 + (x * 0.5) / 0.11 : 1.0 - (x - 0.34) / 0.31;
+  return [clamp(r), clamp(g), clamp(b)];
+}
+
+/** One attribute's id→value lookup plus its data bounds (for normalisation). */
+interface AttrLookup {
+  readonly map: ReadonlyMap<bigint, number>;
+  readonly min: number;
+  readonly max: number;
+}
+
+/**
+ * Build id→value lookups for exactly the per-object attributes the visible
+ * groups reference (via a length range or an `objectAttr` colour), once per
+ * recompute. Attributes not yet loaded are simply absent, and the caller
+ * degrades gracefully (no length narrowing / falls back to the group colour).
+ */
+function buildAttrLookups(
+  groups: readonly RoiGroupConfig[],
+  attrColumns: ReadonlyMap<string, RoiObjectAttrColumn> | undefined,
+): Map<string, AttrLookup> {
+  const lookups = new Map<string, AttrLookup>();
+  if (attrColumns === undefined) return lookups;
+  const need = new Set<string>();
+  for (const g of groups) {
+    if (!g.visible) continue;
+    if (g.lengthRange !== undefined) need.add(g.lengthRange.name);
+    if (g.colorBy?.kind === "objectAttr") need.add(g.colorBy.name);
+  }
+  for (const name of need) {
+    const col = attrColumns.get(name);
+    if (col === undefined) continue;
+    const map = new Map<bigint, number>();
+    const n = Math.min(col.ids.length, col.values.length);
+    for (let i = 0; i < n; ++i) map.set(col.ids[i], col.values[i]);
+    lookups.set(name, { map, min: col.min, max: col.max });
+  }
+  return lookups;
+}
+
+/** Pack `colormapJet(normalise(value))` at the given alpha byte, as the shared
+ * `roiSegmentColors` map (id→packed RGBA) expects. */
+function packAttrColor(
+  value: number,
+  min: number,
+  max: number,
+  alpha255: number,
+): number {
+  const t = max > min ? (value - min) / (max - min) : 0;
+  const [r, g, b] = colormapJet(t);
+  return packColor(vec4.fromValues(r, g, b, alpha255 / 255));
+}
 
 /** The subset of a decoded `SkeletonChunk` the ROI test reads. */
 export interface RoiFilterableChunk {
@@ -73,6 +136,7 @@ function segmentIdOf(segmentIds: Uint32Array, v: number): bigint {
 export function computeChunkCrossings(
   chunk: RoiFilterableChunk,
   rois: readonly Roi[],
+  sampleLabel?: LabelSampler,
 ): Map<bigint, boolean[]> {
   const result = new Map<bigint, boolean[]>();
   const { segmentIds, fragmentIndex, positions, rank } = chunk;
@@ -112,7 +176,9 @@ export function computeChunkCrossings(
     }
     for (let i = 0; i < rois.length; ++i) {
       if (crossed[i]) continue; // already crossed by an earlier fragment
-      if (streamlinePassesRoi(ref, rois[i].shape, rois[i].predicate)) {
+      if (
+        streamlinePassesRoi(ref, rois[i].shape, rois[i].predicate, sampleLabel)
+      ) {
         crossed[i] = true;
       }
     }
@@ -210,11 +276,12 @@ export class RoiFilterAccumulator {
 export function computePassingSet(
   chunks: Iterable<RoiFilterableChunk>,
   rois: readonly Roi[],
+  sampleLabel?: LabelSampler,
 ): Set<bigint> {
   const accumulator = new RoiFilterAccumulator(rois);
   if (rois.length !== 0) {
     for (const chunk of chunks) {
-      accumulator.addChunk(computeChunkCrossings(chunk, rois));
+      accumulator.addChunk(computeChunkCrossings(chunk, rois, sampleLabel));
     }
   }
   return new Set(accumulator.passingSet);
@@ -257,6 +324,8 @@ export function computeGroupedPassingSet(
   chunks: Iterable<RoiFilterableChunk>,
   groups: readonly RoiGroupConfig[],
   highDetailBudget?: number,
+  attrColumns?: ReadonlyMap<string, RoiObjectAttrColumn>,
+  sampleLabel?: LabelSampler,
 ): {
   passing: Set<bigint>;
   colorById: Map<bigint, number>;
@@ -270,13 +339,50 @@ export function computeGroupedPassingSet(
   // The chunk iterable may be single-use (a generator); materialise it once so
   // every group sees the same batch.
   const chunkArray = Array.isArray(chunks) ? chunks : [...chunks];
+  const lookups = buildAttrLookups(groups, attrColumns);
   for (const group of groups) {
     if (!group.visible || group.rois.length === 0) continue;
-    for (const id of computePassingSet(chunkArray, group.rois)) {
+    const colorBy = group.colorBy ?? { kind: "group" };
+    // Per-vertex colouring (direction/position/vertex attribute) varies along
+    // the tract, so the group writes NO colour override and the shader colours
+    // it per vertex. Flat kinds (group / object attribute) write an override.
+    const perVertex =
+      colorBy.kind === "direction" ||
+      colorBy.kind === "position" ||
+      colorBy.kind === "vertexAttr";
+    const colorLookup =
+      colorBy.kind === "objectAttr" ? lookups.get(colorBy.name) : undefined;
+    // Group opacity rides the packed colour's alpha byte; reuse it for the
+    // object-attribute colourmap so the two colouring modes share one opacity.
+    const alpha255 = (group.colorPacked >>> 24) & 0xff;
+    const range = group.lengthRange;
+    const rangeLookup =
+      range !== undefined ? lookups.get(range.name) : undefined;
+    for (const id of computePassingSet(chunkArray, group.rois, sampleLabel)) {
+      // Length filter narrows the ROI passing set. A missing value (attribute
+      // not yet loaded) is left in rather than dropped, so a group never blinks
+      // out while its per-object values are still arriving.
+      if (range !== undefined && rangeLookup !== undefined) {
+        const v = rangeLookup.map.get(id);
+        if (v !== undefined && (v < range.min || v > range.max)) continue;
+      }
+      const firstClaim = !passing.has(id);
       passing.add(id);
-      // First group in list order wins the colour (topmost, deterministic).
-      if (!colorById.has(id)) colorById.set(id, group.colorPacked);
       if (group.highDetail) highDetail.add(id);
+      // First group in list order owns the colour (topmost, deterministic).
+      if (!firstClaim || perVertex) continue;
+      if (colorLookup !== undefined) {
+        const v = colorLookup.map.get(id);
+        if (v !== undefined) {
+          colorById.set(
+            id,
+            packAttrColor(v, colorLookup.min, colorLookup.max, alpha255),
+          );
+          continue;
+        }
+      }
+      // "group" colour, or "objectAttr" fallback when the value is missing.
+      colorById.set(id, group.colorPacked);
     }
   }
   return {
@@ -284,6 +390,53 @@ export function computeGroupedPassingSet(
     colorById,
     highDetail: selectHighDetail(passing, highDetail, highDetailBudget),
   };
+}
+
+/**
+ * Per group, the set of object ids that pass that group's dissection over
+ * `chunks` -- the same include/or/exclude fold and length narrowing
+ * {@link computeGroupedPassingSet} applies, but kept SEPARATE per group rather
+ * than merged into a union.
+ *
+ * This is what the tract export needs: the export tab lets the user tick
+ * individual groups and reports a per-group count, so it cannot use the shared
+ * union passing set (which discards which group each id came from). The result
+ * is positional -- `result[i]` corresponds to `groups[i]` -- because group names
+ * are not unique (see the note in `tract_export/run.py`).
+ *
+ * Unlike {@link computeGroupedPassingSet} this does NOT skip invisible groups:
+ * the caller passes exactly the groups it wants evaluated (the export selection),
+ * and visibility is a rendering concern, not an export one. Groups with no ROIs
+ * yield an empty set.
+ */
+export function computePerGroupPassingSets(
+  chunks: Iterable<RoiFilterableChunk>,
+  groups: readonly RoiGroupConfig[],
+  attrColumns?: ReadonlyMap<string, RoiObjectAttrColumn>,
+  sampleLabel?: LabelSampler,
+): Set<bigint>[] {
+  // Materialise once so every group sees the same batch (the iterable may be a
+  // single-use generator).
+  const chunkArray = Array.isArray(chunks) ? chunks : [...chunks];
+  const lookups = buildAttrLookups(groups, attrColumns);
+  return groups.map((group) => {
+    const out = new Set<bigint>();
+    if (group.rois.length === 0) return out;
+    const range = group.lengthRange;
+    const rangeLookup =
+      range !== undefined ? lookups.get(range.name) : undefined;
+    for (const id of computePassingSet(chunkArray, group.rois, sampleLabel)) {
+      // Length filter narrows the ROI passing set, exactly as the union path
+      // does. A missing value (attribute not yet loaded) is left in rather than
+      // dropped, matching computeGroupedPassingSet.
+      if (range !== undefined && rangeLookup !== undefined) {
+        const v = rangeLookup.map.get(id);
+        if (v !== undefined && (v < range.min || v > range.max)) continue;
+      }
+      out.add(id);
+    }
+    return out;
+  });
 }
 
 /**

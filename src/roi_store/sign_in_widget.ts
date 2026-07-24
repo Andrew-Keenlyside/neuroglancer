@@ -50,8 +50,12 @@ export class RoiStoreSignInWidget extends RefCounted {
           title: "Sign in to save ROI groups to the shared store",
           onClick: () => {
             // getCredentialsWithStatus drives its own status-bar UI, including
-            // the failure message and retry button, so nothing to show here.
-            this.auth.signIn().catch(() => {});
+            // the failure message and retry button. Still log: if signIn throws
+            // before reaching that UI (e.g. no credentials provider, or a
+            // blocked popup) the click would otherwise look like a no-op.
+            this.auth.signIn().catch((e) => {
+              console.error("[roi-store] sign-in failed:", e);
+            });
           },
         }),
       );

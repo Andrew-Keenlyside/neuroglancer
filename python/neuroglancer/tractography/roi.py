@@ -43,6 +43,7 @@ __all__ = [
     "Ellipsoid",
     "Box",
     "Halfspace",
+    "LabelMask",
     "RoiShape",
     "RoiPredicate",
     "RoiOperator",
@@ -84,7 +85,29 @@ class Halfspace(NamedTuple):
     normal: np.ndarray
 
 
-RoiShape = Ellipsoid | Box | Halfspace
+class LabelMask(NamedTuple):
+    """A region defined by anatomical labels in a linked parcellation volume.
+
+    A streamline passes it when a vertex falls in a voxel whose label is one of
+    ``labels``. Unlike the geometric primitives this has no closed form: it is
+    evaluated by sampling a dense label grid, which the browser does in the
+    worker. The Python exporter never *folds* one -- the viewer always ships the
+    on-screen selection as ``objectIds`` for a label dissection -- so this carries
+    provenance only; folding one raises (see ``_vertices_inside``).
+    """
+
+    labels: tuple[int, ...]
+
+
+RoiShape = Ellipsoid | Box | Halfspace | LabelMask
+
+
+def _label_mask_unfoldable() -> np.ndarray:
+    raise NotImplementedError(
+        "label-mask ROIs cannot be folded in Python: they need the parcellation "
+        "volume the browser samples. Export a label dissection via the viewer, "
+        "which ships the on-screen selection as objectIds."
+    )
 
 
 class RoiPredicate(enum.IntEnum):
@@ -154,6 +177,8 @@ def _vertices_inside(shape: RoiShape, points: np.ndarray) -> np.ndarray:
         origin = np.asarray(shape.origin, dtype=np.float64)
         normal = np.asarray(shape.normal, dtype=np.float64)
         return np.sum(normal * (points - origin), axis=-1) >= 0.0
+    if isinstance(shape, LabelMask):
+        return _label_mask_unfoldable()
     raise TypeError(f"unsupported ROI shape: {shape!r}")
 
 
@@ -210,6 +235,9 @@ def _segments_intersect(shape: RoiShape, a: np.ndarray, b: np.ndarray) -> np.nda
     if isinstance(shape, Halfspace):
         # Convex and unbounded: the segment touches it iff either endpoint does.
         return _vertices_inside(shape, a) | _vertices_inside(shape, b)
+
+    if isinstance(shape, LabelMask):
+        return _label_mask_unfoldable()
 
     raise TypeError(f"unsupported ROI shape: {shape!r}")
 

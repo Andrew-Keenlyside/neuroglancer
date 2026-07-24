@@ -38,7 +38,13 @@ import {
   LocalDataSource,
   localEquivalencesUrl,
 } from "#src/datasource/local.js";
-import type { RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
+import type {
+  RoiBackgroundUniforms,
+  RoiGroupConfig,
+  RoiLabelField,
+  RoiObjectAttrColumn,
+} from "#src/datasource/zarr-vectors/roi.js";
+import { buildRoiLabelField } from "#src/datasource/zarr-vectors/label_field.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import { StreamlineFilterTab } from "#src/datasource/zarr-vectors/streamline_filter_tab.js";
 import { StreamlineGuideTab } from "#src/datasource/zarr-vectors/streamline_guide_tab.js";
@@ -50,6 +56,7 @@ import type {
   UserLayerSelectionState,
 } from "#src/layer/index.js";
 import {
+  LayerReference,
   LinkedLayerGroup,
   registerLayerType,
   registerLayerTypeDetector,
@@ -138,6 +145,8 @@ import {
   PerspectiveViewSkeletonLayer,
   SkeletonLayer,
   SkeletonRenderingOptions,
+  type SkeletonSource,
+  DEFAULT_FRAGMENT_MAIN,
   SliceViewPanelSkeletonLayer,
   PerspectiveViewSpatiallyIndexedSkeletonLayer,
   SliceViewPanelSpatiallyIndexedSkeletonLayer,
@@ -708,7 +717,9 @@ function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
   // the coarse pass-1 bulk (which pass-1 no longer hides once inactive),
   // double-drawing them.
   const active = roiFilter.active && roiFilter.hasVisibleRois();
-  return roiFilter.groups.map((g) => ({
+  // Include the live label-selection preview (if any) so a staged, not-yet-
+  // committed selection ghosts/colours streamlines exactly like a real group.
+  return roiFilter.groupsForWorker().map((g) => ({
     rois: g.rois,
     // Pack RGBA: rgb = group colour, a = group opacity. The colour-by-group RGB
     // override and the per-group "on" opacity both ride this single value.
@@ -717,7 +728,38 @@ function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
     ),
     visible: g.visible,
     highDetail: g.highDetail && active,
+    // Per-group unified colour-by + length filter (both settable like opacity).
+    colorBy: g.colorBy,
+    ...(g.lengthFilter !== undefined ? { lengthRange: g.lengthFilter } : {}),
   }));
+}
+
+/**
+ * Snapshot the loaded per-object numeric attributes as worker-shippable columns,
+ * keyed by attribute name. Values are copied to a `Float32Array`; `ids` come
+ * straight from the shared (read-only) inline id array.
+ *
+ * ID-space caveat: these are the segment-property map's ids. For a store with
+ * `object_index_convention: "identity"` they equal the streamline segment ids
+ * the passing set uses; a `"standard"` store would need re-keying through
+ * `object_attributes/segment_id` first (a known follow-up — verify per dataset).
+ */
+function buildObjectAttrColumns(
+  map: PreprocessedSegmentPropertyMap | undefined,
+): Map<string, RoiObjectAttrColumn> {
+  const columns = new Map<string, RoiObjectAttrColumn>();
+  const inline = map?.segmentPropertyMap.inlineProperties;
+  if (map === undefined || inline === undefined) return columns;
+  const ids = inline.ids;
+  for (const p of map.numericalProperties) {
+    columns.set(p.id, {
+      ids,
+      values: Float32Array.from(p.values as ArrayLike<number>),
+      min: Number(p.bounds[0]),
+      max: Number(p.bounds[1]),
+    });
+  }
+  return columns;
 }
 
 // The ROI overlay annotation shader: colour each region by its per-annotation
@@ -797,7 +839,7 @@ const DEFAULT_ROI_HIGH_DETAIL_BUDGET = 50000;
  * important, and which one the user is actually looking at depends entirely on
  * whether they are inspecting a dissection or navigating the whole brain.
  */
-const DEFAULT_ROI_FULL_DETAIL_MEMORY_SHARE = 0.5;
+const DEFAULT_ROI_FULL_DETAIL_MEMORY_SHARE = 0.2;
 
 class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   constructor(public layer: SegmentationUserLayer) {
@@ -835,6 +877,17 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
           return userLayer.displayState.linkedSegmentationColorGroup;
         },
       ),
+    );
+
+    // A segmentation layer other than this one whose labels dissect the tracts.
+    this.roiLabelLayer = layer.registerDisposer(
+      new LayerReference(layer.manager.rootLayers.addRef(), (managed) => {
+        const userLayer = managed.layer;
+        return (
+          userLayer === null ||
+          (userLayer instanceof SegmentationUserLayer && userLayer !== layer)
+        );
+      }),
     );
 
     this.originalSegmentationGroupState = layer.registerDisposer(
@@ -922,6 +975,56 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
       ),
     );
 
+    // LUT colors: apply the colors declared by an `rgb` segment property map by
+    // overlaying the user's stated colors on top of the map's colors into a
+    // derived, non-serialized map. Both the CPU color lookup
+    // (`getBaseObjectColor`) and the GPU segmentation renderer read
+    // `effectiveSegmentStatedColors`. When the map declares no colors it falls
+    // through to the user's `segmentStatedColors` unchanged, so datasets without
+    // a color LUT behave exactly as before.
+    const self = this;
+    this.derivedSegmentStatedColors = this.layer.registerDisposer(
+      new Uint64Map(),
+    );
+    this.effectiveSegmentStatedColors = {
+      changed: this.effectiveSegmentStatedColorsChanged,
+      get value() {
+        return self.effectiveStatedColorsUsesLut
+          ? self.derivedSegmentStatedColors
+          : self.segmentStatedColors.value;
+      },
+    };
+    const recomputeEffectiveStatedColors = () => {
+      const propertyMap = this.segmentPropertyMap.value;
+      const colorProperty = propertyMap?.colors;
+      if (colorProperty === undefined) {
+        // No LUT colors: `effectiveSegmentStatedColors` mirrors the user map.
+        this.effectiveStatedColorsUsesLut = false;
+      } else {
+        const derived = this.derivedSegmentStatedColors;
+        derived.clear();
+        const { ids } = propertyMap!.segmentPropertyMap.inlineProperties!;
+        const { values } = colorProperty;
+        for (let i = 0, n = ids.length; i < n; ++i) {
+          const color = values[i];
+          if (color >= 0) derived.set(ids[i], BigInt(color));
+        }
+        // A user-set stated color for an id overrides the LUT color.
+        for (const [id, color] of this.segmentStatedColors.value) {
+          derived.set(id, color);
+        }
+        this.effectiveStatedColorsUsesLut = true;
+      }
+      this.effectiveSegmentStatedColorsChanged.dispatch();
+    };
+    this.layer.registerDisposer(
+      this.segmentPropertyMap.changed.add(recomputeEffectiveStatedColors),
+    );
+    this.layer.registerDisposer(
+      this.segmentStatedColors.changed.add(recomputeEffectiveStatedColors),
+    );
+    recomputeEffectiveStatedColors();
+
     this.spatialSkeletonGridResolutionTarget2d.changed.add(() =>
       this.applySpatialSkeletonResolutionTarget(
         "2d",
@@ -999,8 +1102,48 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   roiFilterActive?: WatchableValue<boolean>;
   roiGhostAlpha?: WatchableValue<number>;
   roiGroups?: WatchableValue<readonly RoiGroupConfig[]>;
+  /**
+   * Evaluate the given groups over the currently-resident chunks and return each
+   * group's passing object ids (WYSIWYG). Set once the tract render layer exists;
+   * the Export tab calls it to select streamlines by id rather than re-folding
+   * the whole level in the exporter. Positional: `result[i]` ↔ `groups[i]`.
+   */
+  computeRoiExportIds?: (
+    groups: readonly RoiGroupConfig[],
+  ) => Promise<bigint[][]>;
+  /**
+   * The pass-2 (object-keyed, high-detail) skeleton source. Its resident chunks
+   * hold whole tracts' geometry in frontend memory, which the Export tab reads
+   * directly for the fast in-browser TRK export (no store re-read). Present only
+   * once the tract layer's high-detail source is created.
+   */
+  roiHighDetailSkeletonSource?: SkeletonSource;
   roiSegmentColors?: Uint64Map;
   roiColorByGroup?: WatchableValue<boolean>;
+  /**
+   * Per-object numeric attribute columns (from the loaded segment-property map),
+   * shipped to the worker so a group's length filter and object-attribute colour
+   * can be evaluated. Keyed by attribute name; rebuilt when the property map
+   * changes. `undefined`/empty until such a map loads.
+   */
+  roiObjectAttrColumns?: WatchableValue<
+    ReadonlyMap<string, RoiObjectAttrColumn>
+  >;
+  /**
+   * Dense anatomical label grid built from {@link roiLabelLayer}, shipped to the
+   * worker so `labelMask` ROIs can be sampled per streamline vertex. Rebuilt when
+   * the linked parcellation changes or finishes loading; undefined when none is
+   * linked or it is still loading.
+   */
+  roiLabelField?: WatchableValue<RoiLabelField | undefined>;
+  /**
+   * Frontend-only per-object value map (id -> normalised attribute value, 16-bit
+   * packed) for the background length filter + flat colour-by-attribute shader
+   * tier, plus the resolved uniforms in {@link roiBackground}. Not sent to the
+   * worker (the shader reads it directly).
+   */
+  roiObjectValues?: Uint64Map;
+  roiBackground?: WatchableValue<RoiBackgroundUniforms | undefined>;
   /**
    * Shared set of object ids the pass-1 backend fills = union of visible +
    * high-detail groups' passing tracts. Drives the object-keyed pass-2 render
@@ -1216,6 +1359,18 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   /** Budget the ceiling was last computed against, so a toggle can reuse it. */
   private spatialSkeletonBudgetBytes: number | undefined;
 
+  /**
+   * Estimated fully-resident bytes per level, **finest-first** (index == the
+   * export level number, 0 = full resolution); `[]` when the store carries no
+   * per-level metadata. Reuses the estimate already computed for the streamline
+   * budget -- the Export tab uses it to grey out levels a browser export cannot
+   * afford.
+   */
+  roiExportLevelCostsBytes(): number[] {
+    const costs = this.spatialSkeletonLevelCostsBytes; // coarsest-first
+    return costs === undefined ? [] : costs.slice().reverse();
+  }
+
   private computeSpatialSkeletonBudgetLevel(
     budgetBytes: number | undefined,
   ): number | undefined {
@@ -1325,6 +1480,14 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   originalSegmentationGroupState: SegmentationUserLayerGroupState;
   originalSegmentationColorGroupState: SegmentationUserLayerColorGroupState;
 
+  /**
+   * Reference to a segmentation (parcellation) layer whose anatomical labels can
+   * be toggled include/exclude to dissect the tracts (the streamline Filter tab's
+   * "By segmentation label" panel). Persisted so a chosen parcellation survives a
+   * reload. Undefined-name = no parcellation linked.
+   */
+  roiLabelLayer: LayerReference;
+
   segmentationGroupState: WatchableValueInterface<SegmentationUserLayerGroupState>;
   segmentationColorGroupState: WatchableValueInterface<SegmentationUserLayerColorGroupState>;
 
@@ -1332,6 +1495,10 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   hideSegmentZero: WatchableValueInterface<boolean>;
   segmentColorHash: TrackableValueInterface<number>;
   segmentStatedColors: WatchableValueInterface<Uint64Map>;
+  effectiveSegmentStatedColors: WatchableValueInterface<Uint64Map>;
+  private derivedSegmentStatedColors: Uint64Map;
+  private effectiveStatedColorsUsesLut = false;
+  private effectiveSegmentStatedColorsChanged = new Signal();
   tempSegmentStatedColors2d: WatchableValueInterface<Uint64Map>;
   segmentDefaultColor: WatchableValueInterface<vec3 | undefined>;
   tempSegmentDefaultColor2d: WatchableValueInterface<vec3 | vec4 | undefined>;
@@ -1722,6 +1889,9 @@ export class SegmentationUserLayer extends Base {
       this.specificationChanged.dispatch,
     );
     this.displayState.roiFilter.changed.add(this.specificationChanged.dispatch);
+    this.displayState.roiLabelLayer.changed.add(
+      this.specificationChanged.dispatch,
+    );
     this.displayState.spatialSkeletonGridResolutionTarget2d.changed.add(
       this.specificationChanged.dispatch,
     );
@@ -2190,6 +2360,30 @@ export class SegmentationUserLayer extends Base {
   }
 
   /**
+   * Evaluate `groups` over the tract render layer's currently-resident chunks and
+   * return each group's passing object ids (WYSIWYG). Backs the
+   * `computeRoiExportIds` display-state callback the Export tab calls; the lookup
+   * is done here (not captured at channel-creation) because the render layer is
+   * created after the ROI channel. Rejects if no tract render layer exists yet.
+   */
+  private async computeRoiExportIds(
+    groups: readonly RoiGroupConfig[],
+  ): Promise<bigint[][]> {
+    for (const renderLayer of this.renderLayers) {
+      if (
+        renderLayer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
+        renderLayer instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer
+      ) {
+        return renderLayer.base.computeRoiExportIds(groups);
+      }
+    }
+    throw new Error(
+      "This layer's tract geometry is not ready yet — wait for it to load, " +
+        "then export.",
+    );
+  }
+
+  /**
    * Create the ROI streamline-filter data channel once, on first sight of a
    * zarr-vectors spatially-indexed (tract) source. Idempotent — later calls
    * return immediately.
@@ -2240,6 +2434,12 @@ export class SegmentationUserLayer extends Base {
     displayState.roiGhostAlpha = ghostAlpha;
     displayState.roiGroups = groups;
     displayState.roiHighDetailSegments = highDetailSegments;
+    // The Export tab reaches the (later-created) tract render layer through this
+    // callback. Lazy: the render layer does not exist yet, so the lookup runs at
+    // call time. Set on the real display state (not the per-activation spread the
+    // render layers receive), which is the one the tab holds.
+    displayState.computeRoiExportIds = (roiGroups) =>
+      this.computeRoiExportIds(roiGroups);
 
     // Colour-by-group: the worker fills `segmentColors` (id -> packed group
     // colour) for passing tracts, which a dedicated ROI colour shader tier reads
@@ -2258,6 +2458,170 @@ export class SegmentationUserLayer extends Base {
     );
     displayState.roiSegmentColors = segmentColors;
     displayState.roiColorByGroup = colorByGroup;
+
+    // Per-object numeric attributes (length, …) for the worker's length filter
+    // and object-attribute colouring. Rebuilt whenever the segment-property map
+    // changes (e.g. a group switch or the store finishing its load).
+    const objectAttrColumns = new WatchableValue<
+      ReadonlyMap<string, RoiObjectAttrColumn>
+    >(buildObjectAttrColumns(displayState.segmentPropertyMap.value));
+    this.registerDisposer(
+      displayState.segmentPropertyMap.changed.add(() => {
+        objectAttrColumns.value = buildObjectAttrColumns(
+          displayState.segmentPropertyMap.value,
+        );
+      }),
+    );
+    displayState.roiObjectAttrColumns = objectAttrColumns;
+
+    // Dense anatomical label grid, built from the linked parcellation layer
+    // ({@link roiLabelLayer}) and shipped to the worker for `labelMask` ROIs.
+    // Rebuilt whenever the reference changes or the parcellation finishes
+    // loading; an in-flight build is aborted so a rapid re-link cannot land a
+    // stale grid. Kept undefined (label ROIs then select nothing) until ready.
+    const roiLabelField = new WatchableValue<RoiLabelField | undefined>(
+      undefined,
+    );
+    displayState.roiLabelField = roiLabelField;
+    let labelFieldBuild: AbortController | undefined;
+    let lastLabelLayerName: string | undefined;
+    const rebuildLabelField = (force = false) => {
+      const ref = displayState.roiLabelLayer;
+      const managed = ref.layer;
+      const parcellation = managed?.layer;
+      if (
+        !(parcellation instanceof SegmentationUserLayer) ||
+        parcellation === this ||
+        managed === undefined
+      ) {
+        labelFieldBuild?.abort();
+        labelFieldBuild = undefined;
+        lastLabelLayerName = undefined;
+        if (roiLabelField.value !== undefined) roiLabelField.value = undefined;
+        return;
+      }
+      // The layersChanged signal fires often; only rebuild when the referenced
+      // parcellation actually changed, or it just became ready (force), or we
+      // have not built for it yet.
+      if (!force && managed.name === lastLabelLayerName) return;
+      if (!managed.isReady()) return;
+      lastLabelLayerName = managed.name;
+      labelFieldBuild?.abort();
+      const abort = (labelFieldBuild = new AbortController());
+      const globalNames = this.manager.root.coordinateSpace.value.names ?? [];
+      buildRoiLabelField(parcellation, globalNames, { signal: abort.signal })
+        .then((field) => {
+          if (!abort.signal.aborted) roiLabelField.value = field;
+        })
+        .catch((e) => {
+          if (!abort.signal.aborted) {
+            console.error(
+              "ROI label filter: parcellation grid build failed",
+              e,
+            );
+          }
+        });
+    };
+    this.registerDisposer(
+      displayState.roiLabelLayer.changed.add(() => {
+        // A fresh reference: forget the last-built name so a re-link to a
+        // now-ready layer rebuilds even if the name coincides.
+        lastLabelLayerName = undefined;
+        rebuildLabelField();
+      }),
+    );
+    // Catch the parcellation transitioning to ready after the reference was set
+    // (e.g. restored from the URL before its data loaded).
+    this.registerDisposer(
+      this.manager.rootLayers.layersChanged.add(() => rebuildLabelField(true)),
+    );
+    this.registerDisposer(() => labelFieldBuild?.abort());
+    rebuildLabelField();
+
+    // Background (whole-tractogram) length filter + flat colour-by-attribute: a
+    // frontend-only per-object value map (id -> packed normalised values) read
+    // directly by the shader, plus the resolved uniforms.
+    //
+    // ID-space caveat (shared with buildObjectAttrColumns): the keys are the
+    // segment-property map's ids (dense object index). For a store with
+    // `object_index_convention: "identity"` they equal the streamline segment
+    // ids the shader looks up; a `"standard"` store would need re-keying through
+    // `object_attributes/segment_id` first, else the tier silently no-ops.
+    const roiObjectValues = this.registerDisposer(new Uint64Map());
+    const roiBackground = new WatchableValue<RoiBackgroundUniforms | undefined>(
+      undefined,
+    );
+    // Each packed value holds TWO normalised attributes: the length-filter
+    // attribute in the low 16 bits and the colour attribute in the high 16, so a
+    // length filter on one attribute and colour-by another coexist in one map.
+    let lastKey = "";
+    let lastPropMap: PreprocessedSegmentPropertyMap | undefined;
+    const enc16 = (v: number, min: number, span: number) => {
+      const t = span > 0 ? (Number(v) - min) / span : 0;
+      return Math.max(0, Math.min(65535, Math.round(t * 65535)));
+    };
+    const norm01 = (v: number, min: number, span: number) =>
+      span > 0 ? Math.max(0, Math.min(1, (v - min) / span)) : 0;
+    const refreshBackground = () => {
+      const propMap = displayState.segmentPropertyMap.value;
+      const bg = roiFilter.backgroundColorBy;
+      const lf = roiFilter.backgroundLengthFilter;
+      const num = propMap?.numericalProperties ?? [];
+      const lengthProp =
+        lf !== undefined ? num.find((p) => p.id === lf.name) : undefined;
+      const colorProp =
+        bg.kind === "objectAttr"
+          ? num.find((p) => p.id === bg.name)
+          : undefined;
+      if (lengthProp === undefined && colorProp === undefined) {
+        lastKey = "";
+        lastPropMap = undefined;
+        if (roiObjectValues.size !== 0) roiObjectValues.clear();
+        roiBackground.value = undefined;
+        return;
+      }
+      const lMin = lengthProp !== undefined ? Number(lengthProp.bounds[0]) : 0;
+      const lMax = lengthProp !== undefined ? Number(lengthProp.bounds[1]) : 1;
+      const cMin = colorProp !== undefined ? Number(colorProp.bounds[0]) : 0;
+      const cMax = colorProp !== undefined ? Number(colorProp.bounds[1]) : 1;
+      const key = `${lengthProp?.id ?? ""}:${lMin}:${lMax}|${colorProp?.id ?? ""}:${cMin}:${cMax}`;
+      // Rebuild the O(objects) map only when an attribute or its bounds change,
+      // or the property map object itself was reloaded (a source swap gives a
+      // fresh ids array even if name+bounds coincide). A range/mode tweak skips
+      // the rebuild and only updates the cheap uniforms below.
+      if (key !== lastKey || propMap !== lastPropMap) {
+        lastKey = key;
+        lastPropMap = propMap;
+        roiObjectValues.clear();
+        const ids = propMap!.segmentPropertyMap.inlineProperties!.ids;
+        const lVals = lengthProp?.values as ArrayLike<number> | undefined;
+        const cVals = colorProp?.values as ArrayLike<number> | undefined;
+        const lSpan = lMax - lMin;
+        const cSpan = cMax - cMin;
+        for (let i = 0; i < ids.length; ++i) {
+          const lo16 = lVals !== undefined ? enc16(lVals[i], lMin, lSpan) : 0;
+          const hi16 = cVals !== undefined ? enc16(cVals[i], cMin, cSpan) : 0;
+          // BigInt shifts (not `<<`) — `65535 << 16` overflows JS's 32-bit
+          // signed int and would set the value negative.
+          roiObjectValues.set_(ids[i], BigInt(lo16) | (BigInt(hi16) << 16n));
+        }
+        // One coalesced change signal instead of one per object.
+        roiObjectValues.changed.dispatch(null, true);
+      }
+      roiBackground.value = {
+        lengthActive: lf !== undefined && lengthProp !== undefined,
+        lo: lf !== undefined ? norm01(lf.min, lMin, lMax - lMin) : 0,
+        hi: lf !== undefined ? norm01(lf.max, lMin, lMax - lMin) : 1,
+        colorMode: bg.kind === "objectAttr" && colorProp !== undefined,
+      };
+    };
+    refreshBackground();
+    this.registerDisposer(roiFilter.changed.add(refreshBackground));
+    this.registerDisposer(
+      displayState.segmentPropertyMap.changed.add(refreshBackground),
+    );
+    displayState.roiObjectValues = roiObjectValues;
+    displayState.roiBackground = roiBackground;
   }
 
   /**
@@ -2573,6 +2937,12 @@ export class SegmentationUserLayer extends Base {
                 ...displayState,
                 segmentationGroupState: new WatchableValue(proxyGroupState),
               };
+              // Expose this pass-2 source so the Export tab can read whole tracts'
+              // geometry straight from its resident chunks (the fast in-browser
+              // TRK path) instead of re-reading the store. Set on the real display
+              // state (the one the tab holds), not the spread above.
+              this.displayState.roiHighDetailSkeletonSource =
+                mesh as SkeletonSource;
             }
             const base = new SkeletonLayer(
               this.manager.chunkManager,
@@ -2702,14 +3072,27 @@ export class SegmentationUserLayer extends Base {
    * same guard makes re-activation non-clobbering.
    *
    * `sourceShader` is undefined when the layer's skeleton subsources have no
-   * agreed nomination, which means: keep the generic default.
+   * agreed nomination -- no skeleton subsource, an abstaining one (CATMAID), or
+   * two that DISAGREE. In that case revert to the generic segment-coloured
+   * default ({@link DEFAULT_FRAGMENT_MAIN}) rather than leaving a previously
+   * installed datasource shader in place. The retract is load-bearing: subsources
+   * activate incrementally (a source whose `loadState` is still pending is
+   * skipped and this re-runs when it resolves), so a tangent-bearing tract source
+   * can activate ALONE first and install its `prop_tangent()` default, and then a
+   * no-tangent skeleton subsource loads and forces disagreement. Since the whole
+   * layer shares one `skeletonRenderingOptions.shader`, a stuck `prop_tangent()`
+   * default would fail to compile against the no-tangent subsource (blank tracts)
+   * -- so `undefined` must actively pull the default back to the generic one that
+   * compiles for every subsource. `defaultValue` is a plain field (no dispatch)
+   * and the `value` setter is change-guarded, so the common no-skeleton case
+   * (target already generic) is a true no-op.
    */
   private applySkeletonDefaultShader(sourceShader: string | undefined) {
-    if (sourceShader === undefined) return;
+    const target = sourceShader ?? DEFAULT_FRAGMENT_MAIN;
     const { shader } = this.displayState.skeletonRenderingOptions;
     const untouched = shader.value === shader.defaultValue;
-    shader.defaultValue = sourceShader;
-    if (untouched) shader.value = sourceShader;
+    shader.defaultValue = target;
+    if (untouched) shader.value = target;
   }
 
   getLegacyDataSourceSpecifications(
@@ -2819,6 +3202,11 @@ export class SegmentationUserLayer extends Base {
     );
     verifyOptionalObjectProperty(
       specification,
+      json_keys.ROI_LABEL_LAYER_JSON_KEY,
+      (value) => this.displayState.roiLabelLayer.restoreState(value),
+    );
+    verifyOptionalObjectProperty(
+      specification,
       json_keys.IGNORE_SKELETON_MEMORY_CEILING_JSON_KEY,
       (value) =>
         this.displayState.ignoreSpatialSkeletonMemoryCeiling.restoreState(
@@ -2920,6 +3308,8 @@ export class SegmentationUserLayer extends Base {
     x[json_keys.SPATIAL_SKELETON_NODE_FILTER_JSON_KEY] =
       this.displayState.spatialSkeletonNodeFilter.toJSON();
     x[json_keys.ROI_FILTER_JSON_KEY] = this.displayState.roiFilter.toJSON();
+    x[json_keys.ROI_LABEL_LAYER_JSON_KEY] =
+      this.displayState.roiLabelLayer.toJSON();
     x[json_keys.IGNORE_SKELETON_MEMORY_CEILING_JSON_KEY] =
       this.displayState.ignoreSpatialSkeletonMemoryCeiling.toJSON();
     x[json_keys.ROI_HIGH_DETAIL_BUDGET_JSON_KEY] =

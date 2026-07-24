@@ -22,6 +22,14 @@ export const SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID =
   "skeleton/SpatiallyIndexedSkeletonRenderLayer";
 export const SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID =
   "skeleton/SpatiallyIndexedSkeletonRenderLayer.updateSources";
+/**
+ * On-demand request the tract Export tab makes: evaluate the ticked ROI groups
+ * over the currently-resident chunks and return each group's passing object ids.
+ * A promise RPC (request/response), unlike the fire-and-forget passing-set
+ * recompute -- the tab needs the ids in hand before it can build the export job.
+ */
+export const SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID =
+  "skeleton/SpatiallyIndexedSkeletonRenderLayer.roiExportIds";
 
 export interface VertexAttributeInfo {
   dataType: DataType;

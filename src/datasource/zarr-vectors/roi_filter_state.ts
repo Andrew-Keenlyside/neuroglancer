@@ -34,6 +34,8 @@
 
 import type {
   Roi,
+  RoiColorSpec,
+  RoiLengthFilter,
   RoiOperator,
   RoiPredicate,
   RoiShape,
@@ -47,6 +49,7 @@ import { vec3 } from "#src/util/geom.js";
 import {
   parseArray,
   verifyFiniteFloat,
+  verifyInt,
   verifyObject,
   verifyObjectProperty,
   verifyOptionalObjectProperty,
@@ -134,6 +137,8 @@ function shapeToJson(shape: RoiShape): any {
         origin: Array.from(shape.origin),
         normal: Array.from(shape.normal),
       };
+    case "labelMask":
+      return { type: "labelMask", labels: Array.from(shape.labels) };
   }
 }
 
@@ -163,6 +168,13 @@ function shapeFromJson(obj: any): RoiShape {
         kind: "halfspace",
         origin: verifyObjectProperty(obj, "origin", floatVec),
         normal: verifyObjectProperty(obj, "normal", floatVec),
+      };
+    case "labelMask":
+      return {
+        kind: "labelMask",
+        labels: verifyObjectProperty(obj, "labels", (v) =>
+          parseArray(v, verifyInt),
+        ),
       };
     default:
       throw new Error(`Unknown ROI shape type: ${JSON.stringify(type)}`);
@@ -204,6 +216,82 @@ function entryFromJson(obj: any): Roi {
     : { shape, predicate, operator, name };
 }
 
+/**
+ * Colour and length-filter specs live in `roi.js` (the dependency-free module)
+ * so the worker-facing `RoiGroupConfig` can reference them without an import
+ * cycle. Re-exported here — this module owns their JSON encoding and defaults.
+ *
+ * `RoiColorSpec` mirrors the opacity model: each group carries its own spec and
+ * the background carries one too, settable independently. `group`/`objectAttr`
+ * are flat per object and ride the colour-override map (fully independent per
+ * group and background); `direction`/`position`/`vertexAttr` vary along a
+ * polyline and are realised in the layer shader (a group choosing one of them
+ * "inherits" the background per-vertex colour).
+ */
+export type { RoiColorSpec, RoiLengthFilter };
+
+export const DEFAULT_GROUP_COLOR_BY: RoiColorSpec = { kind: "group" };
+export const DEFAULT_BACKGROUND_COLOR_BY: RoiColorSpec = { kind: "direction" };
+
+export function colorSpecEquals(a: RoiColorSpec, b: RoiColorSpec): boolean {
+  if (a.kind !== b.kind) return false;
+  return (a as { name?: string }).name === (b as { name?: string }).name;
+}
+
+export function lengthFilterEquals(
+  a: RoiLengthFilter | undefined,
+  b: RoiLengthFilter | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.name === b.name && a.min === b.min && a.max === b.max;
+}
+
+/** Compact, URL-friendly encoding (`"direction"`, `"object:<name>"`, …). */
+function colorSpecToJson(spec: RoiColorSpec): string {
+  switch (spec.kind) {
+    case "direction":
+    case "group":
+    case "position":
+      return spec.kind;
+    case "objectAttr":
+      return `object:${spec.name}`;
+    case "vertexAttr":
+      return `vertex:${spec.name}`;
+  }
+}
+
+function colorSpecFromJson(v: unknown): RoiColorSpec {
+  const s = verifyString(v);
+  if (s === "direction" || s === "group" || s === "position") {
+    return { kind: s };
+  }
+  const sep = s.indexOf(":");
+  if (sep > 0) {
+    const prefix = s.slice(0, sep);
+    const name = s.slice(sep + 1);
+    if (name.length > 0 && prefix === "object") {
+      return { kind: "objectAttr", name };
+    }
+    if (name.length > 0 && prefix === "vertex") {
+      return { kind: "vertexAttr", name };
+    }
+  }
+  throw new Error(`Invalid colour spec: ${JSON.stringify(s)}`);
+}
+
+function lengthFilterToJson(f: RoiLengthFilter): any {
+  return { name: f.name, min: f.min, max: f.max };
+}
+
+function lengthFilterFromJson(obj: any): RoiLengthFilter {
+  verifyObject(obj);
+  return {
+    name: verifyObjectProperty(obj, "name", verifyString),
+    min: verifyObjectProperty(obj, "min", verifyFiniteFloat),
+    max: verifyObjectProperty(obj, "max", verifyFiniteFloat),
+  };
+}
+
 /** One named, coloured dissection: an ordered ROI list evaluated as a fold. */
 export interface RoiGroup {
   /** Stable within a session (not persisted); the tab references groups by it. */
@@ -215,6 +303,10 @@ export interface RoiGroup {
   readonly opacity: number;
   /** Load this group's passing tracts at full detail (object-keyed pass 2). */
   readonly highDetail: boolean;
+  /** How this group's passing streamlines are coloured. */
+  readonly colorBy: RoiColorSpec;
+  /** Restrict this group to streamlines whose attribute value is in range. */
+  readonly lengthFilter?: RoiLengthFilter;
   readonly rois: readonly Roi[];
 }
 
@@ -233,13 +325,32 @@ export function groupToJson(group: RoiGroup): any {
   if (!group.visible) json.visible = false;
   if (group.opacity !== DEFAULT_GROUP_OPACITY) json.opacity = group.opacity;
   if (group.highDetail) json.highDetail = true;
+  if (!colorSpecEquals(group.colorBy, DEFAULT_GROUP_COLOR_BY))
+    json.colorBy = colorSpecToJson(group.colorBy);
+  if (group.lengthFilter !== undefined)
+    json.lengthFilter = lengthFilterToJson(group.lengthFilter);
   return json;
 }
 
-/** Inverse of {@link groupToJson}; `id` is assigned by the caller. */
-export function groupFromJson(obj: any, id: number): RoiGroup {
+/**
+ * Inverse of {@link groupToJson}; `id` is assigned by the caller.
+ *
+ * `defaultColorBy` seeds `colorBy` when the group JSON carries no explicit key.
+ * The state restorer passes the migrated legacy `colorByGroup` here so an old
+ * URL keeps its colouring; individual store loads use the group default.
+ */
+export function groupFromJson(
+  obj: any,
+  id: number,
+  defaultColorBy: RoiColorSpec = DEFAULT_GROUP_COLOR_BY,
+): RoiGroup {
   verifyObject(obj);
-  return {
+  const lengthFilter = verifyOptionalObjectProperty(
+    obj,
+    "lengthFilter",
+    lengthFilterFromJson,
+  );
+  const base = {
     id,
     name: verifyObjectProperty(obj, "name", verifyString),
     color: verifyObjectProperty(obj, "color", (v) =>
@@ -253,10 +364,16 @@ export function groupFromJson(obj: any, id: number): RoiGroup {
     highDetail:
       verifyOptionalObjectProperty(obj, "highDetail", (v) => v === true) ??
       false,
+    colorBy:
+      verifyOptionalObjectProperty(obj, "colorBy", colorSpecFromJson) ??
+      defaultColorBy,
     rois: verifyObjectProperty(obj, "rois", (v) =>
       parseArray(v, entryFromJson),
     ),
   };
+  // Spread-free so an absent lengthFilter has no key at all (round-trip tests
+  // use toStrictEqual), matching the unnamed-ROI handling above.
+  return lengthFilter === undefined ? base : { ...base, lengthFilter };
 }
 
 /**
@@ -271,8 +388,22 @@ export class RoiFilterState {
   private ghostAlpha_ = DEFAULT_GHOST_ALPHA;
   private colorByGroup_ = true;
   private hideOverlays2d_ = false;
+  private backgroundColorBy_: RoiColorSpec = DEFAULT_BACKGROUND_COLOR_BY;
+  private backgroundLengthFilter_: RoiLengthFilter | undefined = undefined;
   private groups_: RoiGroup[] = [];
   private nextGroupId_ = 1;
+  /**
+   * The live, uncommitted "label selection" dissection: the group the segmentation-
+   * label panel edits as the user toggles parcellation labels include/exclude.
+   * It filters (and previews) exactly like a committed group, but is deliberately
+   * kept OUT of `groups_` so it neither appears in the group list nor persists to
+   * the URL — the user commits it to a real group explicitly (see
+   * {@link commitPreviewGroup}). `undefined` when nothing is staged.
+   */
+  private previewGroup_: RoiGroup | undefined = undefined;
+
+  /** Reserved session id for {@link previewGroup}; real ids start at 1. */
+  static readonly PREVIEW_GROUP_ID = 0;
 
   /** Whether the filter is applied (colouring/ghosting streamlines). */
   get active(): boolean {
@@ -315,13 +446,96 @@ export class RoiFilterState {
     this.changed.dispatch();
   }
 
+  /** How the background (non-passing / ungrouped) streamlines are coloured. */
+  get backgroundColorBy(): RoiColorSpec {
+    return this.backgroundColorBy_;
+  }
+  set backgroundColorBy(value: RoiColorSpec) {
+    if (colorSpecEquals(value, this.backgroundColorBy_)) return;
+    this.backgroundColorBy_ = value;
+    this.changed.dispatch();
+  }
+
+  /** Overall length range applied to the background tractogram (or `undefined`). */
+  get backgroundLengthFilter(): RoiLengthFilter | undefined {
+    return this.backgroundLengthFilter_;
+  }
+  set backgroundLengthFilter(value: RoiLengthFilter | undefined) {
+    if (lengthFilterEquals(this.backgroundLengthFilter_, value)) return;
+    this.backgroundLengthFilter_ = value;
+    this.changed.dispatch();
+  }
+
   /** The ordered group list. Treat as immutable; edit via the mutators. */
   get groups(): readonly RoiGroup[] {
     return this.groups_;
   }
 
+  /** The live label-selection preview dissection, or `undefined` if none staged. */
+  get previewGroup(): RoiGroup | undefined {
+    return this.previewGroup_;
+  }
+
+  /**
+   * Replace (or, with `undefined`, clear) the live label-selection preview. The
+   * panel calls this on every toggle with a freshly-built group whose ROIs are
+   * the currently-selected labels; the reserved id is stamped so the tab and
+   * worker can address it stably.
+   */
+  setPreviewGroup(group: Omit<RoiGroup, "id"> | undefined): void {
+    if (group === undefined) {
+      if (this.previewGroup_ === undefined) return;
+      this.previewGroup_ = undefined;
+      this.changed.dispatch();
+      return;
+    }
+    this.previewGroup_ = { ...group, id: RoiFilterState.PREVIEW_GROUP_ID };
+    this.changed.dispatch();
+  }
+
+  /**
+   * Promote the staged label selection to a real, persisted group and clear the
+   * preview; returns the new group's id, or `undefined` if nothing was staged.
+   * A fresh palette colour and (optional) name are assigned so the committed
+   * group reads as a first-class dissection.
+   */
+  commitPreviewGroup(name?: string): number | undefined {
+    const preview = this.previewGroup_;
+    if (preview === undefined || preview.rois.length === 0) return undefined;
+    const id = this.nextGroupId_++;
+    this.groups_ = [
+      ...this.groups_,
+      {
+        ...preview,
+        id,
+        name: name ?? preview.name,
+        color: paletteColor(this.groups_.length),
+      },
+    ];
+    this.previewGroup_ = undefined;
+    this.changed.dispatch();
+    return id;
+  }
+
+  /**
+   * Groups the worker should evaluate: the committed groups plus the live
+   * label-selection preview (if any), so a staged selection ghosts/colours
+   * streamlines before it is committed.
+   */
+  groupsForWorker(): readonly RoiGroup[] {
+    return this.previewGroup_ === undefined
+      ? this.groups_
+      : [...this.groups_, this.previewGroup_];
+  }
+
   /** Whether any visible group has at least one ROI (i.e. the filter can act). */
   hasVisibleRois(): boolean {
+    if (
+      this.previewGroup_ !== undefined &&
+      this.previewGroup_.rois.length > 0
+    ) {
+      return true;
+    }
     return this.groups_.some((g) => g.visible && g.rois.length > 0);
   }
 
@@ -341,6 +555,7 @@ export class RoiFilterState {
         visible: true,
         opacity: DEFAULT_GROUP_OPACITY,
         highDetail: false,
+        colorBy: DEFAULT_GROUP_COLOR_BY,
         rois: [],
       },
     ];
@@ -379,6 +594,9 @@ export class RoiFilterState {
       visible?: boolean;
       opacity?: number;
       highDetail?: boolean;
+      colorBy?: RoiColorSpec;
+      // `undefined` clears the length filter.
+      lengthFilter?: RoiLengthFilter | undefined;
     },
   ): void {
     const idx = this.groupIndex(id);
@@ -454,7 +672,12 @@ export class RoiFilterState {
   }
 
   toJSON(): any {
-    if (!this.active_ && this.groups_.length === 0) {
+    // Background colour/length are meaningful without any group (colour or clip
+    // the whole tractogram), so they keep the state in the URL on their own.
+    const hasBackground =
+      !colorSpecEquals(this.backgroundColorBy_, DEFAULT_BACKGROUND_COLOR_BY) ||
+      this.backgroundLengthFilter_ !== undefined;
+    if (!this.active_ && this.groups_.length === 0 && !hasBackground) {
       return undefined; // stays out of the URL when unused
     }
     const json: any = {};
@@ -464,6 +687,12 @@ export class RoiFilterState {
       json.ghostAlpha = this.ghostAlpha_;
     if (!this.colorByGroup_) json.colorByGroup = false;
     if (this.hideOverlays2d_) json.hideOverlays2d = true;
+    if (!colorSpecEquals(this.backgroundColorBy_, DEFAULT_BACKGROUND_COLOR_BY))
+      json.backgroundColorBy = colorSpecToJson(this.backgroundColorBy_);
+    if (this.backgroundLengthFilter_ !== undefined)
+      json.backgroundLengthFilter = lengthFilterToJson(
+        this.backgroundLengthFilter_,
+      );
     return json;
   }
 
@@ -474,10 +703,20 @@ export class RoiFilterState {
     }
     verifyObject(x);
     this.nextGroupId_ = 1;
+    // Legacy: a global `colorByGroup` predates the unified per-group `colorBy`.
+    // Read it first so it can seed the default for groups that carry no explicit
+    // `colorBy` key (`true` → group colour, `false` → direction). Still kept as a
+    // live field while the render path is transitioned off it.
+    this.colorByGroup_ =
+      verifyOptionalObjectProperty(x, "colorByGroup", (v) => v === true) ??
+      true;
+    const legacyDefaultColorBy: RoiColorSpec = this.colorByGroup_
+      ? DEFAULT_GROUP_COLOR_BY
+      : { kind: "direction" };
     const groupsJson = verifyOptionalObjectProperty(x, "groups", (v) => v);
     if (groupsJson !== undefined) {
       this.groups_ = parseArray(groupsJson, (obj) =>
-        groupFromJson(obj, this.nextGroupId_++),
+        groupFromJson(obj, this.nextGroupId_++, legacyDefaultColorBy),
       );
     } else {
       // Back-compat: an older flat `rois` list restores as one default group.
@@ -494,6 +733,7 @@ export class RoiFilterState {
                 visible: true,
                 opacity: DEFAULT_GROUP_OPACITY,
                 highDetail: false,
+                colorBy: legacyDefaultColorBy,
                 rois: flatRois,
               },
             ]
@@ -504,12 +744,17 @@ export class RoiFilterState {
     this.ghostAlpha_ =
       verifyOptionalObjectProperty(x, "ghostAlpha", verifyFiniteFloat) ??
       DEFAULT_GHOST_ALPHA;
-    this.colorByGroup_ =
-      verifyOptionalObjectProperty(x, "colorByGroup", (v) => v === true) ??
-      true;
     this.hideOverlays2d_ =
       verifyOptionalObjectProperty(x, "hideOverlays2d", (v) => v === true) ??
       false;
+    this.backgroundColorBy_ =
+      verifyOptionalObjectProperty(x, "backgroundColorBy", colorSpecFromJson) ??
+      DEFAULT_BACKGROUND_COLOR_BY;
+    this.backgroundLengthFilter_ = verifyOptionalObjectProperty(
+      x,
+      "backgroundLengthFilter",
+      lengthFilterFromJson,
+    );
     this.changed.dispatch();
   }
 
@@ -519,12 +764,18 @@ export class RoiFilterState {
       this.colorByGroup_ &&
       !this.hideOverlays2d_ &&
       this.groups_.length === 0 &&
-      this.ghostAlpha_ === DEFAULT_GHOST_ALPHA;
+      this.previewGroup_ === undefined &&
+      this.ghostAlpha_ === DEFAULT_GHOST_ALPHA &&
+      colorSpecEquals(this.backgroundColorBy_, DEFAULT_BACKGROUND_COLOR_BY) &&
+      this.backgroundLengthFilter_ === undefined;
     this.active_ = false;
     this.ghostAlpha_ = DEFAULT_GHOST_ALPHA;
     this.colorByGroup_ = true;
     this.hideOverlays2d_ = false;
+    this.backgroundColorBy_ = DEFAULT_BACKGROUND_COLOR_BY;
+    this.backgroundLengthFilter_ = undefined;
     this.groups_ = [];
+    this.previewGroup_ = undefined;
     this.nextGroupId_ = 1;
     if (!wasDefault) this.changed.dispatch();
   }

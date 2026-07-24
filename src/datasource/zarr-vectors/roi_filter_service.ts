@@ -106,6 +106,11 @@ function shapeToJson(shape: RoiShape): any {
         origin: Array.from(shape.origin),
         normal: Array.from(shape.normal),
       };
+    case "labelMask":
+      // Label-mask ROIs need the dense parcellation grid, which the Python/WASM
+      // service does not have; the backend forces the in-worker TypeScript path
+      // whenever a group contains one, so this is unreachable in practice.
+      throw new Error("labelMask ROI cannot be sent to the ROI filter service");
   }
 }
 

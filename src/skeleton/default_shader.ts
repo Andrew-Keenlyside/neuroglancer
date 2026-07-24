@@ -15,6 +15,26 @@
  */
 
 /**
+ * Canonical "colour by direction" skeleton shader: map the per-vertex unit
+ * tangent's |components| to RGB — the standard tractography convention.
+ *
+ * Defined here (a datasource-neutral module already imported by both the
+ * segmentation layer and the zarr-vectors geometry-kind table) so the two
+ * places that install it — the tangent-bearing kinds' nominated default
+ * (`DEFAULT_STREAMLINE_FRAGMENT_MAIN`, applied via `resolveSkeletonDefaultShader`)
+ * and the Rendering tab's "Direction" preset — use a byte-identical string.
+ * That identity matters: the layer's shader round-trips as "untouched" only
+ * while `value === defaultValue`, so two equivalent-but-different spellings of
+ * the same shader would make the state look user-edited and serialise into
+ * every link.
+ */
+export const COLOR_BY_DIRECTION_SHADER = `void main() {
+  vec3 d = prop_tangent();
+  emitRGB(vec3(abs(d.x), abs(d.y), abs(d.z)));
+}
+`;
+
+/**
  * Resolve the skeleton shader a layer may adopt as its default, given one
  * candidate per skeleton subsource (`undefined` = "no opinion").
  *
@@ -35,7 +55,10 @@
  * Returns `undefined` -- meaning "keep the generic default" -- when no
  * candidate has an opinion, when any candidate abstains, or when two disagree.
  * An abstention is not consent: a source that nominates nothing says nothing
- * about whether another source's shader compiles against its geometry.
+ * about whether another source's shader compiles against its geometry. The
+ * caller (`applySkeletonDefaultShader`) treats `undefined` as "revert to the
+ * generic default", so a later-loading no-tangent subsource retracts a default
+ * an earlier tangent-bearing one installed.
  *
  * Mesh subsources must not be passed here; they carry their own shader and get
  * no vote.

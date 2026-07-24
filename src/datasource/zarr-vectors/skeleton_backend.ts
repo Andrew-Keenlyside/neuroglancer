@@ -57,6 +57,10 @@ import {
   type LinkDtype,
 } from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
 import { downloadSegmentSkeleton } from "#src/datasource/zarr-vectors/skeleton_segment_download.js";
+import {
+  ShardCellReader,
+  type CellReader,
+} from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 import { WithSharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
 import { joinBaseUrlAndPath } from "#src/kvstore/url.js";
 import type {
@@ -264,12 +268,42 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
    */
   private crossChunkLinksCaches_: CrossChunkLinksCaches | false | undefined;
 
+  private cellReader_: ShardCellReader | undefined;
+  /**
+   * One {@link ShardCellReader} per source so its shard-index cache is amortized
+   * across all cells of a shard. Reads per-chunk array cells honoring
+   * `chunk_grid_origin` and the optional `sharding_indexed` packing (grid
+   * geometry threaded via source params).
+   */
+  protected get cellRead(): CellReader {
+    let reader = this.cellReader_;
+    if (reader === undefined) {
+      const p = this.parameters;
+      reader = this.cellReader_ = this.registerDisposer(
+        new ShardCellReader(
+          this.chunkManager,
+          p.baseUrl,
+          this.sharedKvStoreContext.kvStoreContext,
+          makeRawKvStoreRead(p.baseUrl, this.sharedKvStoreContext),
+          {
+            origin: p.chunkGridOrigin,
+            sharded: p.sharded,
+            shardShape: p.shardChunkShape,
+            separator: p.cellSeparator,
+          },
+        ),
+      );
+    }
+    return reader.read;
+  }
+
   private async getCrossChunkLinksForChunk(
     targetChunkCoords: readonly number[],
     kvStoreRead: (
       subpath: string,
       signal: AbortSignal,
     ) => Promise<Uint8Array | undefined>,
+    cellRead: CellReader,
     kvStoreList: (
       prefix: string,
       signal: AbortSignal,
@@ -289,7 +323,7 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
     let table: CrossChunkLinksTable | undefined;
     try {
       table = await readCrossChunkLinksForChunk(
-        { kvStoreRead, kvStoreList },
+        { kvStoreRead, cellRead, kvStoreList },
         targetChunkCoords,
         this.crossChunkLinksCaches_,
         signal,
@@ -447,12 +481,16 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
     } = this.parameters;
     const { chunkGridPosition } = chunk;
     const chunkKey = Array.from(chunkGridPosition, (v) => String(v)).join(".");
-    const kvStoreRead = makeKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    // `rawKvStoreRead` serves whole-file reads (links `zarr.json`); `cellRead`
+    // serves the per-chunk array cells (origin + optional sharding resolved
+    // inside it). The finest levels' large shards make the single shared
+    // cellReader's per-shard index cache important — hence the per-source getter.
     const rawKvStoreRead = makeRawKvStoreRead(
       baseUrl,
       this.sharedKvStoreContext,
     );
     const kvStoreList = makeKvStoreList(baseUrl, this.sharedKvStoreContext);
+    const cellRead = this.cellRead;
 
     const decoded = await downloadSkeletonChunk(
       {
@@ -464,7 +502,7 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
         geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
         hasFragmentSegmentIds,
-        kvStoreRead,
+        cellRead,
       },
       signal,
     );
@@ -491,6 +529,7 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
     const table = await this.getCrossChunkLinksForChunk(
       Array.from(chunkGridPosition, (v) => Number(v)),
       rawKvStoreRead,
+      cellRead,
       kvStoreList,
       signal,
     );
@@ -523,7 +562,7 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
             rank,
             attributeNames,
             attributeDtypes: attributeDtypes.map(asAttributeDtype),
-            kvStoreRead,
+            cellRead,
           },
           signal,
         );
@@ -705,6 +744,35 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
    */
   private crossChunkLinks_: CrossChunkLinksTable | null | undefined;
 
+  private cellReader_: ShardCellReader | undefined;
+  /**
+   * One {@link ShardCellReader} per source (amortizes the per-shard index
+   * cache). Reads the per-chunk geometry arrays honoring `chunk_grid_origin`
+   * and the optional `sharding_indexed` packing. The manifest / object-attribute
+   * arrays are 1-D object-indexed and stay on the whole-file `kvStoreRead` path.
+   */
+  protected get cellRead(): CellReader {
+    let reader = this.cellReader_;
+    if (reader === undefined) {
+      const p = this.parameters;
+      reader = this.cellReader_ = this.registerDisposer(
+        new ShardCellReader(
+          this.chunkManager,
+          p.baseUrl,
+          this.sharedKvStoreContext.kvStoreContext,
+          makeRawKvStoreRead(p.baseUrl, this.sharedKvStoreContext),
+          {
+            origin: p.chunkGridOrigin,
+            sharded: p.sharded,
+            shardShape: p.shardChunkShape,
+            separator: p.cellSeparator,
+          },
+        ),
+      );
+    }
+    return reader.read;
+  }
+
   /**
    * Cached ``object_attributes/segment_id`` array (uint64, dense-OID
    * order → sorted ascending) mapping the dense object index ↔ the
@@ -765,6 +833,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       subpath: string,
       signal: AbortSignal,
     ) => Promise<Uint8Array | undefined>,
+    cellRead: CellReader,
     kvStoreList: (
       prefix: string,
       signal: AbortSignal,
@@ -775,7 +844,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       return this.crossChunkLinks_ ?? undefined;
     }
     const table = await readCrossChunkLinks(
-      { kvStoreRead, kvStoreList },
+      { kvStoreRead, cellRead, kvStoreList },
       signal,
     );
     this.crossChunkLinks_ = table ?? null;
@@ -799,6 +868,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       this.sharedKvStoreContext,
     );
     const kvStoreList = makeKvStoreList(baseUrl, this.sharedKvStoreContext);
+    const cellRead = this.cellRead;
 
     // The manifests array's `numObjects` / `chunkSize` aren't carried
     // on the parameter blob (slice 4c will plumb them through from
@@ -818,7 +888,12 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
     const crossChunkLinks =
       linksConvention === "implicit_sequential"
         ? undefined
-        : await this.getCrossChunkLinks(rawKvStoreRead, kvStoreList, signal);
+        : await this.getCrossChunkLinks(
+            rawKvStoreRead,
+            cellRead,
+            kvStoreList,
+            signal,
+          );
 
     // Map the selected segment id (e.g. a flywire uint64) to the dense
     // object index via object_attributes/segment_id before the manifest
@@ -853,6 +928,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
           sidNdim: rank,
           kvStoreRead,
         },
+        cellRead,
         rank,
         linkDtype: asLinkDtype(linkDtype),
         attributeNames,

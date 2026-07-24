@@ -160,6 +160,76 @@ async function setupPyodide(
 // Request handling
 // ---------------------------------------------------------------------------
 
+/** True for the tract-export route (the only one that may need JSPI). */
+function isExportPath(url: string): boolean {
+  try {
+    return /\/neuroglancer\/export\//.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether this runtime has WebAssembly stack switching (JSPI).
+ *
+ * `callPromising` / zarr's synchronous `sync()` need it. When it is absent
+ * (older/other browsers), export falls back to a plain async handler awaited on
+ * the WebLoop: TRK works there (async read + pure write), and `.zvf` -- which
+ * reaches zarr's synchronous writer -- returns a clear "needs JSPI" error.
+ */
+let jspiCache: boolean | undefined;
+function jspiAvailable(): boolean {
+  if (jspiCache === undefined) {
+    jspiCache =
+      typeof (WebAssembly as any).Suspending === "function" ||
+      typeof (WebAssembly as any).promising === "function";
+  }
+  return jspiCache;
+}
+
+/**
+ * A one-at-a-time gate for the promising export entrypoint.
+ *
+ * `callPromising` enables JSPI stack switching so the `.zvf` writer's
+ * synchronous zarr `sync()` can suspend -- and two concurrent promising entries
+ * into that path wedge this worker permanently (see the long note at the
+ * synchronous `handleRequest` call below). Serialising every promising entry is
+ * the proven mitigation: 100% completion at hanging scale. Ordinary requests do
+ * not take this path and keep their full concurrency.
+ */
+let exportTail: Promise<unknown> = Promise.resolve();
+function runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+  const result = exportTail.then(fn);
+  // Swallow settle state on the tail so a failed export cannot reject the next.
+  exportTail = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
+}
+
+/** Convert the Python handler's `{status, contentType, body}` into transferable bytes. */
+function marshalPythonResponse(result: any): {
+  status: number;
+  contentType: string;
+  responseBody: Uint8Array;
+} {
+  const status: number = result.status;
+  const contentType: string = result.contentType;
+  const rawBody = result.body;
+  let responseBody: Uint8Array;
+  if (rawBody instanceof Uint8Array) {
+    responseBody = rawBody;
+  } else if (rawBody && typeof rawBody.toJs === "function") {
+    responseBody = rawBody.toJs({ create_proxies: false });
+  } else if (rawBody instanceof ArrayBuffer) {
+    responseBody = new Uint8Array(rawBody);
+  } else {
+    responseBody = new TextEncoder().encode(String(rawBody ?? ""));
+  }
+  return { status, contentType, responseBody };
+}
+
 async function handleSwRequest(event: MessageEvent) {
   if (event.data?.type !== "request") return;
 
@@ -181,13 +251,22 @@ async function handleSwRequest(event: MessageEvent) {
     return;
   }
 
-  try {
-    // Call the Python request handler registered by browser_server.py.
-    // browser_server._setup_js_bridge() stores it in Python's __main__ globals
-    // so we can retrieve it reliably via pyodide.globals.get().
-    const handleRequest = pyodide.globals.get("pyodide_handle_request");
+  // Export is the one route that needs JSPI (its .zvf writer calls zarr sync()).
+  // Everything else stays on the synchronous, fully-concurrent path.
+  const isExport = isExportPath(url);
 
-    if (!handleRequest) {
+  try {
+    // Call the Python handler registered by browser_server.py, retrieved from
+    // Python's __main__ globals via pyodide.globals.get(). Export uses a
+    // separate promising-capable entrypoint.
+    const handlerName = !isExport
+      ? "pyodide_handle_request"
+      : jspiAvailable()
+        ? "pyodide_handle_export"
+        : "pyodide_handle_export_async";
+    const handler = pyodide.globals.get(handlerName);
+
+    if (!handler) {
       // Python hasn't finished setting up yet — tell the client to retry.
       swPort!.postMessage(
         {
@@ -206,60 +285,67 @@ async function handleSwRequest(event: MessageEvent) {
     // Do NOT call pyodide.toPy() here: that converts it to a Python memoryview which
     // Pyodide then unwraps before passing to the Python function, leaving no .to_py().
     const bodyBytes = body ? new Uint8Array(body) : null;
-    // This call MUST stay synchronous. Do not "fix" it to
-    // `await handleRequest.callPromising(...)`.
-    //
-    // Being synchronous is what makes each request handler ATOMIC. The service
-    // worker assigns a requestId and posts immediately, with no queue
-    // (pyodide_service_worker.ts) -- concurrency is the design, and it is only
-    // safe because handlers cannot interleave.
-    //
-    // Making this promising enables JSPI stack switching, which is what a
-    // synchronous zarr call needs in order to suspend. It also turns atomic
-    // handlers into interleaved coroutines, and two concurrent promising entries
-    // into zarr-vectors' sync read path wedge this worker PERMANENTLY.
-    // Independently reproduced 2026-07-19 (headless chromium 141, pyodide
-    // 314.0.2), deterministic over 8 runs:
-    //
-    //   - concurrency 2 at ~530-730 store keys per reader and above -> hang.
-    //     Below that it interleaves fine, so a small-store smoke test passes and
-    //     production hangs.
-    //   - the same store read concurrently hangs too; not a two-store artifact.
-    //   - sequential at ~7x the work (12,096 keys x2) completes in 25.5s, so it
-    //     is not memory and not total work.
-    //   - blast radius is THIS worker's event loop, not the page's: the UI stays
-    //     alive while Python request handling is dead and unrecoverable.
-    //
-    // Root cause is still open. Two internal-corruption hypotheses
-    // (validSuspender save/restore crossing, Module.stackStop clobbering) were
-    // tested and refuted; what is established is that resuming a JSPI-suspended
-    // stack needs the macrotask queue, and the queue stops being serviced.
-    //
-    // If this ever must become promising, serialising every promising entry into
-    // Python is a proven mitigation (100% completion at hanging scale) -- but it
-    // must cover EVERY entry, not just this one: any other promising entrypoint
-    // racing a request reintroduces the identical bug.
-    //
-    // The real fix is upstream and avoids JSPI entirely: zarr_vectors/core/aio.py
-    // awaits the I/O up front, then replays the ordinary sync readers against a
-    // primed Group so they never reach sync(). See
-    // upstream_prompts/zarr-vectors-py.md.
-    const result = handleRequest(url, method, bodyBytes ?? null);
 
-    const status: number = result.status;
-    const contentType: string = result.contentType;
-    let responseBody: Uint8Array;
-
-    const rawBody = result.body;
-    if (rawBody instanceof Uint8Array) {
-      responseBody = rawBody;
-    } else if (rawBody && typeof rawBody.toJs === "function") {
-      responseBody = rawBody.toJs({ create_proxies: false });
-    } else if (rawBody instanceof ArrayBuffer) {
-      responseBody = new Uint8Array(rawBody);
+    let result: any;
+    if (isExport && jspiAvailable()) {
+      // Export via callPromising so the .zvf writer's synchronous zarr call can
+      // suspend (JSPI), under runExclusive so only ONE promising entry is ever
+      // live -- the proven guard against the deadlock documented on the
+      // synchronous path below. The async read (zarr_vectors/core/aio) never
+      // reaches sync(); only the .zvf writer does.
+      result = await runExclusive(() =>
+        handler.callPromising(url, method, bodyBytes ?? null),
+      );
+    } else if (isExport) {
+      // No JSPI: the handler is an async coroutine; await it on the WebLoop.
+      // TRK completes here (async read + pure write). .zvf hits zarr's
+      // synchronous writer and returns a clear "needs JSPI" error. Still under
+      // runExclusive for parity with the promising path.
+      result = await runExclusive(() =>
+        handler(url, method, bodyBytes ?? null),
+      );
     } else {
-      responseBody = new TextEncoder().encode(String(rawBody ?? ""));
+      // This call MUST stay synchronous. Do not "fix" it to
+      // `await handler.callPromising(...)`.
+      //
+      // Being synchronous is what makes each request handler ATOMIC. The service
+      // worker assigns a requestId and posts immediately, with no queue
+      // (pyodide_service_worker.ts) -- concurrency is the design, and it is only
+      // safe because handlers cannot interleave.
+      //
+      // Making this promising enables JSPI stack switching, which is what a
+      // synchronous zarr call needs in order to suspend. It also turns atomic
+      // handlers into interleaved coroutines, and two concurrent promising entries
+      // into zarr-vectors' sync read path wedge this worker PERMANENTLY.
+      // Independently reproduced 2026-07-19 (headless chromium 141, pyodide
+      // 314.0.2), deterministic over 8 runs:
+      //
+      //   - concurrency 2 at ~530-730 store keys per reader and above -> hang.
+      //     Below that it interleaves fine, so a small-store smoke test passes and
+      //     production hangs.
+      //   - the same store read concurrently hangs too; not a two-store artifact.
+      //   - sequential at ~7x the work (12,096 keys x2) completes in 25.5s, so it
+      //     is not memory and not total work.
+      //   - blast radius is THIS worker's event loop, not the page's: the UI stays
+      //     alive while Python request handling is dead and unrecoverable.
+      //
+      // Root cause is still open. Two internal-corruption hypotheses
+      // (validSuspender save/restore crossing, Module.stackStop clobbering) were
+      // tested and refuted; what is established is that resuming a JSPI-suspended
+      // stack needs the macrotask queue, and the queue stops being serviced.
+      //
+      // The export route above IS promising, so it is confined to runExclusive:
+      // serialising every promising entry is the proven mitigation (100%
+      // completion at hanging scale), and it must cover EVERY entry -- any other
+      // promising entrypoint racing a request reintroduces the identical bug.
+      //
+      // The read avoids JSPI entirely via zarr_vectors/core/aio.py, which awaits
+      // the I/O up front then replays the ordinary sync readers against a primed
+      // Group so they never reach sync(). See upstream_prompts/zarr-vectors-py.md.
+      result = handler(url, method, bodyBytes ?? null);
     }
+
+    const { status, contentType, responseBody } = marshalPythonResponse(result);
 
     if (status >= 500) {
       console.error(

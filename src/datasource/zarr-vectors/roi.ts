@@ -26,8 +26,71 @@
  * in a compiled kernel without the two drifting apart in meaning.
  */
 
-/** Regions a streamline can be tested against. All are axis-aligned. */
-export type RoiShape =
+/**
+ * How a set of streamlines is coloured. Defined here (the dependency-free
+ * module) rather than in `roi_filter_state.ts` so the worker-facing
+ * `RoiGroupConfig` can reference it without an import cycle; `roi_filter_state`
+ * re-exports it and owns its JSON encoding.
+ *
+ * - `direction`  — the shader default (colour-by-tangent) `prop_tangent()`.
+ * - `group`      — the group's flat colour swatch (the old "colour by group").
+ * - `position`   — per-vertex, intrinsic xyz → RGB.
+ * - `objectAttr` — one flat colour per streamline from a per-object numeric
+ *   attribute (e.g. `length`) through a colourmap.
+ * - `vertexAttr` — per-vertex, a declared `vertex_attributes/<name>` colourmap.
+ */
+export type RoiColorSpec =
+  | { readonly kind: "direction" }
+  | { readonly kind: "group" }
+  | { readonly kind: "position" }
+  | { readonly kind: "objectAttr"; readonly name: string }
+  | { readonly kind: "vertexAttr"; readonly name: string };
+
+/** A closed length range on a named per-object numeric attribute. */
+export interface RoiLengthFilter {
+  readonly name: string;
+  readonly min: number;
+  readonly max: number;
+}
+
+/**
+ * Resolved background (whole-tractogram) shader uniforms for the per-object
+ * value tier: the length-filter discard range and the flat colour-by-attribute
+ * mode, both already normalised to [0,1] against the active attribute's bounds
+ * (the same normalisation baked into the shipped per-object value map).
+ */
+export interface RoiBackgroundUniforms {
+  /** Whether to discard background tracts whose value is outside `[lo, hi]`. */
+  readonly lengthActive: boolean;
+  /** Normalised length range for the discard test. */
+  readonly lo: number;
+  readonly hi: number;
+  /** Whether to recolour background tracts by the attribute (colourmap). */
+  readonly colorMode: boolean;
+}
+
+/**
+ * A voxelised region defined by anatomical labels in a *linked segmentation
+ * layer* (e.g. a parcellation). A streamline "passes" it when a vertex falls in
+ * a voxel whose label is one of `labels`. Unlike the geometric primitives this
+ * is not a closed-form shape: it is evaluated by sampling a dense label field
+ * ({@link LabelSampler}) shipped alongside the ROIs, so the crossing test needs
+ * that sampler and the pure geometry helpers below never see it.
+ *
+ * This is what lets a dissection be authored by *toggling parcellation labels*
+ * (include/exclude) rather than by drawing spheres and boxes.
+ */
+export interface LabelMaskShape {
+  readonly kind: "labelMask";
+  /** Parcellation label ids this region matches (matches any one of them). */
+  readonly labels: readonly number[];
+}
+
+/** Regions a streamline can be tested against. All geometric ones are axis-aligned. */
+export type RoiShape = GeometricRoiShape | LabelMaskShape;
+
+/** The closed-form (sampler-free) regions. Sampled directly against geometry. */
+export type GeometricRoiShape =
   /**
    * Axis-aligned ellipsoid. A sphere is `radii = (r, r, r)`; a disc/slab is one
    * radius much smaller than the others. This is the only bounded primitive
@@ -126,6 +189,34 @@ export interface RoiGroupConfig {
   readonly visible: boolean;
   /** Load this group's passing tracts at full detail (object-keyed pass 2). */
   readonly highDetail: boolean;
+  /**
+   * How this group's passing streamlines are coloured. Absent is treated as the
+   * legacy `{kind:"group"}` (flat group colour). `"objectAttr"` recolours each
+   * tract from a per-object attribute through a colourmap; the per-vertex kinds
+   * (`direction`/`position`/`vertexAttr`) leave the tract out of the colour
+   * override so the shader colours it per vertex.
+   */
+  readonly colorBy?: RoiColorSpec;
+  /**
+   * Restrict this group to streamlines whose value on the named per-object
+   * attribute lies in `[min, max]`. Applied ON TOP of the ROI fold (an empty
+   * ROI list still contributes nothing — the background length filter covers
+   * the whole-tractogram case).
+   */
+  readonly lengthRange?: RoiLengthFilter;
+}
+
+/**
+ * One per-object numeric attribute column, as shipped to the worker for
+ * length-filtering and colour-by-object-attribute. `ids[i]` (an object id in the
+ * same space as the per-vertex segment column) has value `values[i]`; `min`/`max`
+ * are the column's data bounds, used to normalise for the colourmap.
+ */
+export interface RoiObjectAttrColumn {
+  readonly ids: BigUint64Array;
+  readonly values: Float32Array;
+  readonly min: number;
+  readonly max: number;
 }
 
 /** A streamline: `count` vertices from `start`, in a flat `rank`-strided array. */
@@ -136,6 +227,15 @@ export interface StreamlineRef {
   readonly count: number;
   readonly rank: number;
 }
+
+/**
+ * Reads the anatomical label at a point in tract model space, for a
+ * {@link LabelMaskShape}. Returns `0` (conventionally "unlabelled/background")
+ * for a point outside the label field. The x/y/z arguments are model-space
+ * coordinates (the same frame the tract vertices and geometric ROIs live in);
+ * an implementation folds in whatever world→voxel transform its field needs.
+ */
+export type LabelSampler = (x: number, y: number, z: number) => number;
 
 /** Squared distance from the origin to the segment `a -> b`. */
 function pointToSegmentDistanceSq(
@@ -168,7 +268,7 @@ const scratchB = new Float64Array(4);
 
 /** Whether a vertex lies inside the shape. */
 function vertexInside(
-  shape: RoiShape,
+  shape: GeometricRoiShape,
   positions: Float32Array,
   offset: number,
   rank: number,
@@ -204,7 +304,7 @@ function vertexInside(
 
 /** Whether the segment between two vertices touches the shape. */
 function segmentIntersects(
-  shape: RoiShape,
+  shape: GeometricRoiShape,
   positions: Float32Array,
   offsetA: number,
   offsetB: number,
@@ -260,12 +360,107 @@ function segmentIntersects(
   }
 }
 
+/**
+ * Whether any of a streamline's tested vertices lands in a voxel labelled with
+ * one of `shape.labels`. A label field is sampled per vertex (there is no
+ * closed-form region), so `sampleLabel` must be supplied; without it — the field
+ * has not loaded yet — no streamline can be decided to pass, so the group is
+ * momentarily empty rather than wrong.
+ *
+ * `ANY_SEGMENT` degrades to a per-vertex test here: sampling the discrete voxel
+ * grid continuously along an edge is not worth its cost, and at parcellation
+ * resolution (~1 mm) versus tract vertex spacing the vertex test is faithful.
+ */
+function streamlinePassesLabelMask(
+  streamline: StreamlineRef,
+  shape: LabelMaskShape,
+  predicate: RoiPredicate,
+  sampleLabel: LabelSampler | undefined,
+): boolean {
+  const { positions, start, count, rank } = streamline;
+  if (count === 0 || sampleLabel === undefined || shape.labels.length === 0) {
+    return false;
+  }
+  const labels = shape.labels;
+  const hit = (v: number): boolean => {
+    const o = v * rank;
+    const label = sampleLabel(
+      positions[o],
+      positions[o + 1],
+      rank > 2 ? positions[o + 2] : 0,
+    );
+    if (label === 0) return false;
+    for (let i = 0; i < labels.length; ++i)
+      if (labels[i] === label) return true;
+    return false;
+  };
+  const first = start;
+  const last = start + count - 1;
+  switch (predicate) {
+    case RoiPredicate.EITHER_ENDPOINT:
+      return hit(first) || hit(last);
+    case RoiPredicate.BOTH_ENDPOINTS:
+      return hit(first) && hit(last);
+    default:
+      for (let v = 0; v < count; ++v) if (hit(start + v)) return true;
+      return false;
+  }
+}
+
+/**
+ * A dense anatomical label grid plus the transform that places tract model-space
+ * points into it. Built once on the frontend from a linked segmentation
+ * (parcellation) layer and shipped to the worker, where {@link makeLabelSampler}
+ * turns it into the {@link LabelSampler} the label-mask crossing test reads.
+ *
+ * Structured-clone-safe (a typed array + a small matrix), so it rides the same
+ * shared-watchable channel as the ROI groups.
+ */
+export interface RoiLabelField {
+  /**
+   * Dense label ids, x fastest: the voxel `(vx, vy, vz)` is
+   * `data[vx + dims[0] * (vy + dims[1] * vz)]`. Widened to uint32 regardless of
+   * the source dtype so the worker has one representation (labels beyond 2^32
+   * are out of scope — parcellation ids are small).
+   */
+  readonly data: Uint32Array;
+  /** Grid extent in voxels along model x, y, z. */
+  readonly dims: readonly [number, number, number];
+  /**
+   * Row-major 4×4 mapping a model-space point `[x, y, z, 1]` to continuous voxel
+   * coordinates; the sampler rounds to the nearest voxel and indexes `data`.
+   */
+  readonly modelToVoxel: Float32Array;
+}
+
+/**
+ * Build the per-vertex label reader for a field. Nearest-neighbour: rounds the
+ * mapped voxel coordinate and returns `0` outside the grid, matching the
+ * "0 = background" convention {@link streamlinePassesRoi} relies on.
+ */
+export function makeLabelSampler(field: RoiLabelField): LabelSampler {
+  const { data, modelToVoxel: m } = field;
+  const [nx, ny, nz] = field.dims;
+  return (x, y, z) => {
+    const vx = Math.round(m[0] * x + m[1] * y + m[2] * z + m[3]);
+    const vy = Math.round(m[4] * x + m[5] * y + m[6] * z + m[7]);
+    const vz = Math.round(m[8] * x + m[9] * y + m[10] * z + m[11]);
+    if (vx < 0 || vy < 0 || vz < 0 || vx >= nx || vy >= ny || vz >= nz)
+      return 0;
+    return data[vx + nx * (vy + ny * vz)];
+  };
+}
+
 /** Whether one streamline passes one region under `predicate`. */
 export function streamlinePassesRoi(
   streamline: StreamlineRef,
   shape: RoiShape,
   predicate: RoiPredicate,
+  sampleLabel?: LabelSampler,
 ): boolean {
+  if (shape.kind === "labelMask") {
+    return streamlinePassesLabelMask(streamline, shape, predicate, sampleLabel);
+  }
   const { positions, start, count, rank } = streamline;
   if (count === 0) return false;
   if (rank > scratchA.length) {
@@ -344,10 +539,16 @@ function seedVerdict(passes: boolean, operator: RoiOperator): boolean {
 export function streamlinePassesRois(
   streamline: StreamlineRef,
   rois: readonly Roi[],
+  sampleLabel?: LabelSampler,
 ): boolean {
   if (rois.length === 0) return true;
   let verdict = seedVerdict(
-    streamlinePassesRoi(streamline, rois[0].shape, rois[0].predicate),
+    streamlinePassesRoi(
+      streamline,
+      rois[0].shape,
+      rois[0].predicate,
+      sampleLabel,
+    ),
     rois[0].operator,
   );
   for (let i = 1; i < rois.length; ++i) {
@@ -356,7 +557,12 @@ export function streamlinePassesRois(
     // a true one, so the test is skippable in those cases.
     if (verdict === false && roi.operator !== RoiOperator.OR) continue;
     if (verdict === true && roi.operator === RoiOperator.OR) continue;
-    const passes = streamlinePassesRoi(streamline, roi.shape, roi.predicate);
+    const passes = streamlinePassesRoi(
+      streamline,
+      roi.shape,
+      roi.predicate,
+      sampleLabel,
+    );
     switch (roi.operator) {
       case RoiOperator.AND:
         verdict = verdict && passes;
@@ -457,6 +663,11 @@ export function roiRegionBounds(
         break;
       }
       case "halfspace":
+        return undefined;
+      case "labelMask":
+        // No closed-form extent: the region is wherever the parcellation places
+        // those labels. Give no bounded guarantee, so the caller evaluates the
+        // dissection over whatever chunks the camera makes resident (WYSIWYG).
         return undefined;
     }
     if (lower === undefined || upper === undefined) {

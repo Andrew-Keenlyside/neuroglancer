@@ -37,10 +37,16 @@ from neuroglancer.tractography.roi import RoiOperator, RoiPredicate
 # One asymmetry the pairing alone does not catch, hence the assertion below:
 # `parse_job` accepts any version <= JOB_SCHEMA_VERSION, so `VALID` would keep
 # parsing after a Python-side bump while the TS suite -- which asserts the
-# literal 1 in its *output* -- also stays green. The bump would then ship with
-# the two sides silently disagreeing about the current version.
+# current version in its *output* -- also stays green. The bump would then ship
+# with the two sides silently disagreeing about the current version.
+#
+# v3 shape: each group also carries `objectIds` -- the viewer's on-screen passing
+# ids, as decimal *strings* (an object id is a uint64 and can exceed JS's safe
+# integer range). `rois` is retained for provenance but is not folded when
+# `objectIds` is present. One id below is deliberately > 2**53 to pin the
+# string round-trip.
 VALID = {
-    "schemaVersion": 1,
+    "schemaVersion": 3,
     "source": {"url": "zarr-vectors://gs://bucket/tracts.zvf", "level": 0},
     "groups": [
         {
@@ -67,6 +73,7 @@ VALID = {
                     "operator": "andnot",
                 },
             ],
+            "objectIds": ["7", "42", "9007199254740993"],
         }
     ],
     "format": "trk",
@@ -115,6 +122,52 @@ class TestParseJob:
         roi = parse_job(VALID).groups[0].rois[0]
         assert not hasattr(roi, "name")
 
+    def test_parses_object_ids_as_uint64(self):
+        # Ids arrive as decimal strings and must survive past 2**53 exactly.
+        ids = parse_job(VALID).groups[0].object_ids
+        assert ids == (7, 42, 9007199254740993)
+
+    def test_object_ids_absent_yields_none(self):
+        # A legacy (fold-path) group carries no objectIds.
+        s = spec()
+        del s["groups"][0]["objectIds"]
+        assert parse_job(s).groups[0].object_ids is None
+
+    def test_object_ids_present_makes_rois_optional(self):
+        # A v3 group need not carry rois at all -- selection is the id list.
+        s = spec()
+        del s["groups"][0]["rois"]
+        job = parse_job(s)
+        assert job.groups[0].rois == ()
+        assert job.groups[0].object_ids == (7, 42, 9007199254740993)
+
+    def test_empty_object_ids_is_a_valid_empty_selection(self):
+        # Empty ids means "nothing passed on screen", NOT "select everything"
+        # (which is what an empty rois fold would mean).
+        s = spec()
+        s["groups"][0]["objectIds"] = []
+        del s["groups"][0]["rois"]
+        assert parse_job(s).groups[0].object_ids == ()
+
+    def test_accepts_integer_object_ids_too(self):
+        # A hand-written spec may use plain ints; strings are only needed to keep
+        # the browser's JSON precise past 2**53.
+        s = spec()
+        s["groups"][0]["objectIds"] = [1, 2, 3]
+        assert parse_job(s).groups[0].object_ids == (1, 2, 3)
+
+    def test_rejects_a_non_integer_object_id(self):
+        s = spec()
+        s["groups"][0]["objectIds"] = ["7", "not-a-number"]
+        with pytest.raises(JobSpecError, match="objectIds"):
+            parse_job(s)
+
+    def test_rejects_a_negative_object_id(self):
+        s = spec()
+        s["groups"][0]["objectIds"] = ["-1"]
+        with pytest.raises(JobSpecError, match="objectIds"):
+            parse_job(s)
+
     def test_level_defaults_to_zero(self):
         s = spec()
         del s["source"]["level"]
@@ -136,11 +189,64 @@ class TestParseJob:
             ]
             assert len(parse_job(s).groups[0].rois) == 1
 
+    def test_parses_a_label_mask_shape_as_provenance(self):
+        # A label dissection is exported by objectIds (which VALID carries); its
+        # labelMask rois travel as provenance and must parse without error.
+        s = spec()
+        s["groups"][0]["rois"] = [
+            {
+                "shape": {"type": "labelMask", "labels": [17, 53]},
+                "predicate": "any_segment",
+                "operator": "and",
+            }
+        ]
+        roi = parse_job(s).groups[0].rois[0]
+        assert roi.shape.__class__.__name__ == "LabelMask"
+        assert roi.shape.labels == (17, 53)
+
+    def test_rejects_non_integer_label_mask_labels(self):
+        s = spec()
+        s["groups"][0]["rois"] = [
+            {
+                "shape": {"type": "labelMask", "labels": ["x"]},
+                "predicate": "any_segment",
+                "operator": "and",
+            }
+        ]
+        with pytest.raises(JobSpecError, match="labels"):
+            parse_job(s)
+
+
+class TestScope:
+    def test_defaults_to_selected(self):
+        # A v1 spec had no `scope`; it must keep folding the dissection.
+        s = spec()
+        assert "scope" not in s
+        assert parse_job(s).scope == "selected"
+
+    def test_selected_scope_still_requires_groups(self):
+        with pytest.raises(JobSpecError, match="groups"):
+            parse_job(spec(scope="selected", groups=[]))
+
+    def test_whole_scope_allows_empty_groups(self):
+        job = parse_job(spec(scope="whole", groups=[]))
+        assert job.scope == "whole"
+        assert job.groups == ()
+
+    def test_whole_scope_allows_absent_groups(self):
+        s = spec(scope="whole")
+        del s["groups"]
+        assert parse_job(s).groups == ()
+
+    def test_rejects_an_unknown_scope(self):
+        with pytest.raises(JobSpecError, match="scope"):
+            parse_job(spec(scope="everything"))
+
 
 class TestRejections:
     def test_rejects_a_newer_schema_version(self):
         with pytest.raises(JobSpecError, match="newer than this exporter"):
-            parse_job(spec(schemaVersion=2))
+            parse_job(spec(schemaVersion=4))
 
     def test_rejects_an_unknown_format(self):
         with pytest.raises(JobSpecError, match="format"):
@@ -166,8 +272,11 @@ class TestRejections:
 
     def test_rejects_a_group_with_no_rois(self):
         # An empty fold passes everything, so this would export the entire
-        # dataset under the group's name rather than a dissection.
+        # dataset under the group's name rather than a dissection. Only applies
+        # to the fold path -- an id-based group has no rois by design -- so drop
+        # objectIds first.
         s = spec()
+        del s["groups"][0]["objectIds"]
         s["groups"][0]["rois"] = []
         with pytest.raises(JobSpecError, match="every streamline"):
             parse_job(s)

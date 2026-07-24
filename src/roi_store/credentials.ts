@@ -32,6 +32,13 @@
  */
 
 import { getDefaultCredentialsManager } from "#src/credentials_provider/default_manager.js";
+// Guarantee the "middleauth" provider is registered wherever the ROI-store auth
+// is used. It is normally registered via `kvstore/enabled_frontend_modules`, but
+// depending on entry point / bundle ordering that is not certain to have run
+// before `MiddleAuthRoiStoreAuth` resolves its provider -- which threw "No
+// registered credentials provider: middleauth" in the Pyodide build. This
+// side-effect import makes the registration a hard dependency of this module.
+import "#src/kvstore/middleauth/register_credentials_provider.js";
 import type {
   CredentialsProvider,
   CredentialsWithGeneration,
@@ -349,23 +356,36 @@ export class GoogleRoiStoreAuth implements RoiStoreAuth {
  * Constraints, both enforced by the deployment rather than here: the token is a
  * CAVE bearer token, so `endpoint` must accept it (not raw GCS); and the login
  * popup receives its response from the CAVE server's page via `window.opener`,
- * which COOP severs, so this cannot complete in the pyodide build.
+ * which COOP:same-origin severs. The `ng-pyodide` deploy therefore does not set
+ * COOP (see `firebase.json`), so the popup completes there too.
  */
 export class MiddleAuthRoiStoreAuth implements RoiStoreAuth {
   changed = new NullarySignal();
 
-  private provider: CredentialsProvider<MiddleAuthToken>;
+  private _provider: CredentialsProvider<MiddleAuthToken> | undefined;
   private current: CredentialsWithGeneration<MiddleAuthToken> | undefined;
   /** Creds to present as stale on the next get, to force a refresh. */
   private invalidated: CredentialsWithGeneration<MiddleAuthToken> | undefined;
   private pending: Promise<string> | undefined;
 
-  constructor(private authServer: string) {
-    this.provider =
-      getDefaultCredentialsManager().getCredentialsProvider<MiddleAuthToken>(
-        "middleauth",
-        authServer,
-      );
+  constructor(private authServer: string) {}
+
+  /**
+   * Resolved lazily, on first token request. Doing it in the constructor would
+   * crash the whole viewer at startup if "middleauth" is not registered in this
+   * build -- getRoiStoreAuth() is called eagerly when a store is configured
+   * (viewer.ts). Deferring keeps the sign-in chip and the export tab alive; a
+   * genuinely missing provider then surfaces only when the user tries to save.
+   */
+  private get provider(): CredentialsProvider<MiddleAuthToken> {
+    if (this._provider === undefined) {
+      this._provider =
+        getDefaultCredentialsManager().getCredentialsProvider<MiddleAuthToken>(
+          "middleauth",
+          this.authServer,
+        );
+    }
+    return this._provider;
   }
 
   private get storageKey(): string {

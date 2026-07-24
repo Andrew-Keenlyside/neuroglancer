@@ -21,6 +21,8 @@
  * route through the same chunk machinery).
  */
 
+import { COLOR_BY_DIRECTION_SHADER } from "#src/skeleton/default_shader.js";
+
 /**
  * Default skeleton-shader fragment-main text for **streamline** stores:
  * map the unit-sphere direction of the tangent at each vertex to an
@@ -29,16 +31,13 @@
  * synthesised per-vertex tangent attribute the chunk decoder produces
  * for kinds where {@link hasSynthesisedTangent} is true.
  *
- * Defined here (rather than `skeleton_shader_bridge.ts`) so the
- * capability table below can reference it without introducing a
- * value-level import cycle.  `skeleton_shader_bridge.ts` re-exports
- * for callers that imported it from there before the refactor.
+ * Aliases {@link COLOR_BY_DIRECTION_SHADER} (the datasource-neutral canonical
+ * string) so the store-nominated default, the Rendering tab's "Direction"
+ * preset, and the on-load `backgroundColorBy` sync are all byte-identical —
+ * see that constant for why the identity matters.  `skeleton_shader_bridge.ts`
+ * re-exports for callers that imported it from there before the refactor.
  */
-export const DEFAULT_STREAMLINE_FRAGMENT_MAIN = `void main() {
-  vec3 d = prop_tangent();
-  emitRGB(vec3(abs(d.x), abs(d.y), abs(d.z)));
-}
-`;
+export const DEFAULT_STREAMLINE_FRAGMENT_MAIN = COLOR_BY_DIRECTION_SHADER;
 
 /**
  * The geometry-type strings zarr-vectors emits in its
@@ -81,9 +80,18 @@ export interface GeometryKindCapabilities {
   /**
    * Renderer's default shader text (paste-in for users); `undefined`
    * falls back to the neuroglancer-built-in segment-coloured default.
-   * Only streamlines auto-apply the RGB-by-tangent default; for
-   * polylines, skeletons, and graphs we leave a sensible blank so the
-   * user can paste `prop_tangent()` if they want directional colour.
+   * Every current kind synthesises a per-vertex tangent, so all four
+   * auto-apply the RGB-by-tangent default -- matching the segmentation
+   * layer's `roiFilter.backgroundColorBy` default of "direction", so a
+   * freshly loaded tract layer renders colour-by-direction on the first
+   * frame rather than the generic per-object hash colour. A future kind
+   * without a tangent would nominate `undefined` and keep the hash default.
+   *
+   * The nomination still passes through {@link resolveSkeletonDefaultShader}'s
+   * agreement check on the layer, so a layer that also draws a no-tangent
+   * skeleton subsource (sharing the single skeleton shader) safely falls back
+   * to the generic default rather than installing an uncompilable
+   * `prop_tangent()`.
    */
   readonly defaultFragmentMain: string | undefined;
 }
@@ -100,21 +108,30 @@ export const KIND_CAPABILITIES: Record<
   polyline: {
     hasWalkOrderTangent: true,
     hasEdgeAdjacencyTangent: false,
-    defaultFragmentMain: undefined,
+    // Polylines carry a well-defined walk-order tangent at every vertex, just
+    // like streamlines (tractography is commonly written as "polyline"), so they
+    // auto-apply the same colour-by-direction default rather than the segment
+    // hash colour.
+    defaultFragmentMain: DEFAULT_STREAMLINE_FRAGMENT_MAIN,
   },
   skeleton: {
     // Synthesise per-vertex tangents from edge adjacency so shaders can
     // `prop_tangent()` (colour-by-direction).  Branch points get the
-    // central difference of their first two neighbours; the default
-    // shader stays segment-coloured (tangent is opt-in, not auto-applied).
+    // central difference of their first two neighbours.  Auto-applies the
+    // direction default like the other tangent-bearing kinds, matching the
+    // "direction" background colour-by default (see `defaultFragmentMain`);
+    // the agreement check keeps it safe in a mixed-subsource layer.
     hasWalkOrderTangent: false,
     hasEdgeAdjacencyTangent: true,
-    defaultFragmentMain: undefined,
+    defaultFragmentMain: DEFAULT_STREAMLINE_FRAGMENT_MAIN,
   },
   graph: {
     hasWalkOrderTangent: false,
     hasEdgeAdjacencyTangent: true,
-    defaultFragmentMain: undefined,
+    // Edge-adjacency tangents give graph vertices a meaningful direction, so
+    // graphs (a common tractography-as-connectivity encoding) auto-apply the
+    // colour-by-direction default too, matching the background colour-by default.
+    defaultFragmentMain: DEFAULT_STREAMLINE_FRAGMENT_MAIN,
   },
 };
 

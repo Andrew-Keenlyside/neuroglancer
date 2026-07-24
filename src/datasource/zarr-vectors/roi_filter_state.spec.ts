@@ -345,4 +345,211 @@ describe("insertGroup", () => {
     expect(moved).not.toBe(existing);
     expect(new Set(target.groups.map((g) => g.id)).size).toBe(2);
   });
+
+  it("carries colorBy + lengthFilter across states and JSON", () => {
+    const source = new RoiFilterState();
+    const id = source.addGroup();
+    source.updateGroup(id, {
+      colorBy: { kind: "objectAttr", name: "length" },
+      lengthFilter: { name: "length", min: 10, max: 50 },
+    });
+
+    // Direct carry.
+    const target = new RoiFilterState();
+    target.insertGroup(source.groups[0]);
+    expect(target.groups[0].colorBy).toEqual({
+      kind: "objectAttr",
+      name: "length",
+    });
+    expect(target.groups[0].lengthFilter).toEqual({
+      name: "length",
+      min: 10,
+      max: 50,
+    });
+
+    // JSON round trip.
+    const restored = new RoiFilterState();
+    restored.restoreState(source.toJSON());
+    expect(restored.groups[0].colorBy).toEqual({
+      kind: "objectAttr",
+      name: "length",
+    });
+    expect(restored.groups[0].lengthFilter).toEqual({
+      name: "length",
+      min: 10,
+      max: 50,
+    });
+  });
+});
+
+describe("RoiFilterState colour-by + length filter", () => {
+  it("defaults group colorBy to group and background to direction, both omitted", () => {
+    const s = new RoiFilterState();
+    s.addGroup();
+    expect(s.groups[0].colorBy).toEqual({ kind: "group" });
+    expect(s.backgroundColorBy).toEqual({ kind: "direction" });
+    expect(s.backgroundLengthFilter).toBeUndefined();
+    const json = s.toJSON();
+    expect("colorBy" in json.groups[0]).toBe(false);
+    expect("lengthFilter" in json.groups[0]).toBe(false);
+    expect("backgroundColorBy" in json).toBe(false);
+    expect("backgroundLengthFilter" in json).toBe(false);
+  });
+
+  it("round-trips every colorBy kind on a group", () => {
+    for (const spec of [
+      { kind: "direction" as const },
+      { kind: "position" as const },
+      { kind: "group" as const },
+      { kind: "objectAttr" as const, name: "length" },
+      { kind: "vertexAttr" as const, name: "fa" },
+    ]) {
+      const s = new RoiFilterState();
+      const g = s.addGroup();
+      s.updateGroup(g, { colorBy: spec });
+      const restored = new RoiFilterState();
+      restored.restoreState(s.toJSON());
+      expect(restored.groups[0].colorBy).toEqual(spec);
+    }
+  });
+
+  it("keeps background settings in the URL with no groups and inactive", () => {
+    const s = new RoiFilterState();
+    s.backgroundColorBy = { kind: "objectAttr", name: "length" };
+    s.backgroundLengthFilter = { name: "length", min: 5, max: 100 };
+    const json = s.toJSON();
+    expect(json).toBeDefined();
+    expect(json.backgroundColorBy).toBe("object:length");
+    expect(json.backgroundLengthFilter).toEqual({
+      name: "length",
+      min: 5,
+      max: 100,
+    });
+    const restored = new RoiFilterState();
+    restored.restoreState(json);
+    expect(restored.backgroundColorBy).toEqual({
+      kind: "objectAttr",
+      name: "length",
+    });
+    expect(restored.backgroundLengthFilter).toEqual({
+      name: "length",
+      min: 5,
+      max: 100,
+    });
+  });
+
+  it("updateGroup with lengthFilter: undefined clears the filter", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.updateGroup(g, { lengthFilter: { name: "length", min: 1, max: 2 } });
+    expect(s.groups[0].lengthFilter).toBeDefined();
+    s.updateGroup(g, { lengthFilter: undefined });
+    expect(s.groups[0].lengthFilter).toBeUndefined();
+    expect("lengthFilter" in s.toJSON().groups[0]).toBe(false);
+  });
+
+  it("migrates a legacy colorByGroup:false to per-group direction colour", () => {
+    const legacy = new RoiFilterState();
+    legacy.restoreState({
+      colorByGroup: false,
+      groups: [{ name: "G", color: "#ff0000", rois: [] }],
+    });
+    expect(legacy.groups[0].colorBy).toEqual({ kind: "direction" });
+
+    const dflt = new RoiFilterState();
+    dflt.restoreState({
+      groups: [{ name: "G", color: "#ff0000", rois: [] }],
+    });
+    expect(dflt.groups[0].colorBy).toEqual({ kind: "group" });
+  });
+
+  it("an explicit group colorBy overrides the legacy colorByGroup default", () => {
+    const s = new RoiFilterState();
+    s.restoreState({
+      colorByGroup: false,
+      groups: [
+        { name: "G", color: "#ff0000", rois: [], colorBy: "object:length" },
+      ],
+    });
+    expect(s.groups[0].colorBy).toEqual({ kind: "objectAttr", name: "length" });
+  });
+
+  it("round-trips a labelMask ROI through JSON", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.addRoi(g, {
+      shape: { kind: "labelMask", labels: [17, 53, 2] },
+      predicate: RoiPredicate.ANY_SEGMENT,
+      operator: RoiOperator.AND,
+    });
+    const json = s.toJSON();
+    expect(json.groups[0].rois[0].shape).toEqual({
+      type: "labelMask",
+      labels: [17, 53, 2],
+    });
+    const restored = new RoiFilterState();
+    restored.restoreState(json);
+    expect(restored.groups[0].rois[0].shape).toEqual({
+      kind: "labelMask",
+      labels: [17, 53, 2],
+    });
+  });
+});
+
+describe("RoiFilterState label-selection preview", () => {
+  const previewGroup = (labels: number[]) => ({
+    name: "Label selection",
+    color: vec3.fromValues(1, 1, 1),
+    visible: true,
+    opacity: 1,
+    highDetail: false,
+    colorBy: { kind: "group" as const },
+    rois: labels.map((id) => ({
+      shape: { kind: "labelMask" as const, labels: [id] },
+      predicate: RoiPredicate.ANY_SEGMENT,
+      operator: RoiOperator.AND,
+    })),
+  });
+
+  it("stages a preview that filters but stays out of the group list and URL", () => {
+    const s = new RoiFilterState();
+    s.setPreviewGroup(previewGroup([5]));
+    // Not a real group…
+    expect(s.groups).toHaveLength(0);
+    // …but the worker sees it, and the filter can act.
+    expect(s.groupsForWorker()).toHaveLength(1);
+    expect(s.groupsForWorker()[0].id).toBe(RoiFilterState.PREVIEW_GROUP_ID);
+    expect(s.hasVisibleRois()).toBe(true);
+    // …and it never persists.
+    expect(s.toJSON()).toBeUndefined();
+  });
+
+  it("commits the preview to a real group and clears the staging area", () => {
+    const s = new RoiFilterState();
+    s.setPreviewGroup(previewGroup([5, 9]));
+    const id = s.commitPreviewGroup("Bundle A");
+    expect(id).toBeDefined();
+    expect(id).not.toBe(RoiFilterState.PREVIEW_GROUP_ID);
+    expect(s.previewGroup).toBeUndefined();
+    expect(s.groups).toHaveLength(1);
+    expect(s.groups[0].name).toBe("Bundle A");
+    expect(s.groups[0].rois).toHaveLength(2);
+    // The committed group persists like any other.
+    expect(s.toJSON().groups).toHaveLength(1);
+  });
+
+  it("commit is a no-op with nothing staged", () => {
+    const s = new RoiFilterState();
+    expect(s.commitPreviewGroup()).toBeUndefined();
+    expect(s.groups).toHaveLength(0);
+  });
+
+  it("clearing the preview removes it from the worker view", () => {
+    const s = new RoiFilterState();
+    s.setPreviewGroup(previewGroup([5]));
+    s.setPreviewGroup(undefined);
+    expect(s.previewGroup).toBeUndefined();
+    expect(s.groupsForWorker()).toHaveLength(0);
+    expect(s.hasVisibleRois()).toBe(false);
+  });
 });

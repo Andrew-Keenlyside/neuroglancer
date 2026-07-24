@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -43,6 +44,10 @@ from neuroglancer.tractography.roi import streamlines_pass_rois
 
 #: Datasource prefixes neuroglancer puts on a URL that a store path must not carry.
 _SCHEME_PREFIX = re.compile(r"^(zarr-vectors|zarr3?)://")
+#: The viewer's KvStore pipeline suffix, e.g. ``<store-url>|zarr-vectors:``. The
+#: raw byte store is the part before it, so everything from ``|zarr-vectors`` on
+#: is stripped.
+_PIPELINE_SUFFIX = re.compile(r"\|zarr-vectors\b.*$")
 
 
 class ExportRunError(RuntimeError):
@@ -50,14 +55,23 @@ class ExportRunError(RuntimeError):
 
 
 def store_path_from_url(url: str) -> str:
-    """Strip the neuroglancer datasource scheme from a layer's source URL.
+    """Strip neuroglancer's datasource decoration from a layer's source URL.
 
-    The viewer addresses a store as ``zarr-vectors://gs://bucket/x.zvf``; the
-    Python API wants the underlying ``gs://bucket/x.zvf``. Anything without a
-    recognised prefix is passed through untouched, so a plain local path written
-    into a hand-edited job spec still works.
+    Two conventions are handled, because the two producers differ:
+
+    * a hand-written job spec uses the ``zarr-vectors://gs://bucket/x.zvf``
+      *prefix* form; and
+    * the viewer, for a loaded layer, uses the KvStore *pipeline* form
+      ``https://host/bucket/store.zarrvectors/|zarr-vectors:`` -- the store URL
+      followed by the format adapter.
+
+    Both reduce to the underlying byte-store URL (``gs://bucket/x.zvf`` /
+    ``https://host/bucket/store.zarrvectors/``). Anything without either marker
+    passes through untouched, so a plain local path still works.
     """
-    return _SCHEME_PREFIX.sub("", url, count=1)
+    url = _SCHEME_PREFIX.sub("", url, count=1)
+    url = _PIPELINE_SUFFIX.sub("", url)
+    return url
 
 
 def _require_zarr_vectors():
@@ -157,16 +171,27 @@ def passing_object_ids(index: TractIndex, group: ExportGroup) -> np.ndarray:
     return index.object_ids[streamlines_pass_rois(index, list(group.rois))]
 
 
-def select(
-    job: ExportJob, batch: int | None = None
+def select_from(
+    polylines: list,
+    object_ids: list,
+    groups: Sequence[ExportGroup],
+    batch: int | None = None,
+    *,
+    release: bool = False,
 ) -> tuple[int, list[tuple[str, np.ndarray]]]:
-    """Evaluate every group over the level.
+    """Fold `groups` over geometry that has *already* been read.
 
-    The read is one pass (see :func:`_read_level`); the *fold* is batched, since
-    that is where the memory goes -- 32 of `TractIndex`'s 44 bytes per vertex
-    are derived arrays that exist only to answer the ROI tests. Each batch's raw
-    fragments are released once indexed, so peak use falls as the pass proceeds
-    rather than holding raw geometry and derived arrays simultaneously.
+    Split out from :func:`select` so an in-browser caller that has read the
+    level through the async path can reuse the exact same fold without reading
+    the store a second time. `select` and the browser exporter must select the
+    same set from the same geometry, and that is guaranteed only by their
+    sharing this one implementation.
+
+    `release=True` frees each batch's raw fragments as it is indexed -- the
+    memory optimisation :func:`select` needs for a whole-brain level, where 32
+    of `TractIndex`'s 44 bytes per vertex are derived arrays. A caller that
+    still needs the geometry afterwards (e.g. to write the output from the same
+    in-memory read) leaves it False.
 
     Batching cannot change a verdict: the fold is decided per object, with no
     reference to any other object.
@@ -182,22 +207,21 @@ def select(
     # Resolved here rather than as a default argument, which would bind at def
     # time and make `OBJECT_BATCH` impossible to override.
     batch = OBJECT_BATCH if batch is None else batch
-    polylines, object_ids = _read_level(job)
-
-    per_group: list[list[np.ndarray]] = [[] for _ in job.groups]
+    per_group: list[list[np.ndarray]] = [[] for _ in groups]
     considered = 0
     for start in range(0, len(polylines), batch):
         stop = min(start + batch, len(polylines))
         index = build_index(polylines[start:stop], object_ids[start:stop])
         considered += len(index)
-        for i, group in enumerate(job.groups):
+        for i, group in enumerate(groups):
             hit = passing_object_ids(index, group)
             if hit.size:
                 per_group[i].append(hit)
-        # `build_index` concatenated these into the index's own buffers, so the
-        # originals are dead weight from here on.
-        for k in range(start, stop):
-            polylines[k] = None
+        if release:
+            # `build_index` concatenated these into the index's own buffers, so
+            # the originals are dead weight from here on.
+            for k in range(start, stop):
+                polylines[k] = None
         del index
 
     return considered, [
@@ -205,8 +229,20 @@ def select(
             g.name,
             np.concatenate(parts) if parts else np.zeros(0, dtype=np.uint64),
         )
-        for g, parts in zip(job.groups, per_group)
+        for g, parts in zip(groups, per_group)
     ]
+
+
+def select(
+    job: ExportJob, batch: int | None = None
+) -> tuple[int, list[tuple[str, np.ndarray]]]:
+    """Evaluate every group over the level: one unfiltered read, then the fold.
+
+    The read is one pass (see :func:`_read_level`); the *fold* is batched and
+    releases raw geometry as it goes (see :func:`select_from`).
+    """
+    polylines, object_ids = _read_level(job)
+    return select_from(polylines, object_ids, job.groups, batch, release=True)
 
 
 def _export_trk(job: ExportJob, ids: np.ndarray, output_path: str) -> dict[str, Any]:
@@ -304,10 +340,56 @@ def union_ids(per_group: list[tuple[str, np.ndarray]]) -> np.ndarray:
     return np.unique(np.concatenate(arrays))
 
 
+def per_group_from_object_ids(
+    groups: Sequence[ExportGroup],
+) -> list[tuple[str, np.ndarray]]:
+    """Each group's explicit id selection as ascending unique uint64 ids.
+
+    The v3 id-based path: the viewer already folded the dissection on screen and
+    handed us the passing ids per group, so there is nothing to read or fold here
+    -- just carry the ids through to the writer.
+    """
+    return [
+        (g.name, np.unique(np.asarray(g.object_ids or (), dtype=np.uint64)))
+        for g in groups
+    ]
+
+
+def _uses_explicit_ids(groups: Sequence[ExportGroup]) -> bool:
+    """Whether this is a v3 id-based selection, rejecting a mixed spec.
+
+    The viewer sends ``objectIds`` for every selected group or none, so a spec
+    where only some groups carry ids is malformed -- folding the rest would drag
+    the whole level back in and defeat the point. Fail fast with a clear message.
+    """
+    flags = [g.object_ids is not None for g in groups]
+    if any(flags) and not all(flags):
+        raise ExportRunError(
+            "Some groups carry explicit objectIds and others do not. Provide "
+            "objectIds for all groups or none."
+        )
+    return bool(flags) and all(flags)
+
+
 def run_job(job: ExportJob) -> dict[str, Any]:
     """Carry out `job`, returning a summary suitable for the viewer."""
-    considered, per_group = select(job)
-    ids = union_ids(per_group)
+    if job.scope == "whole":
+        # Every object at the level, no ROI fold. Still read the level to learn
+        # the id set the writers need; the writers re-read by id, matching the
+        # selected path.
+        _, object_ids = _read_level(job)
+        ids = np.unique(np.asarray(object_ids, dtype=np.uint64))
+        considered = int(ids.size)
+        per_group: list[tuple[str, np.ndarray]] = []
+    elif _uses_explicit_ids(job.groups):
+        # v3 fast path: read exactly the objects the viewer selected. No whole-
+        # level read, no fold -- `_export_trk`/`_export_zvf` re-read by id.
+        per_group = per_group_from_object_ids(job.groups)
+        ids = union_ids(per_group)
+        considered = int(ids.size)
+    else:
+        considered, per_group = select(job)
+        ids = union_ids(per_group)
 
     if job.destination.kind != "local":
         raise ExportRunError(

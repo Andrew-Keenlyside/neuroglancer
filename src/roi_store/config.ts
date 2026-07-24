@@ -30,17 +30,17 @@ declare const ROI_STORE:
        * Which sign-in backs writes.  Defaults to `google`.
        *
        * `google` — a Google OAuth2 token with a storage scope, written straight
-       * to the GCS JSON API. The only option that works in the cross-origin
-       * isolated (pyodide) build, because our own redirect page can broadcast
-       * the response past COOP.
+       * to the GCS JSON API. Works in every build; its redirect page can
+       * broadcast the response past COOP, so it survives even under
+       * cross-origin isolation.
        *
        * `middleauth` — reuse neuroglancer's existing CAVE/middleauth login (the
        * same one `state_share` uses), so no separate OAuth client is needed.
-       * TWO constraints: the middleauth token is a CAVE bearer token, so the
-       * `endpoint` MUST be a server that accepts it (not raw GCS); and the
-       * login popup gets its response from the CAVE server's own page via
-       * `window.opener`, which COOP severs — so this does NOT work in the
-       * pyodide build.
+       * One constraint: the middleauth token is a CAVE bearer token, so the
+       * `endpoint` MUST be a server that accepts it (not raw GCS). Its login
+       * popup gets its response via `window.opener`, which COOP:same-origin
+       * would sever — so the `ng-pyodide` deploy deliberately does NOT set COOP
+       * (see `firebase.json`), and middleauth works there too.
        */
       provider?: "google" | "middleauth";
       /**

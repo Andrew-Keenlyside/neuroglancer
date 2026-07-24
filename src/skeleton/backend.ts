@@ -23,8 +23,17 @@ import {
   withChunkManager,
 } from "#src/chunk_manager/backend.js";
 import { ChunkState } from "#src/chunk_manager/base.js";
-import type { Roi, RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
-import { roiRegionBounds } from "#src/datasource/zarr-vectors/roi.js";
+import type {
+  LabelSampler,
+  Roi,
+  RoiGroupConfig,
+  RoiLabelField,
+  RoiObjectAttrColumn,
+} from "#src/datasource/zarr-vectors/roi.js";
+import {
+  makeLabelSampler,
+  roiRegionBounds,
+} from "#src/datasource/zarr-vectors/roi.js";
 // Pure ROI geometry (no zarr/render deps) drives the streamline filter's
 // backend recompute for zarr-vectors spatially-indexed skeleton (tract) layers.
 // Inert for every other skeleton layer: the whole feature is guarded on the
@@ -32,6 +41,7 @@ import { roiRegionBounds } from "#src/datasource/zarr-vectors/roi.js";
 import {
   selectHighDetail,
   computeGroupedPassingSet,
+  computePerGroupPassingSets,
   diffPassingSet,
   type RoiFilterableChunk,
 } from "#src/datasource/zarr-vectors/roi_filter_backend.js";
@@ -62,6 +72,7 @@ import type { SharedWatchableValue } from "#src/shared_watchable_value.js";
 import type { SpatialSkeletonSourceState } from "#src/skeleton/api.js";
 import {
   SKELETON_LAYER_RPC_ID,
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
 } from "#src/skeleton/base.js";
@@ -101,7 +112,11 @@ import {
 } from "#src/visibility_priority/backend.js";
 
 import type { RPC } from "#src/worker_rpc.js";
-import { registerRPC, registerSharedObject } from "#src/worker_rpc.js";
+import {
+  registerPromiseRPC,
+  registerRPC,
+  registerSharedObject,
+} from "#src/worker_rpc.js";
 export interface SpatiallyIndexedSkeletonChunkSpecification
   extends SliceViewChunkSpecification {
   chunkLayout: any;
@@ -385,6 +400,21 @@ registerRPC(
   },
 );
 
+registerPromiseRPC(
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
+  function (this: RPC, x: { layer: number; groups: RoiGroupConfig[] }) {
+    const layer = this.get(
+      x.layer,
+    ) as SpatiallyIndexedSkeletonRenderLayerBackend;
+    // The fold is synchronous once the resident chunks are in hand; wrap the
+    // result in the {value, transfers} shape registerPromiseRPC expects.
+    return Promise.resolve({
+      value: layer.computeRoiExportIds(x.groups),
+      transfers: [],
+    });
+  },
+);
+
 // Chunk that contains the skeleton of a single object.
 export class SkeletonChunk extends Chunk implements SkeletonChunkData {
   objectId: bigint = 0n;
@@ -550,6 +580,30 @@ export class SpatiallyIndexedSkeletonChunk
     this.systemMemoryBytes =
       attributeBytes + (this.roiFilterableChunk?.fragmentIndex.byteLength ?? 0);
     super.downloadSucceeded();
+    // Reaching SYSTEM_MEMORY_WORKER is what makes this chunk's geometry
+    // filterable (roiFilterableChunk is set and deliberately retained past
+    // serialize). But the ROI passing-set recompute only re-runs on
+    // `recomputeChunkPrioritiesLate`, whose sole post-arrival trigger is
+    // `gpuMemoryChanged` -- which fires on GPU promotion/eviction, NOT on
+    // reaching worker memory. The ROI filter fetches region chunks regardless
+    // of the camera and folds the FINEST resident level, so a region chunk the
+    // view is not drawing lands here yet is never GPU-promoted; without this
+    // its arrival never re-folds and the passing set stays computed over the
+    // chunks resident at the last ROI edit (the "drag away and back to refresh"
+    // symptom). Re-run the late hook: the added chunk changes the recompute
+    // signature, so `maybeRecomputeRoiPassingSet` re-folds and includes it.
+    //
+    // THROTTLED, not per-arrival: a whole-brain load completes thousands of
+    // chunks in separate macrotasks, and each un-throttled call would re-arm a
+    // full multi-layer priority pass (`scheduleUpdateChunkPriorities` coalesces
+    // only within one task). The throttle caps that at the 200 ms
+    // `gpuMemoryChanged` cadence, trailing so the final arrival still lands a
+    // refold. Gated on roiFilterableChunk so it is inert for every non-tract
+    // skeleton layer; the recompute is itself one-at-a-time and cheap when no
+    // ROIs exist (it early-returns on the `hasRois` guard).
+    if (this.roiFilterableChunk !== undefined) {
+      this.chunkManager.scheduleUpdateChunkPrioritiesThrottled();
+    }
   }
 }
 
@@ -617,6 +671,16 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   // ghost-alpha while an async recompute catches up.
   roiPassingSegments?: Uint64Set;
   roiGroups?: SharedWatchableValue<readonly RoiGroupConfig[]>;
+  /** Per-object numeric attribute columns (length, …) for the length filter and
+   *  object-attribute colouring. */
+  roiObjectAttrColumns?: SharedWatchableValue<
+    ReadonlyMap<string, RoiObjectAttrColumn>
+  >;
+  /**
+   * Dense anatomical label grid from a linked parcellation layer, sampled per
+   * vertex to decide `labelMask` ROIs. Undefined when no parcellation is linked;
+   * label-mask ROIs then select nothing until it loads. */
+  roiLabelField?: SharedWatchableValue<RoiLabelField | undefined>;
   /** Shared id -> packed group colour for passing tracts (colour-by-group). */
   roiSegmentColors?: Uint64Map;
   /** Shared set of passing tracts of visible high-detail groups (drives pass-2). */
@@ -747,6 +811,20 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         this.chunkManager.scheduleUpdateChunkPriorities();
       };
       this.registerDisposer(roiGroups.changed.add(scheduleRoiRecompute));
+      if (options.roiObjectAttrColumns !== undefined) {
+        const columns = (this.roiObjectAttrColumns = rpc.get(
+          options.roiObjectAttrColumns,
+        ));
+        // New per-object values (a length attribute finished loading, a group
+        // switch) change what the length filter / attribute colour resolve to.
+        this.registerDisposer(columns.changed.add(scheduleRoiRecompute));
+      }
+      if (options.roiLabelField !== undefined) {
+        const field = (this.roiLabelField = rpc.get(options.roiLabelField));
+        // A parcellation loading (or the linked layer changing) changes which
+        // tracts a label-mask ROI selects, so it is a recompute trigger too.
+        this.registerDisposer(field.changed.add(scheduleRoiRecompute));
+      }
       if (options.roiHighDetailBudget !== undefined) {
         const budget = (this.roiHighDetailBudget = rpc.get(
           options.roiHighDetailBudget,
@@ -963,7 +1041,25 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     // budget silently stop applying wherever the service is available -- which
     // is precisely the build the budget matters most in.
     const budget = this.roiHighDetailBudget?.value;
-    if (!client.isUnavailable) {
+    const attrColumns = this.roiObjectAttrColumns?.value;
+    const labelField = this.roiLabelField?.value;
+    const sampleLabel: LabelSampler | undefined =
+      labelField !== undefined ? makeLabelSampler(labelField) : undefined;
+    // The dissection service knows nothing about per-object length filtering,
+    // attribute colouring (or the unified colour-by model, where a group can opt
+    // out of the flat colour override), OR label-mask ROIs (which need the dense
+    // parcellation grid the service does not have). When any visible group needs
+    // that, fall back to the in-worker TypeScript path, which has the values and
+    // applies it per group. The common case (all groups flat "group" colour, no
+    // length filter, only geometric ROIs) still takes the fast service path.
+    const needsLocal = groups.some(
+      (g) =>
+        g.visible &&
+        (g.lengthRange !== undefined ||
+          (g.colorBy !== undefined && g.colorBy.kind !== "group") ||
+          g.rois.some((r) => r.shape.kind === "labelMask")),
+    );
+    if (!client.isUnavailable && !needsLocal) {
       const remote = await client.compute(chunks, groups);
       if (remote !== undefined) {
         return {
@@ -980,6 +1076,8 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
       chunks.map((c) => c.data),
       groups,
       budget,
+      attrColumns,
+      sampleLabel,
     );
   }
 
@@ -1013,6 +1111,61 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
       }
       this.roiLastColorById = colorById;
     }
+  }
+
+  /**
+   * Evaluate `groups` over the currently-resident chunks and return, per group,
+   * its passing object ids as decimal strings. Drives the tract export: the tab
+   * hands these ids to the exporter, which reads exactly those objects instead
+   * of re-reading and re-folding the whole level.
+   *
+   * WYSIWYG by construction: it folds over the same finest-resident-level chunks
+   * the on-screen passing set is computed from (see `maybeRecomputeRoiPassingSet`
+   * for why a single level, and why the finest resident one). The result is
+   * positional -- `perGroup[i]` corresponds to `groups[i]` -- because group
+   * names are not unique.
+   *
+   * Ids are strings, not numbers: an object id is a uint64 and JSON would round
+   * one past 2**53. Synchronous: the fold is pure once the chunks are in hand.
+   */
+  computeRoiExportIds(groups: readonly RoiGroupConfig[]): {
+    perGroup: string[][];
+  } {
+    const byLevel = new Map<number, RoiFilterableChunk[]>();
+    for (const source of this.roiFilterableSources()) {
+      const gridIndex = getSpatiallyIndexedSkeletonGridIndex(source);
+      if (gridIndex === undefined) continue;
+      for (const chunk of source.chunks.values()) {
+        const c = chunk as SpatiallyIndexedSkeletonChunk;
+        const data = c.roiFilterableChunk;
+        if (data === undefined) continue;
+        let arr = byLevel.get(gridIndex);
+        if (arr === undefined) {
+          arr = [];
+          byLevel.set(gridIndex, arr);
+        }
+        arr.push(data);
+      }
+    }
+    // Finest level with any resident geometry (larger gridIndex is finer).
+    let targetLevel = -1;
+    for (const level of byLevel.keys()) {
+      if (level > targetLevel) targetLevel = level;
+    }
+    const chunks = targetLevel < 0 ? [] : byLevel.get(targetLevel)!;
+    const attrColumns = this.roiObjectAttrColumns?.value;
+    const labelField = this.roiLabelField?.value;
+    const sampleLabel: LabelSampler | undefined =
+      labelField !== undefined ? makeLabelSampler(labelField) : undefined;
+    const perGroupSets = computePerGroupPassingSets(
+      chunks,
+      groups,
+      attrColumns,
+      sampleLabel,
+    );
+    return {
+      perGroup: perGroupSets.map((s) => Array.from(s, (id) => id.toString())),
+    };
   }
 
   attach(

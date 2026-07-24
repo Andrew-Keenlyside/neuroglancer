@@ -29,6 +29,7 @@ import {
   selectHighDetail,
   computeGroupedPassingSet,
   computePassingSet,
+  computePerGroupPassingSets,
   diffPassingSet,
   RoiFilterAccumulator,
   type RoiFilterableChunk,
@@ -413,6 +414,194 @@ describe("computeGroupedPassingSet", () => {
       [{ ...groupA, highDetail: true, visible: false }],
     );
     expect(highDetail.size).toBe(0);
+  });
+
+  // Per-object attribute values, keyed by attribute name, as shipped to the
+  // worker for the length filter and object-attribute colouring.
+  const lengthColumns = (values: Record<number, number>, min = 0, max = 100) =>
+    new Map([
+      [
+        "length",
+        {
+          ids: BigUint64Array.from(Object.keys(values).map((k) => BigInt(k))),
+          values: Float32Array.from(Object.values(values)),
+          min,
+          max,
+        },
+      ],
+    ]);
+
+  it("narrows a group's passing set by a length range", () => {
+    const cols = lengthColumns({ 1: 50, 2: 10, 3: 999 });
+    // Object 1 (origin, length 50) is inside [40, 60] -> kept.
+    const kept = computeGroupedPassingSet(
+      [chunk],
+      [{ ...groupA, lengthRange: { name: "length", min: 40, max: 60 } }],
+      undefined,
+      cols,
+    );
+    expect([...kept.passing]).toEqual([1n]);
+    // Outside [60, 100] -> dropped, even though its ROI matches.
+    const dropped = computeGroupedPassingSet(
+      [chunk],
+      [{ ...groupA, lengthRange: { name: "length", min: 60, max: 100 } }],
+      undefined,
+      cols,
+    );
+    expect(dropped.passing.size).toBe(0);
+  });
+
+  it("colours a group by an object attribute (colourmap), not the flat colour", () => {
+    const { colorById } = computeGroupedPassingSet(
+      [chunk],
+      [{ ...groupA, colorBy: { kind: "objectAttr", name: "length" } }],
+      undefined,
+      lengthColumns({ 1: 50 }),
+    );
+    const c = colorById.get(1n);
+    expect(c).toBeTypeOf("number");
+    expect(c).not.toBe(RED); // colourmapped from the value, not the group swatch
+  });
+
+  it("leaves per-vertex-coloured groups out of the colour override", () => {
+    const specs = [
+      { kind: "direction" as const },
+      { kind: "position" as const },
+      { kind: "vertexAttr" as const, name: "fa" },
+    ];
+    for (const colorBy of specs) {
+      const { passing, colorById } = computeGroupedPassingSet(
+        [chunk],
+        [{ ...groupA, colorBy }],
+      );
+      expect([...passing]).toEqual([1n]); // still passes the filter
+      expect(colorById.has(1n)).toBe(false); // shader colours it per vertex
+    }
+  });
+
+  it("falls back to the group colour / no narrowing when values are absent", () => {
+    const { passing, colorById } = computeGroupedPassingSet(
+      [chunk],
+      [
+        {
+          ...groupA,
+          colorBy: { kind: "objectAttr", name: "length" },
+          lengthRange: { name: "length", min: 40, max: 60 },
+        },
+      ],
+      undefined,
+      new Map(), // no columns loaded yet
+    );
+    expect([...passing]).toEqual([1n]); // not dropped despite the range
+    expect(colorById.get(1n)).toBe(RED); // falls back to the group colour
+  });
+});
+
+describe("computePerGroupPassingSets", () => {
+  // Object 1 near origin, object 2 near x=10, object 3 near x=100 (crosses none).
+  const chunk: RoiFilterableChunk = {
+    rank: 3,
+    numVertices: 6,
+    positions: Float32Array.from([
+      -5, 0, 0, 5, 0, 0, 5, 0, 0, 15, 0, 0, 95, 0, 0, 105, 0, 0,
+    ]),
+    segmentIds: segColumn([1n, 1n, 2n, 2n, 3n, 3n]),
+    fragmentIndex: rangeIndex([
+      [0, 2],
+      [2, 2],
+      [4, 2],
+    ]),
+  };
+  const groupA: RoiGroupConfig = {
+    rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
+    colorPacked: 0,
+    visible: true,
+    highDetail: false,
+  };
+  const groupB: RoiGroupConfig = {
+    rois: [roi(sphere(10, 0, 0, 1), RoiOperator.AND)],
+    colorPacked: 0,
+    visible: true,
+    highDetail: false,
+  };
+
+  it("returns each group's passing set separately, positionally", () => {
+    const sets = computePerGroupPassingSets([chunk], [groupA, groupB]);
+    expect(sets.length).toBe(2);
+    expect([...sets[0]]).toEqual([1n]);
+    expect([...sets[1]]).toEqual([2n]);
+  });
+
+  it("does not merge groups: a shared object stays in every group that selects it", () => {
+    // The union path (computeGroupedPassingSet) would keep object 1 once; here it
+    // must appear in BOTH groups so per-group export counts are right.
+    const bAlsoOrigin: RoiGroupConfig = {
+      ...groupB,
+      rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
+    };
+    const sets = computePerGroupPassingSets([chunk], [groupA, bAlsoOrigin]);
+    expect([...sets[0]]).toEqual([1n]);
+    expect([...sets[1]]).toEqual([1n]);
+  });
+
+  it("evaluates invisible groups too (export honours the tick, not visibility)", () => {
+    // computeGroupedPassingSet SKIPS invisible groups; the export helper must not
+    // -- the user ticked the group to export it.
+    const sets = computePerGroupPassingSets(
+      [chunk],
+      [{ ...groupA, visible: false }],
+    );
+    expect([...sets[0]]).toEqual([1n]);
+  });
+
+  it("yields an empty set for a group with no rois", () => {
+    const sets = computePerGroupPassingSets([chunk], [{ ...groupA, rois: [] }]);
+    expect(sets[0].size).toBe(0);
+  });
+
+  it("keeps groups independent under exclusion", () => {
+    // Group A includes the origin and EXCLUDES x=10; group B includes x=10.
+    // B's object 2 must survive -- a flat fold would let A's ANDNOT drop it.
+    const a: RoiGroupConfig = {
+      ...groupA,
+      rois: [
+        roi(sphere(0, 0, 0, 1), RoiOperator.AND),
+        roi(sphere(10, 0, 0, 1), RoiOperator.ANDNOT),
+      ],
+    };
+    const sets = computePerGroupPassingSets([chunk], [a, groupB]);
+    expect([...sets[0]]).toEqual([1n]);
+    expect([...sets[1]]).toEqual([2n]);
+  });
+
+  it("narrows a group's set by a length range", () => {
+    const cols = new Map([
+      [
+        "length",
+        {
+          ids: BigUint64Array.from([1n]),
+          values: Float32Array.from([50]),
+          min: 0,
+          max: 100,
+        },
+      ],
+    ]);
+    const kept = computePerGroupPassingSets(
+      [chunk],
+      [{ ...groupA, lengthRange: { name: "length", min: 40, max: 60 } }],
+      cols,
+    );
+    expect([...kept[0]]).toEqual([1n]);
+    const dropped = computePerGroupPassingSets(
+      [chunk],
+      [{ ...groupA, lengthRange: { name: "length", min: 60, max: 100 } }],
+      cols,
+    );
+    expect(dropped[0].size).toBe(0);
+  });
+
+  it("returns an empty array for no groups", () => {
+    expect(computePerGroupPassingSets([chunk], [])).toEqual([]);
   });
 });
 

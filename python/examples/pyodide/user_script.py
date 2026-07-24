@@ -33,18 +33,61 @@ unavailable. Use `js.setTimeout` rather than `threading.Timer`.
 
 import neuroglancer
 
-# A zarr-vectors source is `<kvstore-url>|zarr-vectors:`. Any gs:// zarr-vectors
-# store works; the `https://storage.googleapis.com/...` form is used here so the
-# public bucket resolves without extra GCS auth.
+# A zarr-vectors source is `<kvstore-url>|zarr-vectors:`. The `gs://` form reads
+# the bucket anonymously (public `allUsers` read) AND lists it, so cross-chunk
+# links are enumerated by a real directory LIST -- complete discovery, with no
+# bounded neighbourhood probe (the probe in links.ts remains only as a
+# no-listing fallback). This needs the bucket to grant `allUsers` list + CORS,
+# which the admin has now enabled. A plain `https://storage.googleapis.com/...`
+# source reads the same objects but cannot LIST, so it would fall back to the
+# probe and could miss long-range links at decimated coarse levels.
 TEST_TRACTOGRAM = (
-    "https://storage.googleapis.com/hip_ct_zarr_vector_03987646472fethdsvdvdfg/"
+    "gs://hip_ct_zarr_vector_03987646472fethdsvdvdfg/"
     "zarr_vectors_test/hcp1065_whole_brain.zarrvectors/|zarr-vectors:"
+)
+
+# MNI reference volumes, same bucket, over `gs://` (zarr reads by key, so listing
+# is not required here -- gs:// just serves the reads anonymously all the same).
+# `mni_t1.zarr` / `mni_synthseg.zarr` are zarr v2 (OME-NGFF multiscale), hence
+# `|zarr2:`; the SynthSeg label names/colours come from a neuroglancer
+# `segment_properties` LUT, added as a `precomputed://` source on the
+# segmentation layer.
+MNI_BASE = (
+    "gs://hip_ct_zarr_vector_03987646472fethdsvdvdfg/zarr_vectors_test/mni_images/"
 )
 
 viewer = neuroglancer.Viewer()
 
 with viewer.txn() as s:
+    # Pin the global coordinate space to the TRACTS' frame (x, y, z in mm). The
+    # MNI volumes declare their axes as z, y, x in micrometer; without this pin
+    # their ordering would define the global space, which (a) scrambled ROI
+    # sphere/box placement -- the tool reads the crosshair in global-dimension
+    # order and assumes x, y, z -- and (b) shifted the tracts off identity. With
+    # the pin, every layer maps in by axis NAME (x->x, y->y, z->z) and unit, so
+    # the tracts stay at identity and ROI placement is correct.
+    s.dimensions = neuroglancer.CoordinateSpace(
+        names=["x", "y", "z"], units="mm", scales=[1, 1, 1]
+    )
+
+    # MNI reference UNDER the tracts (added first = lower in the layer stack).
+    s.layers["mni_t1"] = neuroglancer.ImageLayer(
+        source=MNI_BASE + "mni_t1.zarr/|zarr2:",
+    )
+    s.layers["mni_synthseg"] = neuroglancer.SegmentationLayer(
+        source=[
+            MNI_BASE + "mni_synthseg.zarr/|zarr2:",
+            # The label LUT (names/colours) for the parcellation.
+            "precomputed://" + MNI_BASE + "mni_synthseg_segment_properties/",
+        ],
+    )
+
     tracts = neuroglancer.SegmentationLayer(source=TEST_TRACTOGRAM)
+    # Link the SynthSeg parcellation so the Filter tab's "By segmentation label"
+    # panel can dissect the tracts by anatomy: toggle labels include/exclude and
+    # commit the combination to a tract group. The label names/colours come from
+    # the parcellation's `segment_properties` LUT.
+    tracts.roi_label_layer = "mni_synthseg"
     s.layers["tracts"] = tracts
     s.layout = "4panel"
 

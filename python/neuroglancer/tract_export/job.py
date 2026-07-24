@@ -40,6 +40,7 @@ from neuroglancer.tractography.roi import (
     Box,
     Ellipsoid,
     Halfspace,
+    LabelMask,
     Roi,
     RoiOperator,
     RoiPredicate,
@@ -47,10 +48,22 @@ from neuroglancer.tractography.roi import (
 )
 
 #: Bumped when a change would make an older exporter misread a newer spec.
-JOB_SCHEMA_VERSION = 1
+#: v2 added ``scope`` -- a v1 exporter would ignore it and quietly export the
+#: dissection when the whole store was asked for, so v2 specs must be rejected
+#: by an older exporter rather than silently mis-served.
+#: v3 added per-group ``objectIds``: the viewer's on-screen dissection selects
+#: the streamlines and hands the exporter their ids directly (WYSIWYG), so the
+#: exporter reads exactly those objects instead of re-reading and re-folding the
+#: whole level. A v2 exporter would ignore ``objectIds`` and re-fold ``rois``,
+#: producing a different (re-evaluated, not on-screen) set -- a misread -- so v3
+#: specs must be rejected by an older exporter.
+JOB_SCHEMA_VERSION = 3
 
 FORMATS = ("trk", "zvf")
 DESTINATION_KINDS = ("local", "gcs")
+#: ``selected`` folds the dissection; ``whole`` exports every object at the
+#: level with no ROI filter (a straight duplication of the store's geometry).
+SCOPES = ("selected", "whole")
 
 _PREDICATE_FROM_JSON = {
     "any_segment": RoiPredicate.ANY_SEGMENT,
@@ -75,6 +88,13 @@ class ExportGroup:
 
     name: str
     rois: tuple[Roi, ...]
+    #: Explicit object ids for this group, as computed by the viewer's on-screen
+    #: dissection (WYSIWYG export). When present, the exporter reads exactly these
+    #: objects and does NOT re-fold ``rois`` over the level -- that is the whole
+    #: point of v3. ``None`` means "fold ``rois``" (a hand-written spec, or the
+    #: retained legacy path); an empty tuple means "the on-screen fold selected
+    #: nothing", which is a valid empty selection, not "select everything".
+    object_ids: tuple[int, ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,6 +112,9 @@ class ExportJob:
     destination: Destination
     #: 4x4 voxel-to-RAS matrix for TRK, or None for identity.
     affine: np.ndarray | None = None
+    #: ``"selected"`` folds ``groups``; ``"whole"`` exports every object at the
+    #: level, ignoring ``groups`` (which may then be empty).
+    scope: str = "selected"
 
 
 def _require(obj: Any, key: str, where: str) -> Any:
@@ -129,6 +152,15 @@ def _parse_shape(obj: Any, where: str) -> RoiShape:
             _floats(_require(obj, "origin", where), f"{where}.origin"),
             _floats(_require(obj, "normal", where), f"{where}.normal"),
         )
+    if kind == "labelMask":
+        labels_raw = _require(obj, "labels", where)
+        if not isinstance(labels_raw, list | tuple) or not all(
+            isinstance(v, int) and not isinstance(v, bool) for v in labels_raw
+        ):
+            raise JobSpecError(f"{where}.labels: expected an array of integer ids")
+        # Provenance only: a label dissection is exported by objectIds, never
+        # folded here (Python has no parcellation to sample).
+        return LabelMask(labels=tuple(labels_raw))
     raise JobSpecError(f"{where}: unknown ROI shape type {kind!r}")
 
 
@@ -149,23 +181,71 @@ def _parse_roi(obj: Any, where: str) -> Roi:
     )
 
 
+def _parse_object_ids(value: Any, where: str) -> tuple[int, ...] | None:
+    """Parse a group's ``objectIds`` array, or ``None`` if the key is absent.
+
+    Ids arrive as **decimal strings**, not JSON numbers: an object id is a uint64
+    and can exceed JavaScript's safe-integer range, where ``JSON.stringify`` would
+    silently round it. Plain ints are also accepted for a hand-written spec.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise JobSpecError(
+            f"{where}.objectIds: expected an array of non-negative integer ids "
+            f"(as decimal strings)"
+        )
+    out: list[int] = []
+    for i, v in enumerate(value):
+        if isinstance(v, bool):
+            raise JobSpecError(f"{where}.objectIds[{i}]: expected an integer id")
+        if isinstance(v, int):
+            iv = v
+        elif isinstance(v, str):
+            try:
+                iv = int(v)
+            except ValueError:
+                raise JobSpecError(
+                    f"{where}.objectIds[{i}]: expected a decimal integer string"
+                ) from None
+        else:
+            raise JobSpecError(
+                f"{where}.objectIds[{i}]: expected a non-negative integer id "
+                f"(or its decimal string)"
+            )
+        if iv < 0:
+            raise JobSpecError(f"{where}.objectIds[{i}]: expected a non-negative id")
+        out.append(iv)
+    return tuple(out)
+
+
 def _parse_group(obj: Any, where: str) -> ExportGroup:
     name = _require(obj, "name", where)
     if not isinstance(name, str):
         raise JobSpecError(f"{where}.name: expected a string")
-    rois = _require(obj, "rois", where)
-    if not isinstance(rois, list):
+    object_ids = _parse_object_ids(obj.get("objectIds"), where)
+    rois_raw = obj.get("rois")
+    # ROIs are required only when there is no explicit id selection. A v3 spec
+    # carries the viewer's on-screen selection in ``objectIds`` and never folds
+    # ``rois`` -- the ids may even be empty (nothing passed on screen), which is a
+    # valid empty selection. The "empty rois selects everything" guard therefore
+    # applies only to the fold path (``objectIds`` absent).
+    if object_ids is None:
+        if not isinstance(rois_raw, list):
+            raise JobSpecError(f"{where}.rois: expected an array")
+        if not rois_raw:
+            raise JobSpecError(
+                f"{where}: group {name!r} has no ROIs, which would select every "
+                f"streamline in the dataset"
+            )
+    if rois_raw is None:
+        rois_raw = []
+    elif not isinstance(rois_raw, list):
         raise JobSpecError(f"{where}.rois: expected an array")
-    # An empty ROI list passes *everything*, which as an export would silently
-    # write the whole dataset under a group's name. Refuse rather than surprise.
-    if not rois:
-        raise JobSpecError(
-            f"{where}: group {name!r} has no ROIs, which would select every "
-            f"streamline in the dataset"
-        )
     return ExportGroup(
         name=name,
-        rois=tuple(_parse_roi(r, f"{where}.rois[{i}]") for i, r in enumerate(rois)),
+        rois=tuple(_parse_roi(r, f"{where}.rois[{i}]") for i, r in enumerate(rois_raw)),
+        object_ids=object_ids,
     )
 
 
@@ -207,6 +287,12 @@ def parse_job(obj: Any) -> ExportJob:
     if fmt not in FORMATS:
         raise JobSpecError(f"format: expected one of {FORMATS}, got {fmt!r}")
 
+    # Absent scope means "selected": a v1 spec had no scope and always folded
+    # the dissection, so that is the only back-compatible default.
+    scope = obj.get("scope", "selected")
+    if scope not in SCOPES:
+        raise JobSpecError(f"scope: expected one of {SCOPES}, got {scope!r}")
+
     destination = _require(obj, "destination", "spec")
     kind = _require(destination, "kind", "destination")
     if kind not in DESTINATION_KINDS:
@@ -225,9 +311,16 @@ def parse_job(obj: Any) -> ExportJob:
     if not isinstance(path, str) or not path:
         raise JobSpecError("destination.path: expected a non-empty string")
 
-    groups = _require(obj, "groups", "spec")
-    if not isinstance(groups, list) or not groups:
-        raise JobSpecError("groups: expected a non-empty array")
+    # A whole-store export folds no ROIs, so groups are optional and may be
+    # empty; a selected export needs at least one group to have anything to do.
+    if scope == "whole":
+        groups = obj.get("groups", [])
+        if not isinstance(groups, list):
+            raise JobSpecError("groups: expected an array")
+    else:
+        groups = _require(obj, "groups", "spec")
+        if not isinstance(groups, list) or not groups:
+            raise JobSpecError("groups: expected a non-empty array")
 
     affine = obj.get("affine")
     return ExportJob(
@@ -237,6 +330,7 @@ def parse_job(obj: Any) -> ExportJob:
         format=fmt,
         destination=Destination(kind=kind, path=path),
         affine=None if affine is None else _parse_affine(affine),
+        scope=scope,
     )
 
 

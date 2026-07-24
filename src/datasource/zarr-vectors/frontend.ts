@@ -366,6 +366,69 @@ async function getJsonResource(
   );
 }
 
+/**
+ * Read the per-chunk-array grid geometry from a level's `vertices/zarr.json`
+ * (v0.9.0 single-array format): `chunk_grid_origin`, whether the array uses the
+ * `sharding_indexed` codec, the shard shape, and the chunk-key separator. These
+ * drive the backend cell reader (see `shard_cell_reader.ts`). Rejects the
+ * pre-0.9.0 "Option G" layout, where the per-array node is a group rather than a
+ * single array — those stores are unreadable and must be rewritten from source.
+ */
+async function readChunkGridParams(
+  sharedKvStoreContext: SharedKvStoreContext,
+  levelUrl: string,
+  rank: number,
+  options: Partial<ProgressOptions>,
+): Promise<{
+  chunkGridOrigin: number[];
+  sharded: boolean;
+  shardChunkShape: number[];
+  cellSeparator: string;
+}> {
+  const json = await getJsonResource(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(levelUrl, "vertices/zarr.json"),
+    "zarr-vectors vertices array metadata",
+    options,
+  );
+  if (json === undefined || json.node_type !== "array") {
+    throw new Error(
+      `zarr-vectors: ${levelUrl}vertices is not a single zarr array ` +
+        `(node_type=${JSON.stringify(json?.node_type)}). Pre-0.9.0 "Option G" ` +
+        `stores are unreadable; rewrite from source with zarr-vectors >= 0.9.0.`,
+    );
+  }
+  const attrs = json.attributes ?? {};
+  const originRaw = attrs.chunk_grid_origin;
+  const chunkGridOrigin =
+    Array.isArray(originRaw) && originRaw.length === rank
+      ? originRaw.map((x: any) => Number(x))
+      : new Array<number>(rank).fill(0);
+  const codecs = json.codecs;
+  const sharded =
+    Array.isArray(codecs) &&
+    codecs.length > 0 &&
+    codecs[0]?.name === "sharding_indexed";
+  let shardChunkShape: number[] = [];
+  if (sharded) {
+    const cs = json.chunk_grid?.configuration?.chunk_shape;
+    if (!Array.isArray(cs) || cs.length !== rank) {
+      throw new Error(
+        `zarr-vectors: sharded vertices array at ${levelUrl} is missing a ` +
+          `chunk_grid.configuration.chunk_shape of rank ${rank}`,
+      );
+    }
+    shardChunkShape = cs.map((x: any) => Number(x));
+  }
+  const sep = json.chunk_key_encoding?.configuration?.separator;
+  return {
+    chunkGridOrigin,
+    sharded,
+    shardChunkShape,
+    cellSeparator: typeof sep === "string" ? sep : "/",
+  };
+}
+
 async function buildPropertySpecsAndDtypes(
   sharedKvStoreContext: SharedKvStoreContext,
   levelUrl: string,
@@ -407,6 +470,21 @@ async function buildPropertySpecsAndDtypes(
   const rawPropertyJson: any[] = [];
 
   for (const name of orderedNames) {
+    // `tangent` is reserved for the synthesised per-vertex direction
+    // (vec3 float32), exposed as `prop_tangent()` for the default
+    // colour-by-direction shader (see skeleton_shader_bridge.ts). A store
+    // that ALSO ships its own `tangent` vertex_attribute would redefine
+    // the `prop_tangent` macro and — being multi-component (vec3) while the
+    // reader packs user attributes as 1-component — make the skeleton
+    // shader fail to compile ("illegal vector field selection"), rendering
+    // nothing. The synthesised tangent wins; skip the store's copy.
+    if (name === "tangent") {
+      console.warn(
+        'zarr-vectors: ignoring reserved vertex attribute "tangent" — the ' +
+          "reader synthesises prop_tangent() for colour-by-direction.",
+      );
+      continue;
+    }
     let dtype: string | undefined;
     let arrayMeta: any | undefined;
     try {
@@ -591,6 +669,48 @@ function reinterpretObjectAttributeBytes(
 }
 
 /**
+ * Reinterpret an 8-byte-per-element blob (float64 / int64 / uint64) as
+ * `Float32Array`, downcasting values. The segment-properties columns hold
+ * float32 (or the narrow int types), so a float64 tortuosity or int64 vertex
+ * count would otherwise be dropped as "exotic"; downcasting keeps them usable
+ * for filtering and colouring (precision loss is immaterial for these).
+ */
+function reinterpretWideToFloat32(
+  bytes: Uint8Array,
+  kind: "float64" | "int64" | "uint64",
+  expectedElements: number,
+): Float32Array {
+  const elementSize = 8;
+  const expectedBytes = expectedElements * elementSize;
+  if (bytes.byteLength !== expectedBytes) {
+    throw new Error(
+      `zarr-vectors object_attributes: expected ${expectedBytes} bytes ` +
+        `(${expectedElements} elements), got ${bytes.byteLength}`,
+    );
+  }
+  let buffer: ArrayBufferLike = bytes.buffer;
+  let offset = bytes.byteOffset;
+  if (offset % elementSize !== 0) {
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    buffer = copy.buffer;
+    offset = 0;
+  }
+  const out = new Float32Array(expectedElements);
+  if (kind === "float64") {
+    const wide = new Float64Array(buffer, offset, expectedElements);
+    for (let i = 0; i < expectedElements; ++i) out[i] = wide[i];
+  } else {
+    const wide =
+      kind === "int64"
+        ? new BigInt64Array(buffer, offset, expectedElements)
+        : new BigUint64Array(buffer, offset, expectedElements);
+    for (let i = 0; i < expectedElements; ++i) out[i] = Number(wide[i]);
+  }
+  return out;
+}
+
+/**
  * Build a `SegmentPropertyMap` from level-0 `object_attributes/`.  Each
  * scalar (num_channels=1) attribute becomes one numerical column in
  * neuroglancer's segment-properties UI; the row order maps directly to
@@ -601,8 +721,11 @@ function reinterpretObjectAttributeBytes(
  * Multi-channel (num_channels > 1) attributes are silently dropped:
  * neuroglancer's segment-properties UI is scalar-per-column, and
  * splitting an O×C attribute into C named columns would require a
- * naming convention writers don't currently follow.  Same for dtypes
- * the segment-properties UI can't represent (uint64, float64, ...).
+ * naming convention writers don't currently follow.  (Colouring
+ * streamlines by a 3-vector attribute as RGB is a separate path.)
+ * Wide scalar dtypes (float64 / int64 / uint64) ARE accepted, downcast
+ * to float32 so common computed attributes (tortuosity, counts) are not
+ * lost; only genuinely unrepresentable dtypes are skipped.
  *
  * `present_mask` arrays are honoured: rows with mask=0 are dropped
  * from the segment-properties output so absent objects don't appear
@@ -644,26 +767,49 @@ async function buildObjectAttributePropertyMap(
       );
       if (meta === undefined) return undefined;
       const attrs = meta?.attributes ?? meta;
-      const dtype = String(attrs?.dtype ?? "");
-      const numChannels = Number(attrs?.num_channels ?? 1);
-      const shape = Array.isArray(attrs?.shape) ? attrs.shape : undefined;
-      const numObjects = shape !== undefined ? Number(shape[0]) : 0;
+      // Semantic dtype rides the group attributes; fall back to the array's own
+      // `data_type` for robustness.
+      const dtype = String(attrs?.dtype ?? meta?.data_type ?? "");
+      // Shape is `[O]` for a scalar column or `[O, C]` for a C-vector; the
+      // trailing dim is the channel count. (There is no `num_channels` field.)
+      const shape = Array.isArray(attrs?.shape)
+        ? attrs.shape
+        : Array.isArray(meta?.shape)
+          ? meta.shape
+          : undefined;
+      if (shape === undefined || shape.length === 0) return undefined;
+      const numObjects = Number(shape[0]);
+      const numChannels =
+        shape.length >= 2 ? Number(shape[shape.length - 1]) : 1;
       if (numObjects <= 0) return undefined;
       const entry = OBJECT_ATTR_DTYPE_TABLE[dtype];
-      if (entry === undefined || numChannels !== 1) {
-        // Skip exotic dtypes and multi-channel attributes — see docstring.
+      // Wide scalar dtypes are downcast to float32 (see reinterpretWideToFloat32)
+      // so a float64 tortuosity or int64 count is still discovered.
+      const wideKind =
+        dtype === "float64"
+          ? "float64"
+          : dtype === "int64"
+            ? "int64"
+            : dtype === "uint64"
+              ? "uint64"
+              : undefined;
+      if (
+        numChannels !== 1 ||
+        (entry === undefined && wideKind === undefined)
+      ) {
+        // Multi-channel attributes (e.g. a 3-vector orientation) are not scalar
+        // columns; truly exotic dtypes can't be represented — skip both.
         return undefined;
       }
-      // On-disk layout: `object_attributes/<name>/` is a group; the
-      // raw bytes live in a single-chunk zarr v3 array directory
-      // `data/` underneath it (`data/c/0` is the byte-blob; uint8 dtype
-      // at the zarr level, semantic dtype carried in the outer group's
-      // attributes — see `write_object_attributes` in zarr-vectors-py).
-      // We bypass the inner zarr metadata and read `data/c/0` directly:
-      // the byte length is known from `numObjects * elementSize`, and
-      // chunking is fixed to a single chunk by the writer.
+      const dataType = entry?.dataType ?? DataType.FLOAT32;
+      // On-disk layout: `object_attributes/<name>/` is itself a single-chunk
+      // zarr v3 array (not a group with a nested `data/` array). Its one chunk
+      // lives at `c/<0…>/` under the default chunk-key encoding ("/" separator):
+      // `c/0` for a scalar `[O]` array, `c/0/0` for a `[O, C]` vector. Read that
+      // blob directly; the semantic dtype is carried in the array attributes.
+      const chunkKey = `c/${shape.map(() => 0).join("/")}`;
       const dataResponse = await sharedKvStoreContext.kvStoreContext.read(
-        joinBaseUrlAndPath(arrayUrl, "data/c/0"),
+        joinBaseUrlAndPath(arrayUrl, chunkKey),
         options,
       );
       if (dataResponse === undefined) return undefined;
@@ -677,12 +823,15 @@ async function buildObjectAttributePropertyMap(
         rawBytes,
         options.signal ?? new AbortController().signal,
       );
-      const values = reinterpretObjectAttributeBytes(
-        bytes,
-        entry.ctor,
-        entry.elementSize,
-        numObjects,
-      );
+      const values =
+        entry !== undefined
+          ? reinterpretObjectAttributeBytes(
+              bytes,
+              entry.ctor,
+              entry.elementSize,
+              numObjects,
+            )
+          : reinterpretWideToFloat32(bytes, wideKind!, numObjects);
       let presentMask: Uint8Array | undefined;
       if (attrs?.has_present_mask === true) {
         const maskResponse = await sharedKvStoreContext.kvStoreContext.read(
@@ -701,7 +850,7 @@ async function buildObjectAttributePropertyMap(
       }
       return {
         name,
-        dataType: entry.dataType,
+        dataType,
         values,
         presentMask,
         numObjects,
@@ -1437,6 +1586,19 @@ async function buildSkeletonMetadata(
   pass2Params.geometryKind = geometryKind;
   pass2Params.linkDtype = linkDtype;
   pass2Params.hasFragmentSegmentIds = hasFragmentSegmentIds;
+  // Per-chunk-array grid geometry (origin + sharding) from level 0's
+  // vertices/zarr.json. Needed by pass 2 regardless of rank (it reads the same
+  // per-chunk arrays). Cached, so re-read per level below with no extra traffic.
+  const level0Grid = await readChunkGridParams(
+    sharedKvStoreContext,
+    level0Url,
+    rank,
+    options,
+  );
+  pass2Params.chunkGridOrigin = level0Grid.chunkGridOrigin;
+  pass2Params.sharded = level0Grid.sharded;
+  pass2Params.shardChunkShape = level0Grid.shardChunkShape;
+  pass2Params.cellSeparator = level0Grid.cellSeparator;
 
   // Pass-1 (spatially-indexed) wiring — only when the store is 3-D.
   // Neuroglancer's spatially-indexed skeleton machinery hardcodes a
@@ -1484,10 +1646,24 @@ async function buildSkeletonMetadata(
       vertexCount: number | undefined;
       objectSparsity: number | undefined;
       numObjects: number | undefined;
+      grid: {
+        chunkGridOrigin: number[];
+        sharded: boolean;
+        shardChunkShape: number[];
+        cellSeparator: string;
+      };
     }[] = await Promise.all(
       levelPaths.map(async (levelPath) => {
         const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
           pipelineUrlJoin(storeUrl, levelPath),
+        );
+        // Required: per-level per-chunk-array grid geometry (throws on the
+        // unreadable pre-0.9.0 "Option G" layout).
+        const grid = await readChunkGridParams(
+          sharedKvStoreContext,
+          levelUrl,
+          rank,
+          options,
         );
         try {
           const levelJson = await getJsonResource(
@@ -1521,6 +1697,7 @@ async function buildSkeletonMetadata(
             vertexCount,
             objectSparsity,
             numObjects,
+            grid,
           };
         } catch {
           // fall through to defaults
@@ -1531,6 +1708,7 @@ async function buildSkeletonMetadata(
           vertexCount: undefined,
           objectSparsity: undefined,
           numObjects: undefined,
+          grid,
         };
       }),
     );
@@ -1566,6 +1744,10 @@ async function buildSkeletonMetadata(
       // then looks up sources by `gridIndex`.
       params.gridIndex = levelPaths.length - 1 - k;
       params.hasFragmentSegmentIds = perLevelMeta[k].hasFragmentSegmentIds;
+      params.chunkGridOrigin = perLevelMeta[k].grid.chunkGridOrigin;
+      params.sharded = perLevelMeta[k].grid.sharded;
+      params.shardChunkShape = perLevelMeta[k].grid.shardChunkShape;
+      params.cellSeparator = perLevelMeta[k].grid.cellSeparator;
       levels.push({ parameters: params });
     }
 
@@ -1687,15 +1869,18 @@ function getSkeletonDataSource(
     },
   });
 
-  // Segment-properties subsource — opt-in like pass-2 (it's purely a
-  // UI augmentation: sortable/filterable columns in the segments-list
-  // panel, no extra geometry).  Only emitted when the store carries
-  // `object_attributes/` at level 0; otherwise the subsource doesn't
-  // exist to toggle.
+  // Segment-properties subsource.  Beyond the sortable/filterable columns in
+  // the segments-list panel, this map now BACKS the streamline filter's per-
+  // group + background length filter and colour-by-object-attribute: those UIs
+  // read `displayState.segmentPropertyMap.numericalProperties`, which is only
+  // populated when this subsource is active.  So it defaults ON (the feature
+  // must work without the user hunting for a source toggle); it carries no extra
+  // geometry.  Only emitted when the store carries `object_attributes/` at level
+  // 0; otherwise the subsource doesn't exist to toggle.
   if (metadata.segmentPropertyMap !== undefined) {
     subsources.push({
       id: "properties",
-      default: false,
+      default: true,
       subsource: { segmentPropertyMap: metadata.segmentPropertyMap },
     });
   }

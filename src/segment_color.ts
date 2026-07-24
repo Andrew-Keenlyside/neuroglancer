@@ -138,11 +138,17 @@ export class SegmentColorHash implements Trackable {
  * Adds the shader code to get a segment's color if it is present in the map.
  */
 export class SegmentStatedColorShaderManager {
-  private hashMapShaderManager = new HashMapShaderManager(
-    "segmentStatedColorHash",
-  );
+  // Derive the inner hash-map manager's name from the outer prefix so distinct
+  // instances get distinct texture-unit symbols and sampler/uniform names. (A
+  // hardcoded name made every instance collide on the same texture unit, which
+  // threw "Duplicate texture unit symbol" as soon as two were used in one
+  // shader.) Back-compatible: "segmentStatedColor" + "Hash" is the historical
+  // name, so the original instance is unchanged.
+  private hashMapShaderManager: HashMapShaderManager;
 
-  constructor(public prefix: string) {}
+  constructor(public prefix: string) {
+    this.hashMapShaderManager = new HashMapShaderManager(prefix + "Hash");
+  }
 
   defineShader(builder: ShaderBuilder) {
     this.hashMapShaderManager.defineShader(builder);

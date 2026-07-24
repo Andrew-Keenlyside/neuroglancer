@@ -202,6 +202,18 @@ function promptForStartingUrl(): Promise<string | null> {
       spinner.style.display = "";
       loading.style.display = "";
       setLoadingMessage("Running Python setup…");
+      // A Neuroglancer share link carries its whole state (layers + ROI filter)
+      // in a `#!{…}` fragment. Route that through the URL-hash path -- which
+      // takes over the frontend state directly -- rather than handing it to the
+      // Python script, which builds the fixed example scene and ignores it.
+      // Setting the hash here makes the boot code below restore it, exactly as
+      // if the link had been opened directly.
+      const hashIndex = url.indexOf("#!");
+      if (hashIndex !== -1) {
+        window.location.hash = url.slice(hashIndex);
+        resolve(null);
+        return;
+      }
       resolve(url || null);
     };
 
@@ -343,8 +355,10 @@ async function bootstrap() {
   setLoadingMessage("Loading Python packages (numpy, scipy, pillow)…");
   await packagesReadyPromise;
 
-  // Phase 2: prompt the user for an optional starting Neuroglancer URL.
-  const startingUrl = await promptForStartingUrl();
+  // Phase 2: prompt the user for an optional starting Neuroglancer URL. A shared
+  // link carries its whole state in the `#!{…}` hash (restored below by
+  // UrlHashBinding), so skip the start screen entirely and boot straight in.
+  const startingUrl = window.location.hash ? null : await promptForStartingUrl();
 
   // Phase 3: tell the worker to run the script, then wait for 'ready'.
   const readyPromise = new Promise<void>((resolve, reject) => {
@@ -425,13 +439,24 @@ async function bootstrap() {
 
   let sharedState: Trackable | undefined = viewer.state;
 
+  // Bind the viewer state to the URL hash in BOTH directions. Constructing the
+  // binding starts the serialize side (state -> `#!{…}` in the address bar), so
+  // the live URL is always a shareable link carrying the ROI filter groups
+  // (their positions, never the materialised passing-object IDs). `setUrlHash`
+  // uses `history.replaceState` (no `hashchange`) and dedupes on the encoded
+  // string, so it will not feed back into the Python shared-state ("s")
+  // synchronizer on a fresh boot.
+  const hashBinding = viewer.registerDisposer(
+    new UrlHashBinding(
+      viewer.state,
+      viewer.dataSourceProvider.sharedKvStoreContext,
+    ),
+  );
   if (window.location.hash) {
-    const hashBinding = viewer.registerDisposer(
-      new UrlHashBinding(
-        viewer.state,
-        viewer.dataSourceProvider.sharedKvStoreContext,
-      ),
-    );
+    // Opened from a shared link: the hash is authoritative. Restore it and drop
+    // the "s" synchronizer so the Python-built scene does not fight it. ROI
+    // filtering and tract export are frontend-driven and token-scoped, so they
+    // keep working with "s" off.
     hashBinding.updateFromUrlHash();
     sharedState = undefined;
   }

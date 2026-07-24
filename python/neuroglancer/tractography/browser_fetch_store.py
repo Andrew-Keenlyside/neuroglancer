@@ -27,8 +27,8 @@ Read-only, and deliberately non-listing: the async read path in ``aio`` never
 lists (it fetches metadata and chunks by key), and a plain HTTP object store
 cannot enumerate keys anyway. Any attempt to list raises.
 
-The byte-range interpretation lives in ``zarr_vectors_source.apply_byte_range``
-so it can be unit-tested without zarr present.
+The byte-range interpretation lives in ``zvf_pure.apply_byte_range`` so it can
+be unit-tested without zarr present.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from typing import Any
 from zarr.abc.store import ByteRequest, Store
 from zarr.core.buffer import Buffer, BufferPrototype
 
-from .zarr_vectors_source import apply_byte_range
+from .zvf_pure import apply_byte_range
 
 FetchFn = Callable[[str], Awaitable[bytes | None]]
 

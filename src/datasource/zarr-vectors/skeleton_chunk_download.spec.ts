@@ -16,6 +16,7 @@ import {
   type GhostVertexRequest,
   type LinkDtype,
 } from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
+import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 
 /** Build a single-range-fragment ZVFG blob covering all `numVertices` rows. */
 function singleRangeFragmentBlob(numVertices: number): Uint8Array {
@@ -110,9 +111,7 @@ const ENCODED_CHUNK_PATH = /\/c\/\d+(?:\/\d+)*$/;
  * `object_index/manifests/c/0` (a 1-D vlen array read by the manifest reader,
  * not a per-chunk array) working unchanged.
  */
-function makeKvStore(
-  map: Record<string, Uint8Array | undefined>,
-): (path: string, signal: AbortSignal) => Promise<Uint8Array | undefined> {
+function makeKvStore(map: Record<string, Uint8Array | undefined>): CellReader {
   const encoded = new Map<string, Uint8Array | undefined>();
   for (const [key, blob] of Object.entries(map)) {
     const m = ENCODED_CHUNK_PATH.test(key) ? null : key.match(CHUNK_KEY_SUFFIX);
@@ -124,12 +123,16 @@ function makeKvStore(
     const cellPath = `${arrayPath}/c/${m[1].split(".").join("/")}`;
     encoded.set(cellPath, blob === undefined ? undefined : vlenChunk(blob));
   }
-  return async (path: string) => encoded.get(path);
+  // `cellRead` contract: (arrayPath, chunkKey) -> raw vlen cell bytes. Mirrors
+  // the real reader, whose origin/shard resolution the download path no longer
+  // performs itself.
+  return async (arrayPath: string, chunkKey: string) =>
+    encoded.get(`${arrayPath}/c/${chunkKey.split(".").join("/")}`);
 }
 
 describe("downloadSkeletonChunk — orchestrator", () => {
   it("returns undefined when the vertices blob is absent", async () => {
-    const kvStoreRead = makeKvStore({});
+    const cellRead = makeKvStore({});
     const result = await downloadSkeletonChunk(
       {
         chunkKey: "0.0.0",
@@ -139,7 +142,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -147,7 +150,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   });
 
   it("returns undefined when the vertices blob is zero bytes", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": new Uint8Array(0),
     });
     const result = await downloadSkeletonChunk(
@@ -159,7 +162,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -169,7 +172,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   it("downloads a streamline chunk and returns positions + edges + tangents", async () => {
     // 3 vertices marching +X by 1 each step → tangents all (1, 0, 0).
     const positions = [0, 0, 0, 1, 0, 0, 2, 0, 0];
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/1.2.3": verticesBlob(positions),
       "vertex_fragments/1.2.3": singleRangeFragmentBlob(3),
     });
@@ -182,7 +185,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "implicit_sequential",
         geometryKind: "streamline",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -200,7 +203,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   });
 
   it("downloads a polyline chunk with per-vertex attributes", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(2),
       "vertex_attributes/radius/0.0.0": new Uint8Array(
@@ -216,7 +219,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: ["float32"],
         linksConvention: "implicit_sequential",
         geometryKind: "polyline",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -230,7 +233,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   it("downloads a skeleton chunk with implicit_sequential_with_branches and uint16 link dtype", async () => {
     // 5 vertices, single fragment.  Sequential edges plus a branch (1,4)
     // stored in the intra-chunk links array links/0/0.0.0 as uint16.
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([
         0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0,
       ]),
@@ -246,7 +249,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "implicit_sequential_with_branches",
         geometryKind: "skeleton",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -259,7 +262,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
 
   it("downloads an explicit-only graph chunk with int32 link dtype", async () => {
     const linksBlob = new Uint8Array(new Int32Array([0, 1, 2, 3]).buffer);
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(4),
       "links/0/0.0.0/0.0.0": linksBlob,
@@ -273,7 +276,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "explicit",
         geometryKind: "skeleton",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -282,7 +285,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   });
 
   it("handles a skeleton chunk with no branches (empty links blob)", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(2),
       "links/0/0.0.0/0.0.0": new Uint8Array(0),
@@ -296,7 +299,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "implicit_sequential_with_branches",
         geometryKind: "skeleton",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -305,7 +308,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   });
 
   it("rejects when vertex_fragments is missing", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0]),
     });
     await expect(
@@ -318,7 +321,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
           attributeDtypes: [],
           linksConvention: "implicit_sequential",
           geometryKind: "streamline",
-          kvStoreRead,
+          cellRead,
         },
         new AbortController().signal,
       ),
@@ -331,7 +334,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     // metavertex aggregation skips attribute propagation).  Rather
     // than fail the whole chunk, the reader degrades each missing
     // attribute to zero-filled.
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(2),
       // intentionally missing vertex_attributes/radius/...
@@ -345,7 +348,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: ["float32"],
         linksConvention: "implicit_sequential",
         geometryKind: "polyline",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -361,7 +364,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   it("widens narrow-int link dtypes to chunk-local Uint32Array", async () => {
     // uint8 link dtype — the widening should preserve indices losslessly.
     const linksBlob = new Uint8Array([0, 1, 1, 2]); // edges (0,1) and (1,2)
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]),
       "vertex_fragments/0.0.0": singleRangeFragmentBlob(3),
       "links/0/0.0.0/0.0.0": linksBlob,
@@ -375,7 +378,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "explicit",
         geometryKind: "skeleton",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -394,7 +397,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
           attributeDtypes: ["float32"], // mismatched length
           linksConvention: "implicit_sequential",
           geometryKind: "polyline",
-          kvStoreRead: makeKvStore({}),
+          cellRead: makeKvStore({}),
         },
         new AbortController().signal,
       ),
@@ -421,7 +424,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
     const id0 = 720575940612786691n;
     const id1 = 720575940606327461n;
     expect(id0 > 0xffffffffn && id1 > 0xffffffffn).toBe(true); // genuinely uint64
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([
         0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0,
       ]),
@@ -437,7 +440,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "implicit_sequential_with_branches",
         geometryKind: "skeleton",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -453,7 +456,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
   });
 
   it("falls back to the fragment's chunk-local index when segment_id is absent", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([
         0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4, 0, 0,
       ]),
@@ -469,7 +472,7 @@ describe("downloadSkeletonChunk — orchestrator", () => {
         attributeDtypes: [],
         linksConvention: "implicit_sequential_with_branches",
         geometryKind: "skeleton",
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -516,7 +519,7 @@ describe("downloadSkeletonChunk — link dtype matrix", () => {
   ];
   for (const { dtype, blob } of cases) {
     it(`reads edges with linkDtype=${dtype}`, async () => {
-      const kvStoreRead = makeKvStore({
+      const cellRead = makeKvStore({
         "vertices/0.0.0": verticesBlob([0, 0, 0, 1, 0, 0, 2, 0, 0]),
         "vertex_fragments/0.0.0": singleRangeFragmentBlob(3),
         "links/0/0.0.0/0.0.0": blob(),
@@ -530,7 +533,7 @@ describe("downloadSkeletonChunk — link dtype matrix", () => {
           attributeDtypes: [],
           linksConvention: "explicit",
           geometryKind: "skeleton",
-          kvStoreRead,
+          cellRead,
         },
         new AbortController().signal,
       );
@@ -551,7 +554,7 @@ function uint16AttrBlob(values: number[]): Uint8Array {
 describe("fetchGhostVertices", () => {
   it("returns [] for an empty request list (and does not fetch anything)", async () => {
     let fetchCount = 0;
-    const kvStoreRead = async (_path: string) => {
+    const cellRead = async (_path: string) => {
       fetchCount++;
       return undefined;
     };
@@ -561,7 +564,7 @@ describe("fetchGhostVertices", () => {
         rank: 3,
         attributeNames: ["fa"],
         attributeDtypes: ["float32"],
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -571,7 +574,7 @@ describe("fetchGhostVertices", () => {
 
   it("slices one neighbor vertex + attribute into a ghost record", async () => {
     // Neighbor chunk has 3 vertices.  Request vertex index 1.
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/1.0.0": verticesBlob([10, 20, 30, 11, 21, 31, 12, 22, 32]),
       "vertex_attributes/fa/1.0.0": new Uint8Array(
         new Float32Array([0.1, 0.5, 0.9]).buffer,
@@ -590,7 +593,7 @@ describe("fetchGhostVertices", () => {
         rank: 3,
         attributeNames: ["fa"],
         attributeDtypes: ["float32"],
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -606,7 +609,8 @@ describe("fetchGhostVertices", () => {
     const positionsCell = "vertices/c/1/0/0";
     const attributeCell = "vertex_attributes/fa/c/1/0/0";
     const fetched: string[] = [];
-    const kvStoreRead = async (path: string, _s: AbortSignal) => {
+    const cellRead: CellReader = async (arrayPath, chunkKey, _s) => {
+      const path = `${arrayPath}/c/${chunkKey.split(".").join("/")}`;
       fetched.push(path);
       if (path === positionsCell) {
         return vlenChunk(verticesBlob([10, 20, 30, 11, 21, 31, 12, 22, 32]));
@@ -629,7 +633,7 @@ describe("fetchGhostVertices", () => {
         rank: 3,
         attributeNames: ["fa"],
         attributeDtypes: ["float32"],
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -643,7 +647,7 @@ describe("fetchGhostVertices", () => {
   });
 
   it("drops requests whose neighbor chunk file is absent (sparse / missing)", async () => {
-    const kvStoreRead = makeKvStore({});
+    const cellRead = makeKvStore({});
     const requests: GhostVertexRequest[] = [
       { hostLocalVertex: 0, neighborChunkKey: "1.0.0", neighborLocalVertex: 0 },
     ];
@@ -653,7 +657,7 @@ describe("fetchGhostVertices", () => {
         rank: 3,
         attributeNames: ["fa"],
         attributeDtypes: ["float32"],
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -661,7 +665,7 @@ describe("fetchGhostVertices", () => {
   });
 
   it("drops requests whose neighbor vertex index is out of range", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       // Only 2 vertices' worth of bytes — index 5 is out of range.
       "vertices/1.0.0": verticesBlob([0, 0, 0, 1, 1, 1]),
     });
@@ -674,7 +678,7 @@ describe("fetchGhostVertices", () => {
         rank: 3,
         attributeNames: [],
         attributeDtypes: [],
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -682,7 +686,7 @@ describe("fetchGhostVertices", () => {
   });
 
   it("zero-fills missing neighbor attributes (pyramid-level case)", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/1.0.0": verticesBlob([5, 6, 7]),
       // Intentionally NO vertex_attributes/fa/...
     });
@@ -695,7 +699,7 @@ describe("fetchGhostVertices", () => {
         rank: 3,
         attributeNames: ["fa"],
         attributeDtypes: ["float32"],
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -704,7 +708,7 @@ describe("fetchGhostVertices", () => {
   });
 
   it("handles uint16-dtype attributes (mixed dtype slicing)", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/1.0.0": verticesBlob([0, 0, 0, 1, 1, 1]),
       "vertex_attributes/swc_type/1.0.0": uint16AttrBlob([3, 7]),
     });
@@ -717,7 +721,7 @@ describe("fetchGhostVertices", () => {
         rank: 3,
         attributeNames: ["swc_type"],
         attributeDtypes: ["uint16"],
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );
@@ -727,7 +731,7 @@ describe("fetchGhostVertices", () => {
   });
 
   it("handles multiple neighbors (parallel fetches, results ordered by request)", async () => {
-    const kvStoreRead = makeKvStore({
+    const cellRead = makeKvStore({
       "vertices/0.0.0": verticesBlob([1, 2, 3]),
       "vertices/1.0.0": verticesBlob([4, 5, 6]),
     });
@@ -749,7 +753,7 @@ describe("fetchGhostVertices", () => {
         rank: 3,
         attributeNames: [],
         attributeDtypes: [],
-        kvStoreRead,
+        cellRead,
       },
       new AbortController().signal,
     );

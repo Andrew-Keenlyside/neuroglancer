@@ -179,7 +179,11 @@ export class StoreGroupPicker extends RefCounted {
           void getRoiStoreAuth()
             .signIn()
             .then(() => this.refresh())
-            .catch(() => {});
+            .catch((err) => {
+              // Cancellation needs no message, but a throw before the status UI
+              // (e.g. no credentials provider) would otherwise look like a no-op.
+              console.error("[roi-store] sign-in failed:", err);
+            });
         },
       });
       this.statusEl.appendChild(signIn);

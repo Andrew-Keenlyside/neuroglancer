@@ -81,7 +81,48 @@ function parseDefines(argv: string[]): Record<string, string> {
   return defines;
 }
 
-const defines = parseDefines(args);
+/**
+ * The `ROI_STORE` build define, assembled from the environment so the build call
+ * stays a plain `npm run build-pyodide`. All parts have env overrides:
+ *
+ *   NEUROGLANCER_ROI_STORE_CLIENT_ID   Google OAuth2 client id (enables the
+ *                                      store under the default `google` provider)
+ *   NEUROGLANCER_ROI_STORE_BUCKET      GCS bucket (defaults to the demo bucket)
+ *   NEUROGLANCER_ROI_STORE_PROVIDER    `google` (default) or `middleauth`
+ *   NEUROGLANCER_ROI_STORE_AUTH_SERVER middleauth server (only for that provider)
+ *
+ * So enabling "Save to GCS" for the demo is just:
+ *
+ *   NEUROGLANCER_ROI_STORE_CLIENT_ID=YOUR_ID.apps.googleusercontent.com \
+ *   NEUROGLANCER_PYODIDE_PACKAGES=/path/to/zarr_vectors \
+ *   npm run build-pyodide
+ *
+ * The bucket IS required by the feature, but it is defaulted, so you never pass
+ * it. Until the provider's required credential is present (a clientId for
+ * `google`, an authServer for `middleauth`), the store is left unconfigured and
+ * the Export tab simply omits "Save to GCS". A `--define ROI_STORE=...` still
+ * overrides everything here.
+ */
+function roiStoreDefineFromEnv(): Record<string, string> {
+  const env = process.env;
+  const provider = env.NEUROGLANCER_ROI_STORE_PROVIDER ?? "google";
+  const bucket =
+    env.NEUROGLANCER_ROI_STORE_BUCKET ??
+    "hip_ct_zarr_vector_03987646472fethdsvdvdfg";
+  const clientId = env.NEUROGLANCER_ROI_STORE_CLIENT_ID;
+  const authServer = env.NEUROGLANCER_ROI_STORE_AUTH_SERVER;
+  const configured =
+    provider === "google" ? Boolean(clientId) : Boolean(authServer);
+  if (!configured) return {};
+  const config: Record<string, unknown> = { bucket, provider };
+  if (clientId) config.clientId = clientId;
+  if (authServer) config.authServer = authServer;
+  return { ROI_STORE: JSON.stringify(config) };
+}
+
+const DEFAULT_DEFINES: Record<string, string> = roiStoreDefineFromEnv();
+
+const defines = { ...DEFAULT_DEFINES, ...parseDefines(args) };
 
 // ---------------------------------------------------------------------------
 // Shared rspack module rules

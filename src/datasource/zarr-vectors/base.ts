@@ -155,6 +155,19 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceParameters {
   gridIndex!: number;
   /** Whether `fragment_attributes/segment_id` exists for this level. */
   hasFragmentSegmentIds!: boolean;
+  /**
+   * Per-chunk-array grid geometry from `<level>/vertices/zarr.json` (v0.9.0
+   * single-array format).  `chunkGridOrigin` is `attributes.chunk_grid_origin`
+   * (the on-disk 0-based cell index of absolute chunk coord `C` is
+   * `C - chunkGridOrigin`); `sharded` is `codecs[0].name === "sharding_indexed"`;
+   * `shardChunkShape` is `chunk_grid.configuration.chunk_shape` (empty when
+   * unsharded); `cellSeparator` is the chunk-key separator (default `/`).
+   * See {@link shard_cell_reader.ChunkGridDescriptor}.
+   */
+  chunkGridOrigin!: number[];
+  sharded!: boolean;
+  shardChunkShape!: number[];
+  cellSeparator!: string;
   static RPC_ID = "zarr-vectors/SpatiallyIndexedSkeletonSource";
 }
 
@@ -182,5 +195,13 @@ export class ZarrVectorsObjectKeyedSkeletonSourceParameters {
   linkDtype!: ZarrVectorsLinkDtype;
   /** Whether `fragment_attributes/segment_id` exists at level 0. */
   hasFragmentSegmentIds!: boolean;
+  /**
+   * Per-chunk-array grid geometry from level 0's `vertices/zarr.json`; see the
+   * matching fields on {@link ZarrVectorsSpatiallyIndexedSkeletonSourceParameters}.
+   */
+  chunkGridOrigin!: number[];
+  sharded!: boolean;
+  shardChunkShape!: number[];
+  cellSeparator!: string;
   static RPC_ID = "zarr-vectors/ObjectKeyedSkeletonSource";
 }

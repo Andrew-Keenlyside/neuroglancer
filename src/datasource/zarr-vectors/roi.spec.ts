@@ -17,12 +17,15 @@
 import { describe, expect, it } from "vitest";
 import {
   combineRoiVerdicts,
+  makeLabelSampler,
   RoiOperator,
   RoiPredicate,
   streamlinePassesRoi,
   roiRegionBounds,
   streamlinePassesRois,
+  type LabelSampler,
   type Roi,
+  type RoiLabelField,
   type RoiShape,
   type StreamlineRef,
 } from "#src/datasource/zarr-vectors/roi.js";
@@ -501,5 +504,146 @@ describe("roiRegionBounds", () => {
 
   it("is undefined for an empty list", () => {
     expect(roiRegionBounds([])).toBeUndefined();
+  });
+
+  it("is undefined when any region is a label mask (unbounded)", () => {
+    expect(
+      roiRegionBounds([
+        mk({ kind: "box", lower: f(0, 0, 0), upper: f(1, 1, 1) }),
+        mk({ kind: "labelMask", labels: [7] }),
+      ]),
+    ).toBeUndefined();
+  });
+});
+
+describe("streamlinePassesRoi — labelMask", () => {
+  // A sampler that labels the single voxel column at x≈5 (rounded) as label 42,
+  // everything else background (0).
+  const sampleLabel: LabelSampler = (x) => (Math.round(x) === 5 ? 42 : 0);
+  const mask = (...labels: number[]): RoiShape => ({
+    kind: "labelMask",
+    labels,
+  });
+
+  it("passes a track with a vertex in a matching label voxel", () => {
+    expect(
+      streamlinePassesRoi(
+        line(0, 0, 0, 5, 0, 0, 20, 0, 0),
+        mask(42),
+        RoiPredicate.ANY_SEGMENT,
+        sampleLabel,
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a track that never enters the label", () => {
+    expect(
+      streamlinePassesRoi(
+        line(0, 0, 0, 1, 0, 0, 2, 0, 0),
+        mask(42),
+        RoiPredicate.ANY_SEGMENT,
+        sampleLabel,
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects when the label is present but not in the mask's label set", () => {
+    expect(
+      streamlinePassesRoi(
+        line(5, 0, 0),
+        mask(7, 8),
+        RoiPredicate.ANY_VERTEX,
+        sampleLabel,
+      ),
+    ).toBe(false);
+  });
+
+  it("matches any of several labels", () => {
+    expect(
+      streamlinePassesRoi(
+        line(5, 0, 0),
+        mask(7, 42),
+        RoiPredicate.ANY_VERTEX,
+        sampleLabel,
+      ),
+    ).toBe(true);
+  });
+
+  it("decides nothing (false) when no sampler is supplied", () => {
+    expect(
+      streamlinePassesRoi(line(5, 0, 0), mask(42), RoiPredicate.ANY_VERTEX),
+    ).toBe(false);
+  });
+
+  it("honours the endpoint predicates", () => {
+    // Endpoint at x=5 (label 42), interior/other endpoint outside.
+    const track = line(5, 0, 0, 0, 0, 0, 1, 0, 0);
+    expect(
+      streamlinePassesRoi(
+        track,
+        mask(42),
+        RoiPredicate.EITHER_ENDPOINT,
+        sampleLabel,
+      ),
+    ).toBe(true);
+    expect(
+      streamlinePassesRoi(
+        track,
+        mask(42),
+        RoiPredicate.BOTH_ENDPOINTS,
+        sampleLabel,
+      ),
+    ).toBe(false);
+  });
+
+  it("folds include/exclude label masks through streamlinePassesRois", () => {
+    // Two label voxels: 42 at x≈5, 7 at x≈-5.
+    const s: LabelSampler = (x) =>
+      Math.round(x) === 5 ? 42 : Math.round(x) === -5 ? 7 : 0;
+    const roi = (labels: number[], operator: RoiOperator): Roi => ({
+      shape: { kind: "labelMask", labels },
+      predicate: RoiPredicate.ANY_VERTEX,
+      operator,
+    });
+    // Include 42, exclude 7.
+    const rois = [roi([42], RoiOperator.AND), roi([7], RoiOperator.ANDNOT)];
+    // Through 42 only → passes.
+    expect(streamlinePassesRois(line(5, 0, 0), rois, s)).toBe(true);
+    // Through 42 AND 7 → excluded.
+    expect(streamlinePassesRois(line(5, 0, 0, -5, 0, 0), rois, s)).toBe(false);
+    // Through neither → fails the include.
+    expect(streamlinePassesRois(line(0, 0, 0), rois, s)).toBe(false);
+  });
+});
+
+describe("makeLabelSampler", () => {
+  // 2×2×2 grid, x fastest; only voxel (1,0,1) carries label 9.
+  const field: RoiLabelField = {
+    data: (() => {
+      const d = new Uint32Array(8);
+      d[1 + 2 * (0 + 2 * 1)] = 9; // (vx=1, vy=0, vz=1)
+      return d;
+    })(),
+    dims: [2, 2, 2],
+    // Identity model→voxel (row-major 4×4).
+    modelToVoxel: Float32Array.from([
+      1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
+    ]),
+  };
+  const sample = makeLabelSampler(field);
+
+  it("reads the label at a voxel centre", () => {
+    expect(sample(1, 0, 1)).toBe(9);
+    expect(sample(0, 0, 0)).toBe(0);
+  });
+
+  it("rounds to the nearest voxel", () => {
+    expect(sample(0.9, 0.1, 1.1)).toBe(9);
+  });
+
+  it("returns 0 outside the grid", () => {
+    expect(sample(-1, 0, 0)).toBe(0);
+    expect(sample(2, 0, 0)).toBe(0);
+    expect(sample(0, 0, 5)).toBe(0);
   });
 });

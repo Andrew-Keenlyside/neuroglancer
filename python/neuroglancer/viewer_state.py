@@ -1025,6 +1025,9 @@ class SegmentationLayer(Layer, _AnnotationLayerOptions):
     linked_segmentation_group = linkedSegmentationGroup = wrapped_property(
         "linkedSegmentationGroup", optional(str)
     )
+    # Name of a parcellation segmentation layer whose labels dissect the tracts
+    # (the zarr-vectors streamline Filter tab's "By segmentation label" panel).
+    roi_label_layer = roiLabelLayer = wrapped_property("roiLabelLayer", optional(str))
     linked_segmentation_color_group = linkedSegmentationColorGroup = wrapped_property(
         "linkedSegmentationColorGroup", optional(_linked_segmentation_color_group_value)
     )

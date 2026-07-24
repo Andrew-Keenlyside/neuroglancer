@@ -28,6 +28,7 @@ from neuroglancer.tractography import (
     Box,
     Ellipsoid,
     Halfspace,
+    LabelMask,
     Roi,
     RoiOperator,
     RoiPredicate,
@@ -513,3 +514,12 @@ class TestTractIndex:
             assert bool(streamlines_pass_roi(index, shape)[0]) == bool(
                 streamlines_pass_roi(small, shape)[0]
             ), shape
+
+
+class TestLabelMask:
+    def test_folding_a_label_mask_raises_a_clear_error(self):
+        # Python has no parcellation volume to sample; a label dissection is
+        # exported by objectIds, never folded. Folding must fail loudly.
+        roi = Roi(LabelMask(labels=(1, 2)), RoiPredicate.ANY_VERTEX, RoiOperator.AND)
+        with pytest.raises(NotImplementedError, match="label-mask"):
+            streamlines_pass_rois(line(0, 0, 0, 1, 1, 1), [roi])

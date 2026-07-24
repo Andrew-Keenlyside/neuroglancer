@@ -47,6 +47,7 @@ import {
   linksPath,
   parseOffsets,
 } from "#src/datasource/zarr-vectors/links_paths.js";
+import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 
 /** One endpoint of a link: which chunk, and which vertex within it. */
 export interface CrossChunkLinkEndpoint {
@@ -85,6 +86,13 @@ export interface CrossChunkLinksReaderOptions {
     signal: AbortSignal,
   ) => Promise<Uint8Array | undefined>;
   /**
+   * Reads one per-chunk array cell (`<offsets>/c/<sourceChunk>`), resolving
+   * `chunk_grid_origin` and the `sharding_indexed` packing. Used for the link
+   * record cells; `kvStoreRead` above still serves the whole-file `zarr.json`
+   * reads. Returns the raw vlen-bytes container, or `undefined` when absent.
+   */
+  readonly cellRead: CellReader;
+  /**
    * Lists the immediate children of one directory-like prefix (relative to the
    * level base URL). When available it enumerates every `<offsets>` array under
    * `links/<delta>/` — the correct, unbounded discovery. When omitted (or it
@@ -106,7 +114,31 @@ export interface CrossChunkLinksReaderOptions {
   readonly fallbackOffsetRadius?: number;
 }
 
-const DEFAULT_FALLBACK_OFFSET_RADIUS = 1;
+/**
+ * Optional build-time override for the offset-probe radius, e.g.
+ * `--define ZARR_VECTORS_LINK_PROBE_RADIUS=3`. Substituted by DefinePlugin; when
+ * unset, `typeof` is `"undefined"` (safe on an undeclared global) and the
+ * default below applies.
+ */
+declare const ZARR_VECTORS_LINK_PROBE_RADIUS: number | undefined;
+
+/**
+ * Chebyshev radius for the GET-only offset probe used when the store cannot LIST
+ * (e.g. a public GCS store addressed as raw `https://...`, which has no
+ * directory listing). Adjacent-chunk links are radius 1, but DECIMATED coarse
+ * levels can have longer bridges -- too small a radius drops them and
+ * streamlines show gaps when zoomed out.
+ *
+ * Default 2 covers common decimation at (2·2+1)³−1 = 124 speculative GETs per
+ * query set (misses are harmless 404s). Raise it with
+ * `--define ZARR_VECTORS_LINK_PROBE_RADIUS=<n>` if gaps remain; the real fix is
+ * to make the store listable (`gs://` + Object Viewer/CORS) or to stamp the
+ * offset children into `links/<delta>/` metadata.
+ */
+const DEFAULT_FALLBACK_OFFSET_RADIUS =
+  typeof ZARR_VECTORS_LINK_PROBE_RADIUS === "number"
+    ? ZARR_VECTORS_LINK_PROBE_RADIUS
+    : 2;
 
 /** Marker written on the `links/<delta>/` family group. */
 const LINKS_FAMILY_MARKER = "links_family";
@@ -526,9 +558,6 @@ async function getDiscovery(
 function chunkKeyDot(coords: readonly number[]): string {
   return coords.join(".");
 }
-function cellPath(arrayPath: string, coords: readonly number[]): string {
-  return `${arrayPath}/c/${coords.join("/")}`;
-}
 
 async function readCellRecords(
   options: CrossChunkLinksReaderOptions,
@@ -537,15 +566,18 @@ async function readCellRecords(
   family: LinksFamilyMeta,
   signal: AbortSignal,
 ): Promise<CrossChunkLinkRecord[]> {
-  // Skip the GET when the array's manifest says this cell is empty.
+  // Skip the read when the array's manifest says this cell is empty.
+  // nonempty_chunks are ABSOLUTE coords (incl. negatives under a nonzero
+  // chunk_grid_origin); the origin/shard translation happens inside `cellRead`.
   if (
     descriptor.nonemptyChunks !== undefined &&
     !descriptor.nonemptyChunks.has(chunkKeyDot(sourceChunk))
   ) {
     return [];
   }
-  const raw = await options.kvStoreRead(
-    cellPath(descriptor.arrayPath, sourceChunk),
+  const raw = await options.cellRead(
+    descriptor.arrayPath,
+    chunkKeyDot(sourceChunk),
     signal,
   );
   if (raw === undefined || raw.byteLength === 0) return [];
@@ -601,7 +633,16 @@ export async function readCrossChunkLinksForChunk(
       const mirror = targetChunkCoords.map(
         (c, d) => c - descriptor.offsets[0][d],
       );
-      if (mirror.every((c) => c >= 0)) {
+      // Read the mirror cell if it's a populated source chunk. nonempty_chunks
+      // (absolute coords, which under a nonzero chunk_grid_origin legitimately
+      // include NEGATIVES) is the presence oracle; when it is absent, attempt
+      // the read and let `readCellRecords`/`cellRead` return [] for a missing
+      // cell. The former `mirror.every((c) => c >= 0)` guard wrongly dropped
+      // negative-coordinate source chunks, breaking bridges at those seams.
+      if (
+        descriptor.nonemptyChunks === undefined ||
+        descriptor.nonemptyChunks.has(chunkKeyDot(mirror))
+      ) {
         for (const rec of await readCellRecords(
           options,
           descriptor,

@@ -21,7 +21,12 @@ import {
   ChunkRenderLayerFrontend,
   ChunkSource,
 } from "#src/chunk_manager/frontend.js";
-import type { RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
+import type {
+  RoiBackgroundUniforms,
+  RoiGroupConfig,
+  RoiLabelField,
+  RoiObjectAttrColumn,
+} from "#src/datasource/zarr-vectors/roi.js";
 import { hashCombine } from "#src/gpu_hash/hash_function.js";
 import type { HashMapUint64, HashSetUint64 } from "#src/gpu_hash/hash_table.js";
 import { GPUHashTable, HashSetShaderManager } from "#src/gpu_hash/shader.js";
@@ -72,6 +77,7 @@ import type {
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import {
   SKELETON_LAYER_RPC_ID,
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
 } from "#src/skeleton/base.js";
@@ -199,7 +205,13 @@ const tempMat4 = mat4.create();
 const tempRoiColor = vec4.create();
 const OVERLAY_SELECTED_FLOAT_ZERO = new Float32Array([0]);
 const OVERLAY_SELECTED_FLOAT_ONE = new Float32Array([1]);
-const DEFAULT_FRAGMENT_MAIN = `void main() {
+/**
+ * The generic built-in skeleton shader: segment-coloured (`emitDefault()`). The
+ * initial `SkeletonRenderingOptions.shader` default, and the shader the layer
+ * reverts to when its skeleton subsources nominate no agreed default (see
+ * `applySkeletonDefaultShader`).
+ */
+export const DEFAULT_FRAGMENT_MAIN = `void main() {
   emitDefault();
 }
 `;
@@ -247,6 +259,12 @@ interface SkeletonShaderParameters {
   hasRoiHighDetailHide: boolean;
   /** Compile the ROI colour-by-group tier (zarr-vectors tract layers). */
   hasRoiSegmentColors: boolean;
+  /**
+   * Compile the background per-object value tier: the whole-tractogram length
+   * filter (discard) and flat colour-by-attribute. Pass 1 only (the background
+   * tracts it governs are never drawn by the pass-2 high-detail layer).
+   */
+  hasRoiObjectValues: boolean;
   hasSegmentStatedColors: boolean;
   hasSegmentDefaultColor: boolean;
   hoverHighlight: boolean;
@@ -333,6 +351,13 @@ class RenderHelper extends RefCounted {
   private roiSegmentColorShaderManager = new SegmentStatedColorShaderManager(
     "roiSegmentColor",
   );
+  // Background per-object value tier: id -> normalised attribute value (16-bit,
+  // packed into the low two colour bytes). Drives the whole-tractogram length
+  // filter (discard) and flat colour-by-attribute, for tracts NOT claimed by a
+  // group (or the whole tractogram when the ROI filter is off).
+  private roiObjectValueShaderManager = new SegmentStatedColorShaderManager(
+    "roiObjectValue",
+  );
   private readonly clearedTextureUnits = new Set<number>();
   private emptySegmentSet = new Uint64Set();
   private gpuVisibleSegmentsHashTable: GPUHashTable<HashSetUint64>;
@@ -345,6 +370,7 @@ class RenderHelper extends RefCounted {
     | GPUHashTable<HashSetUint64>
     | undefined;
   private gpuRoiSegmentColorHashTable: GPUHashTable<HashMapUint64> | undefined;
+  private gpuRoiObjectValueHashTable: GPUHashTable<HashMapUint64> | undefined;
   // Lazily acquired and re-checked each draw; see getSegmentStatedColorHashTable.
   private gpuSegmentStatedColorHashTable:
     | GPUHashTable<HashMapUint64>
@@ -432,6 +458,13 @@ void spatialChunkCull() {
       builder.addFragmentCode(`#define ${info.name} vCustom${i}\n`);
       builder.addFragmentCode(`#define prop_${info.name}() vCustom${i}\n`);
     }
+    // Expose the vertex world position as `prop_position()` so a shader can
+    // colour by position (attribute slot 0 is always position; `vertexIndex` is
+    // defined in both the edge and node vertex mains). Interpolates along a line
+    // segment, giving a smooth per-vertex position colour.
+    builder.addVarying("highp vec3", "vPosition");
+    vertexMain += `vPosition = readAttribute0(vertexIndex);\n`;
+    builder.addFragmentCode(`#define prop_position() vPosition\n`);
     builder.setVertexMain(vertexMain);
     addControlsToBuilder(shaderBuilderState, builder);
     builder.addFragmentCode(`void userMain();\n`);
@@ -541,6 +574,25 @@ void spatialChunkCull() {
   }`
       : "";
 
+    // Background (whole-tractogram) length filter: discard tracts whose value is
+    // out of range, but only the BACKGROUND ones -- a tract a group claims (in
+    // the passing set while the filter is active) is governed by its group's own
+    // length filter, evaluated in the worker. With the filter off, every tract
+    // is "background", giving the "overall" filter.
+    const bgPassingExpr = params.hasRoiFilter
+      ? `(uRoiFilterActive > 0.5 && ${this.roiPassingSegmentsShaderManager.hasFunctionName}(segmentId))`
+      : `false`;
+    const bgLengthFragment = params.hasRoiObjectValues
+      ? `
+  if (uBgLengthActive > 0.5 && !(${bgPassingExpr})) {
+    float bgLen; float bgCol;
+    if (getRoiObjectValues(segmentId, bgLen, bgCol) &&
+        (bgLen < uBgLo || bgLen > uBgHi)) {
+      return 0.0;
+    }
+  }`
+      : "";
+
     this.visibleSegmentsShaderManager.defineShader(builder);
     this.excludedSegmentsShaderManager.defineShader(builder);
     this.segmentColorShaderManager.defineShader(builder);
@@ -558,6 +610,31 @@ void spatialChunkCull() {
     if (params.hasRoiSegmentColors) {
       this.roiSegmentColorShaderManager.defineShader(builder);
       builder.addUniform("highp float", "uRoiColorByGroup");
+    }
+    if (params.hasRoiObjectValues) {
+      // colormapJet (glsl_COLORMAPS) is called by the edge/node emitRGB below,
+      // which are added to the builder BEFORE finalizeShaderBuilder's own
+      // glsl_COLORMAPS. GLSL has no function hoisting, so inject it here first;
+      // ShaderCode dedups the later identical add to a no-op.
+      builder.addFragmentCode(glsl_COLORMAPS);
+      this.roiObjectValueShaderManager.defineShader(builder);
+      builder.addUniform("highp float", "uBgLengthActive");
+      builder.addUniform("highp float", "uBgLo");
+      builder.addUniform("highp float", "uBgHi");
+      builder.addUniform("highp float", "uBgColorMode");
+      // One packed per-object value holds TWO independent normalised [0,1]
+      // attributes: the length-filter attribute in bytes 0-1 and the colour
+      // attribute in bytes 2-3 (16-bit each). So a length filter on attribute A
+      // and colour-by attribute B coexist without a second map.
+      builder.addFragmentCode(`
+bool getRoiObjectValues(uint64_t segmentId, out float lengthValue, out float colorValue) {
+  vec4 v = vec4(0.0);
+  bool found = ${this.roiObjectValueShaderManager.getFunctionName}(segmentId, v);
+  lengthValue = (floor(v.r * 255.0 + 0.5) + floor(v.g * 255.0 + 0.5) * 256.0) / 65535.0;
+  colorValue = (floor(v.b * 255.0 + 0.5) + floor(v.a * 255.0 + 0.5) * 256.0) / 65535.0;
+  return found;
+}
+`);
     }
     builder.addUniform("highp float", "uVisibleAlpha");
     builder.addUniform("highp float", "uHiddenAlpha");
@@ -611,7 +688,7 @@ ${hoverAdjustFragment}
 float getSegmentLookupAlpha(uint64_t segmentId) {
   if (${this.excludedSegmentsShaderManager.hasFunctionName}(segmentId)) {
     return ${excludedSegmentAlpha};
-  }${roiHighDetailHideFragment}${roiFilterFragment}${roiOpacityFragment}
+  }${bgLengthFragment}${roiHighDetailHideFragment}${roiFilterFragment}${roiOpacityFragment}
   bool isVisible = ${this.visibleSegmentsShaderManager.hasFunctionName}(segmentId);
   ${alphaExpression}
 }
@@ -727,6 +804,22 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
       );
     }
 
+    if (
+      skeletonParams?.hasRoiObjectValues &&
+      this.gpuRoiObjectValueHashTable !== undefined
+    ) {
+      this.roiObjectValueShaderManager.enable(
+        gl,
+        shader,
+        this.gpuRoiObjectValueHashTable,
+      );
+      const bg = this.base.displayState.roiBackground?.value;
+      gl.uniform1f(shader.uniform("uBgLengthActive"), bg?.lengthActive ? 1 : 0);
+      gl.uniform1f(shader.uniform("uBgLo"), bg?.lo ?? 0);
+      gl.uniform1f(shader.uniform("uBgHi"), bg?.hi ?? 1);
+      gl.uniform1f(shader.uniform("uBgColorMode"), bg?.colorMode ? 1 : 0);
+    }
+
     const { saturation, segmentSelectionState } = this.base.displayState;
     gl.uniform1f(shader.uniform("uSaturation"), saturation.value);
     if (skeletonParams.hoverHighlight) {
@@ -754,6 +847,12 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
     }
     if (skeletonParams?.hasRoiSegmentColors) {
       this.roiSegmentColorShaderManager.disable(gl, shader);
+    }
+    if (
+      skeletonParams?.hasRoiObjectValues &&
+      this.gpuRoiObjectValueHashTable !== undefined
+    ) {
+      this.roiObjectValueShaderManager.disable(gl, shader);
     }
   }
 
@@ -822,6 +921,12 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
         GPUHashTable.get(this.gl, roiSegmentColors.hashTable),
       );
     }
+    const roiObjectValues = base.displayState.roiObjectValues;
+    if (roiObjectValues !== undefined) {
+      this.gpuRoiObjectValueHashTable = this.registerDisposer(
+        GPUHashTable.get(this.gl, roiObjectValues.hashTable),
+      );
+    }
 
     this.edgeShaderGetter = parameterizedEmitterDependentShaderGetter(
       this,
@@ -884,6 +989,23 @@ highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexInde
     }
   }`
               : "";
+            // Background flat colour-by-attribute: recolour the BACKGROUND tracts
+            // (not claimed by a group) by their per-object value through a
+            // colourmap. Group-claimed tracts keep their group/attribute colour
+            // (roiColorFragment, above), which is why the passing check mirrors
+            // the length tier's.
+            const bgColorPassingExpr = skeletonParams.hasRoiFilter
+              ? `(uRoiFilterActive > 0.5 && ${this.roiPassingSegmentsShaderManager.hasFunctionName}(getSegmentAppearanceId(vSegmentValue)))`
+              : `false`;
+            const bgColorFragment = skeletonParams.hasRoiObjectValues
+              ? `
+  if (uBgColorMode > 0.5 && !(${bgColorPassingExpr})) {
+    float bgLen; float bgCol;
+    if (getRoiObjectValues(getSegmentAppearanceId(vSegmentValue), bgLen, bgCol)) {
+      rgb = colormapJet(bgCol);
+    }
+  }`
+              : "";
             // Dynamic path (spatial skeletons): per-segment color, visibility,
             // and hover highlight resolved in the shader via
             // getSegmentAppearance(). uColor is unused in this path. Saturation
@@ -900,7 +1022,10 @@ void emitRGB(vec3 color) {
   vec4 baseColor = segmentColor();
   highp float alpha = baseColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
   if (alpha <= 0.0) discard;
-  vec3 rgb = color;${roiColorFragment}
+  // Group colour first (claimed tracts), then the background attribute colour,
+  // which skips claimed tracts -- so with the ROI filter off the whole
+  // tractogram is "background" and owns the colour, matching the length tier.
+  vec3 rgb = color;${roiColorFragment}${bgColorFragment}
   rgb = mix(vec3(1.0), rgb, uSaturation);
   ${this.emitColorStatement("rgb", "alpha")}
 }
@@ -1036,6 +1161,20 @@ emitCircle(
               selectedNodeExpression === undefined
                 ? "renderColor"
                 : `((${selectedNodeExpression} > 0.5) ? vec4(${SELECTED_NODE_OUTLINE_COLOR_RGB}, renderColor.a) : renderColor)`;
+            // Background attribute colour for node dots, mirroring the edge path
+            // so a tract's line and its vertex dots agree.
+            const nodeBgColorPassingExpr = skeletonParams.hasRoiFilter
+              ? `(uRoiFilterActive > 0.5 && ${this.roiPassingSegmentsShaderManager.hasFunctionName}(getSegmentAppearanceId(vSegmentValue)))`
+              : `false`;
+            const nodeBgColorFragment = skeletonParams.hasRoiObjectValues
+              ? `
+  if (uBgColorMode > 0.5 && !(${nodeBgColorPassingExpr})) {
+    float bgLen; float bgCol;
+    if (getRoiObjectValues(getSegmentAppearanceId(vSegmentValue), bgLen, bgCol)) {
+      rgb = colormapJet(bgCol);
+    }
+  }`
+              : "";
             builder.addFragmentCode(`
 vec4 segmentColor() {
   return getSegmentAppearance(${segmentExpression});
@@ -1052,7 +1191,8 @@ void emitRGBA(vec4 color) {
 void emitRGB(vec3 color) {
   // Saturation for a custom shader's node colour (see the edge path); the
   // emitDefault segment-colour path is already saturated via getSegmentLookupColor.
-  emitRGBA(vec4(mix(vec3(1.0), color, uSaturation), 1.0));
+  vec3 rgb = color;${nodeBgColorFragment}
+  emitRGBA(vec4(mix(vec3(1.0), rgb, uSaturation), 1.0));
 }
 void emitDefault() {
   emitRGBA(vec4(segmentColor().rgb, 1.0));
@@ -1512,6 +1652,25 @@ export interface SkeletonLayerDisplayState extends SegmentationDisplayState3D {
    */
   roiGroups?: WatchableValueInterface<readonly RoiGroupConfig[]>;
   /**
+   * Per-object numeric attribute columns (length, …), threaded to the backend so
+   * a group's length filter and object-attribute colouring can be evaluated.
+   */
+  roiObjectAttrColumns?: WatchableValueInterface<
+    ReadonlyMap<string, RoiObjectAttrColumn>
+  >;
+  /**
+   * Dense anatomical label grid from a linked parcellation layer, threaded to the
+   * backend so `labelMask` ROIs can be sampled per streamline vertex.
+   */
+  roiLabelField?: WatchableValueInterface<RoiLabelField | undefined>;
+  /**
+   * Frontend-only per-object value map (id -> normalised attribute value) +
+   * resolved uniforms for the background length filter / flat colour-by-attribute
+   * shader tier. Read directly by the shader (not threaded to the backend).
+   */
+  roiObjectValues?: Uint64Map;
+  roiBackground?: WatchableValueInterface<RoiBackgroundUniforms | undefined>;
+  /**
    * Shared id -> packed group colour the backend fills for passing tracts. Read
    * directly by the ROI colour-by-group shader tier (never the user-facing
    * `segmentStatedColors`); its rpcId is also threaded to the backend.
@@ -1550,6 +1709,7 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
       hasRoiFilter: false,
       hasRoiHighDetailHide: false,
       hasRoiSegmentColors: false,
+      hasRoiObjectValues: false,
       hasSegmentStatedColors: false,
       hasSegmentDefaultColor: false,
       hoverHighlight: false,
@@ -3214,12 +3374,17 @@ export class SpatiallyIndexedSkeletonLayer
       hasRoiFilter &&
       !isRoiHighDetailLayer &&
       this.displayState.roiHighDetailSegments !== undefined;
+    // Background per-object value tier: pass 1 only (see hasRoiHighDetailHide;
+    // the background tracts it governs are the coarse bulk pass 2 never draws).
+    const hasRoiObjectValues =
+      this.displayState.roiObjectValues !== undefined && !isRoiHighDetailLayer;
     this.skeletonShaderParameters =
       new WatchableValue<SkeletonShaderParameters>({
         dynamicSegmentAppearance: true,
         hasRoiFilter,
         hasRoiHighDetailHide,
         hasRoiSegmentColors,
+        hasRoiObjectValues,
         hasSegmentStatedColors: false,
         hasSegmentDefaultColor: false,
         hoverHighlight: false,
@@ -3233,6 +3398,7 @@ export class SpatiallyIndexedSkeletonLayer
         hasRoiFilter,
         hasRoiHighDetailHide,
         hasRoiSegmentColors,
+        hasRoiObjectValues,
         hasSegmentStatedColors: colorGroupState.segmentStatedColors.size !== 0,
         hasSegmentDefaultColor:
           colorGroupState.segmentDefaultColor.value !== undefined ||
@@ -3391,6 +3557,25 @@ export class SpatiallyIndexedSkeletonLayer
       counterpartOptions.roiGroups = this.registerDisposer(
         SharedWatchableValue.makeFromExisting(rpc, displayState.roiGroups),
       ).rpcId;
+      if (displayState.roiObjectAttrColumns !== undefined) {
+        counterpartOptions.roiObjectAttrColumns = this.registerDisposer(
+          SharedWatchableValue.makeFromExisting(
+            rpc,
+            displayState.roiObjectAttrColumns,
+          ),
+        ).rpcId;
+      }
+      if (displayState.roiLabelField !== undefined) {
+        // Shared, not snapshotted: the dense parcellation grid arrives
+        // asynchronously (and can change if the linked layer changes), so the
+        // backend must see the value settle rather than the initial undefined.
+        counterpartOptions.roiLabelField = this.registerDisposer(
+          SharedWatchableValue.makeFromExisting(
+            rpc,
+            displayState.roiLabelField,
+          ),
+        ).rpcId;
+      }
       const roiRedraw = () => this.redrawNeeded.dispatch();
       this.registerDisposer(
         displayState.roiPassingSegments.changed.add(roiRedraw),
@@ -3413,6 +3598,16 @@ export class SpatiallyIndexedSkeletonLayer
           displayState.roiColorByGroup.changed.add(roiRedraw),
         );
       }
+      if (displayState.roiObjectValues !== undefined) {
+        this.registerDisposer(
+          displayState.roiObjectValues.changed.add(roiRedraw),
+        );
+      }
+      if (displayState.roiBackground !== undefined) {
+        this.registerDisposer(
+          displayState.roiBackground.changed.add(roiRedraw),
+        );
+      }
     }
 
     sharedObject.initializeCounterpart(rpc, counterpartOptions);
@@ -3420,6 +3615,26 @@ export class SpatiallyIndexedSkeletonLayer
     this.gpuBrowseExcludedSegmentsHashTable = this.registerDisposer(
       GPUHashTable.get(this.gl, this.browseExcludedSegments.hashTable),
     );
+  }
+
+  /**
+   * Ask the backend for each group's on-screen passing object ids -- the tract
+   * export selection. Positional: `result[i]` corresponds to `groups[i]`. A
+   * request/response RPC (the tab needs the ids before it can build the export
+   * job); see the backend's `computeRoiExportIds`.
+   */
+  async computeRoiExportIds(
+    groups: readonly RoiGroupConfig[],
+  ): Promise<bigint[][]> {
+    const rpc = this.rpc;
+    if (rpc === undefined) {
+      throw new Error("This tract layer is not connected to a worker.");
+    }
+    const { perGroup } = await rpc.promiseInvoke<{ perGroup: string[][] }>(
+      SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
+      { layer: this.backend.rpcId, groups },
+    );
+    return perGroup.map((ids) => ids.map((s) => BigInt(s)));
   }
 
   get gl() {

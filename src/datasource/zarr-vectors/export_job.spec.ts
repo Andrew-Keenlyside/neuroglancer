@@ -61,11 +61,14 @@ describe("buildExportSpec", () => {
     const spec = buildExportSpec({
       sourceUrl: "zarr-vectors://gs://bucket/tracts.zvf",
       groups: s.groups,
+      // The viewer's on-screen passing ids, as decimal strings. The large id is
+      // > 2**53, pinning the string round-trip.
+      objectIdsByGroup: [["7", "42", "9007199254740993"]],
       format: "trk",
       outputPath: "out.trk",
     });
     expect(spec).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 3,
       source: { url: "zarr-vectors://gs://bucket/tracts.zvf", level: 0 },
       groups: [
         {
@@ -92,6 +95,7 @@ describe("buildExportSpec", () => {
               operator: "andnot",
             },
           ],
+          objectIds: ["7", "42", "9007199254740993"],
         },
       ],
       format: "trk",
@@ -99,11 +103,79 @@ describe("buildExportSpec", () => {
     });
   });
 
+  it("omits scope for a selected export (default), matching a v1-shaped spec", () => {
+    const s = stateWithGroup("g");
+    const spec = buildExportSpec({
+      sourceUrl: "zarr-vectors://x",
+      groups: s.groups,
+      objectIdsByGroup: [["1"]],
+      format: "trk",
+      outputPath: "o.trk",
+    });
+    expect("scope" in spec).toBe(false);
+  });
+
+  it("appends each group's object ids as decimal strings", () => {
+    const s = stateWithGroup("g");
+    const spec = buildExportSpec({
+      sourceUrl: "zarr-vectors://x",
+      groups: s.groups,
+      objectIdsByGroup: [["3", "5", "9007199254740993"]],
+      format: "trk",
+      outputPath: "o.trk",
+    });
+    expect(spec.groups[0].objectIds).toEqual(["3", "5", "9007199254740993"]);
+  });
+
+  it("rejects a selected export whose ids were never computed", () => {
+    // A programmer error: the tab must compute the on-screen ids first.
+    const s = stateWithGroup("g");
+    expect(() =>
+      buildExportSpec({
+        sourceUrl: "zarr-vectors://x",
+        groups: s.groups,
+        format: "trk",
+        outputPath: "o.trk",
+      }),
+    ).toThrow(/object ids were not computed/);
+  });
+
+  it("rejects a selected export when nothing currently passes", () => {
+    // Empty ids across every group means the on-screen dissection selects
+    // nothing; refuse before a round trip that would write no file.
+    const s = stateWithGroup("g");
+    expect(() =>
+      buildExportSpec({
+        sourceUrl: "zarr-vectors://x",
+        groups: s.groups,
+        objectIdsByGroup: [[]],
+        format: "trk",
+        outputPath: "o.trk",
+      }),
+    ).toThrow(/No streamlines currently pass/);
+  });
+
+  it("exports the whole store: scope='whole', empty groups, no group checks", () => {
+    // No groups at all -- a whole-store export folds nothing, so the
+    // "select at least one group" guard must not fire.
+    const spec = buildExportSpec({
+      sourceUrl: "zarr-vectors://x",
+      groups: [],
+      format: "zvf",
+      outputPath: "whole.zvf",
+      scope: "whole",
+    });
+    expect(spec.scope).toBe("whole");
+    expect(spec.groups).toEqual([]);
+    expect(spec.format).toBe("zvf");
+  });
+
   it("always exports at level 0, never the level on screen", () => {
     const s = stateWithGroup("g");
     const spec = buildExportSpec({
       sourceUrl: "zarr-vectors://x",
       groups: s.groups,
+      objectIdsByGroup: [["1"]],
       format: "zvf",
       outputPath: "out.zvf",
     });
@@ -117,6 +189,7 @@ describe("buildExportSpec", () => {
     const roi = buildExportSpec({
       sourceUrl: "zarr-vectors://x",
       groups: s.groups,
+      objectIdsByGroup: [["1"]],
       format: "trk",
       outputPath: "o.trk",
     }).groups[0].rois[0];
@@ -148,26 +221,12 @@ describe("buildExportSpec", () => {
     ).toThrow(/at least one group/);
   });
 
-  it("rejects a group with no regions before it reaches the exporter", () => {
-    // An empty fold passes everything, so this would write the whole dataset.
-    const s = new RoiFilterState();
-    const g = s.addGroup();
-    s.updateGroup(g, { name: "Empty" });
-    expect(() =>
-      buildExportSpec({
-        sourceUrl: "zarr-vectors://x",
-        groups: s.groups,
-        format: "trk",
-        outputPath: "o.trk",
-      }),
-    ).toThrow(/every streamline/);
-  });
-
   it("emits a non-identity affine but omits identity and absent", () => {
     const s = stateWithGroup("g");
     const base = {
       sourceUrl: "zarr-vectors://x",
       groups: s.groups,
+      objectIdsByGroup: [["1"]],
       format: "trk" as const,
       outputPath: "o.trk",
     };

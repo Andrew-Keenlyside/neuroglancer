@@ -29,8 +29,10 @@ import "#src/datasource/zarr-vectors/streamline_filter_tab.css";
 import {
   labelled,
   makeSelect,
+  makeStringSelect,
 } from "#src/datasource/zarr-vectors/filter_widgets.js";
 import { ImportGroupDialog } from "#src/datasource/zarr-vectors/import_group_dialog.js";
+import { LabelFilterPanel } from "#src/datasource/zarr-vectors/label_filter_panel.js";
 import {
   RoiOperator,
   RoiPredicate,
@@ -41,6 +43,7 @@ import {
   groupFromJson,
   groupToJson,
   RoiFilterState,
+  type RoiColorSpec,
   type RoiGroup,
 } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import { StoreGroupPicker } from "#src/datasource/zarr-vectors/store_group_picker.js";
@@ -172,6 +175,10 @@ function shapeLabel(shape: RoiShape): string {
     }
     case "halfspace":
       return `Plane @ ${fmt(Array.from(shape.origin))}`;
+    case "labelMask": {
+      const n = shape.labels.length;
+      return `${n} label${n === 1 ? "" : "s"}`;
+    }
   }
 }
 
@@ -227,6 +234,12 @@ export class StreamlineFilterTab extends Tab {
       element.appendChild(picker.element);
     }
 
+    // "By segmentation label" panel: stage parcellation labels as include/exclude
+    // and commit the combination to a group. Built once (outside `bodyEl`) so a
+    // structural rebuild does not drop its search list / staged rows.
+    const labelPanel = this.registerDisposer(new LabelFilterPanel(this.layer));
+    element.appendChild(labelPanel.element);
+
     this.bodyEl = document.createElement("div");
     this.bodyEl.classList.add("neuroglancer-streamline-filter-body");
     element.appendChild(this.bodyEl);
@@ -236,6 +249,14 @@ export class StreamlineFilterTab extends Tab {
 
     this.registerDisposer(this.bodyContext);
     this.registerDisposer(this.roiFilter.changed.add(() => this.onChanged()));
+    // Rebuild when the per-object attributes load/change: the "Colour by"
+    // options and the length sliders are derived from them, so the body's
+    // structural signature includes the attribute list.
+    this.registerDisposer(
+      this.layer.displayState.segmentPropertyMap.changed.add(() =>
+        this.onChanged(),
+      ),
+    );
     if (this.passingSegments !== undefined) {
       this.registerDisposer(
         this.passingSegments.changed.add(() => this.updateCount()),
@@ -279,16 +300,12 @@ export class StreamlineFilterTab extends Tab {
       ),
     );
 
-    const colorByGroup = this.registerDisposer(
-      new TrackableBooleanCheckbox(
-        fieldWatchable(
-          this.roiFilter.changed,
-          () => this.roiFilter.colorByGroup,
-          (v) => (this.roiFilter.colorByGroup = v),
-        ),
-      ),
-    );
-    header.appendChild(labelled("Colour by group", colorByGroup.element));
+    // "Colour by group" is superseded by the per-group "Colour by" selector on
+    // each group row (and the background "Colour by" on the Render tab): each
+    // group now chooses group colour / object-attribute colourmap / per-vertex
+    // shader independently, like opacity. The legacy `colorByGroup` flag stays in
+    // state at its default (true) so the shader keeps applying the per-object
+    // colour overrides the groups write.
 
     const hide2d = this.registerDisposer(
       new TrackableBooleanCheckbox(
@@ -311,16 +328,29 @@ export class StreamlineFilterTab extends Tab {
     // Include each ROI's shape kind so a restore that keeps ids + counts but
     // changes a kind still rebuilds (the sliders are wired per kind), and each
     // group's expanded state (its ROI section is only in the DOM when open);
-    // exclude group colour/name/visibility/opacity and ROI name (all bound live
-    // to inputs — rebuilding on those would recreate an input mid-edit, so a
-    // rename would lose focus on the first keystroke that commits).
-    return this.roiFilter.groups
-      .map(
-        (g) =>
-          `${g.id}${this.expandedGroupIds.has(g.id) ? "+" : "-"}:` +
-          g.rois.map((r) => r.shape.kind[0]).join(""),
-      )
-      .join(",");
+    // exclude group colour/name/visibility/opacity/colorBy/lengthFilter and ROI
+    // name (all bound live to inputs — rebuilding on those would recreate an
+    // input mid-edit, so a rename would lose focus on the first keystroke that
+    // commits). The available object-attribute names are included so the
+    // "Colour by" options + length sliders appear once the store's attributes
+    // load.
+    const attrSig = this.numericObjectAttrs()
+      .map((a) => a.name)
+      .join("|");
+    return (
+      `${attrSig}#` +
+      this.roiFilter.groups
+        .map(
+          (g) =>
+            `${g.id}${this.expandedGroupIds.has(g.id) ? "+" : "-"}` +
+            // The filter-attribute NAME (not its min/max) is structural: picking
+            // an attribute must rebuild the row to show/hide the sliders, but
+            // dragging them must not.
+            `f${g.lengthFilter?.name ?? ""}:` +
+            g.rois.map((r) => r.shape.kind[0]).join(""),
+        )
+        .join(",")
+    );
   }
 
   private onChanged(): void {
@@ -824,6 +854,18 @@ export class StreamlineFilterTab extends Tab {
     );
     controls.appendChild(labelled("Opacity", opacity.element));
 
+    // Per-group "Colour by" — like opacity, independent per group. Flat modes
+    // (group colour / object-attribute colourmap) write a colour override the
+    // shader applies; "Per-vertex" leaves no override so the layer shader
+    // colours the tract per vertex (direction/position/attribute).
+    controls.appendChild(
+      labelled("Colour by", this.makeColorBySelect(group.id)),
+    );
+
+    // Per-group "Filter by" attribute (min/max hides tracts outside the range).
+    // Absent when the store carries no per-object numeric attribute yet.
+    this.appendAttributeFilterControls(controls, group.id);
+
     const highDetail = document.createElement("input");
     highDetail.type = "checkbox";
     highDetail.checked = group.highDetail;
@@ -838,6 +880,133 @@ export class StreamlineFilterTab extends Tab {
     wrapper.appendChild(row);
     wrapper.appendChild(controls);
     return wrapper;
+  }
+
+  // --- per-group colour-by + length filter ---------------------------------
+
+  /** Numeric per-object attributes discovered on the layer, with their bounds. */
+  private numericObjectAttrs(): { name: string; min: number; max: number }[] {
+    const props =
+      this.layer.displayState.segmentPropertyMap.value?.numericalProperties;
+    if (props === undefined) return [];
+    return props.map((p) => ({
+      name: p.id,
+      min: Number(p.bounds[0]),
+      max: Number(p.bounds[1]),
+    }));
+  }
+
+  /**
+   * A `<select>` binding a group's `colorBy`. Options: Group colour, Background
+   * shader (the group's tracts follow the layer's "Colour by (background)"
+   * shading, e.g. direction), and one per numeric object attribute (flat
+   * colourmap). "Background shader" writes no per-object override, so it stores
+   * `direction` and the tract falls through to the layer shader.
+   */
+  private makeColorBySelect(groupId: number): HTMLSelectElement {
+    const attrs = this.numericObjectAttrs();
+    const options = [
+      { value: "group", label: "Group colour" },
+      { value: "pervertex", label: "Background shader" },
+      ...attrs.map((a) => ({
+        value: `object:${a.name}`,
+        label: `By ${a.name}`,
+      })),
+    ];
+    const spec = this.currentGroup(groupId)?.colorBy ?? { kind: "group" };
+    const current =
+      spec.kind === "group"
+        ? "group"
+        : spec.kind === "objectAttr"
+          ? `object:${spec.name}`
+          : "pervertex";
+    return makeStringSelect(options, current, (value) => {
+      const next: RoiColorSpec = value.startsWith("object:")
+        ? { kind: "objectAttr", name: value.slice("object:".length) }
+        : value === "group"
+          ? { kind: "group" }
+          : { kind: "direction" }; // "pervertex" -> defer to the layer shader
+      this.roiFilter.updateGroup(groupId, { colorBy: next });
+    });
+  }
+
+  /**
+   * A "Filter by" attribute picker plus, once an attribute is chosen, a min/max
+   * pair that hides the group's tracts whose value on that attribute is outside
+   * the range. The attribute is any per-object numeric column (length, FA,
+   * vertex count, image intensity, …); "None" clears the filter. The chosen
+   * attribute is part of the tab's structural signature, so picking one rebuilds
+   * the row to reveal the sliders (dragging the sliders does not rebuild).
+   */
+  private appendAttributeFilterControls(
+    controls: HTMLElement,
+    groupId: number,
+  ): void {
+    const attrs = this.numericObjectAttrs();
+    if (attrs.length === 0) return;
+    const filter = this.currentGroup(groupId)?.lengthFilter;
+    const options = [
+      { value: "", label: "None" },
+      ...attrs.map((a) => ({ value: a.name, label: a.name })),
+    ];
+    const select = makeStringSelect(options, filter?.name ?? "", (name) => {
+      if (name === "") {
+        this.roiFilter.updateGroup(groupId, { lengthFilter: undefined });
+        return;
+      }
+      const a = attrs.find((x) => x.name === name);
+      if (a === undefined) return;
+      // Seed at the attribute's full range: the selection persists (so the
+      // sliders show) and is a no-op until narrowed. Keep an existing range when
+      // the same attribute is re-picked.
+      const keep = filter?.name === name ? filter : undefined;
+      this.roiFilter.updateGroup(groupId, {
+        lengthFilter: {
+          name,
+          min: keep?.min ?? a.min,
+          max: keep?.max ?? a.max,
+        },
+      });
+    });
+    controls.appendChild(labelled("Filter by", select));
+
+    const a =
+      filter !== undefined
+        ? attrs.find((x) => x.name === filter.name)
+        : undefined;
+    if (a === undefined) return;
+    const span = a.max - a.min;
+    const step = span > 0 ? Math.max(span / 200, 1e-6) : 1;
+    const current = () => {
+      const f = this.currentGroup(groupId)?.lengthFilter;
+      return f !== undefined && f.name === a.name ? f : undefined;
+    };
+    const set = (min: number, max: number) =>
+      this.roiFilter.updateGroup(groupId, {
+        lengthFilter: { name: a.name, min, max },
+      });
+    const lo = this.bodyContext.registerDisposer(
+      new RangeWidget(
+        fieldWatchable(
+          this.roiFilter.changed,
+          () => current()?.min ?? a.min,
+          (v) => set(v, current()?.max ?? a.max),
+        ),
+        { min: a.min, max: a.max, step },
+      ),
+    );
+    const hi = this.bodyContext.registerDisposer(
+      new RangeWidget(
+        fieldWatchable(
+          this.roiFilter.changed,
+          () => current()?.max ?? a.max,
+          (v) => set(current()?.min ?? a.min, v),
+        ),
+        { min: a.min, max: a.max, step },
+      ),
+    );
+    controls.appendChild(labelled(`${a.name} ≥`, lo.element));
+    controls.appendChild(labelled(`${a.name} ≤`, hi.element));
   }
 
   private makeRoiSection(group: RoiGroup): HTMLElement {

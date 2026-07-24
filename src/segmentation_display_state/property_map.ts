@@ -44,13 +44,24 @@ import { defaultStringCompare } from "#src/util/string.js";
 export type InlineSegmentProperty =
   | InlineSegmentStringProperty
   | InlineSegmentTagsProperty
-  | InlineSegmentNumericalProperty;
+  | InlineSegmentNumericalProperty
+  | InlineSegmentColorProperty;
 
 export interface InlineSegmentStringProperty {
   id: string;
   type: "string" | "label" | "description";
   description?: string | undefined;
   values: string[];
+}
+
+export interface InlineSegmentColorProperty {
+  id: string;
+  type: "rgb";
+  description?: string | undefined;
+  // One packed color per id, in the same `R | G<<8 | B<<16` encoding used by
+  // `segmentStatedColors` (see `packColor`). A value of -1 means "no color for
+  // this id"; that only arises after merging property maps of differing id sets.
+  values: Int32Array<ArrayBuffer>;
 }
 
 export interface InlineSegmentTagsProperty {
@@ -179,6 +190,7 @@ export class PreprocessedSegmentPropertyMap {
   inlineIdToIndex: IndicesArray | undefined;
   tags: InlineSegmentTagsProperty | undefined;
   labels: InlineSegmentStringProperty | undefined;
+  colors: InlineSegmentColorProperty | undefined;
   numericalProperties: InlineSegmentNumericalProperty[];
 
   getSegmentInlineIndex(id: bigint): number {
@@ -202,9 +214,26 @@ export class PreprocessedSegmentPropertyMap {
     this.labels = inlineProperties?.properties.find(
       (p) => p.type === "label",
     ) as InlineSegmentStringProperty | undefined;
+    this.colors = inlineProperties?.properties.find(
+      (p) => p.type === "rgb",
+    ) as InlineSegmentColorProperty | undefined;
     this.numericalProperties = (inlineProperties?.properties.filter(
       (p) => p.type === "number",
     ) ?? []) as InlineSegmentNumericalProperty[];
+  }
+
+  /**
+   * Returns the LUT color declared for `id` by an `rgb` segment property, packed
+   * as `R | G<<8 | B<<16` (the `segmentStatedColors` encoding), or `undefined`
+   * if there is no color property or no color for this id.
+   */
+  getSegmentColor(id: bigint): number | undefined {
+    const { colors } = this;
+    if (colors === undefined) return undefined;
+    const index = this.getSegmentInlineIndex(id);
+    if (index === -1) return undefined;
+    const color = colors.values[index];
+    return color < 0 ? undefined : color;
   }
 
   getSegmentLabel(id: bigint): string | undefined {
@@ -301,6 +330,17 @@ function remapNumericalProperty(
   return { ...property, values };
 }
 
+function remapColorProperty(
+  property: InlineSegmentColorProperty,
+  numMerged: number,
+  toMerged: Uint32Array,
+): InlineSegmentColorProperty {
+  // -1 marks ids absent from this map (see InlineSegmentColorProperty.values).
+  const values = new Int32Array(numMerged).fill(-1);
+  remapArray(property.values, values, toMerged);
+  return { ...property, values };
+}
+
 function remapProperty(
   property: InlineSegmentProperty,
   numMerged: number,
@@ -315,6 +355,13 @@ function remapProperty(
   ) {
     return remapStringProperty(
       property as InlineSegmentStringProperty | InlineSegmentTagsProperty,
+      numMerged,
+      toMerged,
+    );
+  }
+  if (type === "rgb") {
+    return remapColorProperty(
+      property as InlineSegmentColorProperty,
       numMerged,
       toMerged,
     );
@@ -1013,14 +1060,17 @@ export function executeSegmentQuery(
     property: InlineSegmentProperty,
     orderCoeff: number,
   ) => {
-    if (property.type !== "number") {
+    // Only label/tags/string/number fields are ever sortable (see the query
+    // parser); color (`rgb`) values are numeric, so compare them numerically
+    // for completeness rather than as strings.
+    if (property.type === "number" || property.type === "rgb") {
+      const values = property.values as TypedNumberArray;
+      indices.sort((a, b) => (values[a] - values[b]) * orderCoeff);
+    } else {
       const { values } = property;
       indices.sort(
         (a, b) => defaultStringCompare(values[a], values[b]) * orderCoeff,
       );
-    } else {
-      const values = property.values as TypedNumberArray;
-      indices.sort((a, b) => (values[a] - values[b]) * orderCoeff);
     }
   };
 

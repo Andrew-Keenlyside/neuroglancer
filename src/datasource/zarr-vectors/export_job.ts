@@ -23,13 +23,22 @@
  * pinned by a shared literal: `export_job.spec.ts` here and
  * `tract_export_job_test.py` there assert against the same JSON.
  *
- * Groups are `groupToJson` output verbatim. That is deliberate: the spec, the
- * URL hash and a saved ROI-group document then carry byte-identical group JSON,
- * so there is a single serialisation to keep correct rather than three. Note it
- * is the *persistence* encoding (`{type: "box"}`, string predicate/operator),
- * not the worker wire encoding (`{kind: "box"}`, numeric) -- see the two
- * unrelated `shapeToJson` pairs in `roi_filter_state.ts` and
+ * A selected-scope group is `groupToJson` output plus an `objectIds` array: the
+ * viewer's on-screen dissection has already chosen the passing streamlines, so
+ * the spec hands their ids to the exporter and it reads exactly those (a WYSIWYG
+ * export), instead of re-reading and re-folding the whole level. `groupToJson`
+ * stays untouched so the URL hash and a saved ROI-group document still carry
+ * byte-identical group JSON; `objectIds` is appended only here, never persisted.
+ * The `rois` are carried for provenance but are not folded when `objectIds` is
+ * present.
+ *
+ * The `groups[].rois` are the *persistence* encoding (`{type: "box"}`, string
+ * predicate/operator), not the worker wire encoding (`{kind: "box"}`, numeric)
+ * -- see the two unrelated `shapeToJson` pairs in `roi_filter_state.ts` and
  * `roi_filter_service.ts`.
+ *
+ * Object ids are decimal *strings*, not numbers: an id is a uint64 and can
+ * exceed JavaScript's safe-integer range, where `JSON.stringify` would round it.
  */
 
 import {
@@ -38,15 +47,38 @@ import {
 } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 
 /** Must match `JOB_SCHEMA_VERSION` in `tract_export/job.py`. */
-export const JOB_SCHEMA_VERSION = 1;
+export const JOB_SCHEMA_VERSION = 3;
 
 export type ExportFormat = "trk" | "zvf";
+
+/**
+ * `"selected"` exports the dissection (the chosen groups' passing set);
+ * `"whole"` exports every object at the level, ignoring the ROI fold -- a
+ * straight duplication of the store's geometry.
+ */
+export type ExportScope = "selected" | "whole";
 
 export interface ExportSpecOptions {
   /** The layer's resolved data source URL, e.g. `zarr-vectors://gs://b/x.zvf`. */
   sourceUrl: string;
   groups: readonly RoiGroup[];
+  /**
+   * For a `"selected"` export: each group's passing object ids as decimal
+   * strings, in the same order and length as `groups` -- the viewer's on-screen
+   * dissection. Required for a selected export (the ids ARE the selection);
+   * ignored for a `"whole"` export. Strings, not numbers: an id is a uint64 and
+   * can exceed JS's safe-integer range.
+   */
+  objectIdsByGroup?: readonly (readonly string[])[];
   format: ExportFormat;
+  /**
+   * Pyramid level to export. Defaults to 0 (full resolution). The native
+   * exporter re-evaluates at whatever level is given; the in-browser exporter
+   * uses a coarser level to fit browser memory.
+   */
+  level?: number;
+  /** Defaults to `"selected"`; `"whole"` ignores `groups`. */
+  scope?: ExportScope;
   /** Where the *exporter* writes, on its own filesystem. */
   outputPath: string;
   /**
@@ -107,32 +139,71 @@ function isIdentity4x4(m: readonly (readonly number[])[]): boolean {
 }
 
 export function buildExportSpec(options: ExportSpecOptions): any {
-  const { sourceUrl, groups, format, outputPath, affine } = options;
+  const {
+    sourceUrl,
+    groups,
+    objectIdsByGroup,
+    format,
+    outputPath,
+    affine,
+    scope,
+    level,
+  } = options;
+  const exportScope: ExportScope = scope ?? "selected";
+  const exportLevel = level ?? 0;
   if (sourceUrl === "") {
     throw new Error("This layer has no resolved data source.");
   }
-  if (groups.length === 0) {
-    throw new Error("Select at least one group to export.");
-  }
-  // A group with no regions folds to "everything", which as an export would
-  // silently write the whole dataset under that group's name. `parse_job`
-  // rejects it too; catching it here means the message arrives without a
-  // round trip.
-  const empty = groups.find((g) => g.rois.length === 0);
-  if (empty !== undefined) {
-    throw new Error(
-      `Group “${empty.name}” has no regions, which would select every ` +
-        `streamline in the dataset.`,
-    );
+  // A whole-store export folds no regions, so it needs no groups; a selected
+  // export needs the viewer's chosen object ids -- one id list per group -- to
+  // have anything to write.
+  if (exportScope === "selected") {
+    if (groups.length === 0) {
+      throw new Error("Select at least one group to export.");
+    }
+    if (
+      objectIdsByGroup === undefined ||
+      objectIdsByGroup.length !== groups.length
+    ) {
+      // A programmer error, not user input: the tab must compute the on-screen
+      // passing ids for every selected group before building the spec.
+      throw new Error(
+        "Export failed: object ids were not computed for every group.",
+      );
+    }
+    // Empty across the board means nothing currently passes the dissection.
+    // Refuse here rather than after a round trip that would write no file.
+    const total = objectIdsByGroup.reduce((n, ids) => n + ids.length, 0);
+    if (total === 0) {
+      throw new Error(
+        "No streamlines currently pass this dissection — adjust the filter or " +
+          "load more of the region, then export.",
+      );
+    }
   }
   const spec: any = {
     schemaVersion: JOB_SCHEMA_VERSION,
-    // Level 0 always: the export is of the data, not of what is on screen.
-    source: { url: sourceUrl, level: 0 },
-    groups: groups.map(groupToJson),
+    // The export is of the *data*, not of what is on screen; `level` defaults to
+    // 0 (full resolution) and is only raised to fit an in-browser export.
+    source: { url: sourceUrl, level: exportLevel },
+    // Selected groups carry their on-screen passing ids (the selection) plus the
+    // persistence group JSON (rois/colour, for provenance -- not re-folded).
+    groups:
+      exportScope === "whole"
+        ? []
+        : groups.map((g, i) => ({
+            ...groupToJson(g),
+            objectIds: [...(objectIdsByGroup![i] ?? [])],
+          })),
     format,
     destination: { kind: "local", path: outputPath },
   };
+  // Emit `scope` only when it is "whole": the default matches a v1 spec's
+  // shape, so a selected export stays byte-identical to the golden fixture and
+  // `parse_job` reads absent scope as "selected".
+  if (exportScope === "whole") {
+    spec.scope = "whole";
+  }
   // Only emit a non-identity affine: identity is the exporter's default, and
   // omitting it keeps the golden-fixture spec (which has no affine) unchanged.
   if (affine !== undefined && !isIdentity4x4(affine)) {

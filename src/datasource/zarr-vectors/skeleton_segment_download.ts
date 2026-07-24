@@ -35,6 +35,7 @@ import {
   type AttributeDtype,
   type LinkDtype,
 } from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
+import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 
 /**
  * The merged geometry for one object.  Shapes match the per-segment
@@ -162,8 +163,14 @@ export function filterChunkByFragments(
 }
 
 export interface DownloadSegmentSkeletonOptions {
-  /** Manifest reader configuration (numObjects, chunkSize, sidNdim, kvStoreRead). */
+  /** Manifest reader configuration (numObjects, chunkSize, sidNdim, kvStoreRead).
+   * Its `kvStoreRead` serves the 1-D, object-indexed `object_index/manifests`
+   * array (non-sharded, origin 0) — NOT the per-chunk geometry, which goes
+   * through `cellRead`. */
   readonly manifestReader: ObjectManifestReaderOptions;
+  /** Reads the per-chunk geometry array cells (vertices, vertex_fragments, …),
+   * resolving `chunk_grid_origin` and the optional `sharding_indexed` packing. */
+  readonly cellRead: CellReader;
   /**
    * Shared across concurrent calls, so a chunk several tracts pass through is
    * decoded once rather than once per tract. Optional: omit it and each call
@@ -332,6 +339,7 @@ export async function downloadSegmentSkeleton(
 ): Promise<AggregatedSegmentSkeleton | undefined> {
   const {
     manifestReader,
+    cellRead,
     rank,
     linkDtype,
     attributeNames,
@@ -407,7 +415,7 @@ export async function downloadSegmentSkeleton(
         linksConvention,
         geometryKind,
         hasFragmentSegmentIds,
-        kvStoreRead: manifestReader.kvStoreRead,
+        cellRead,
       },
       chunkSignal,
     );

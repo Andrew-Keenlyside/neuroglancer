@@ -29,6 +29,7 @@ from neuroglancer.tract_export.run import (
     ExportRunError,
     build_index,
     passing_object_ids,
+    per_group_from_object_ids,
     store_path_from_url,
 )
 
@@ -83,6 +84,22 @@ class TestStorePathFromUrl:
     def test_strips_at_most_one_prefix(self):
         # The inner scheme belongs to the store and must survive.
         assert store_path_from_url("zarr-vectors://zarr://x") == "zarr://x"
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            # The viewer's KvStore pipeline form: store URL then format adapter.
+            (
+                "https://h/b/store.zarrvectors/|zarr-vectors:",
+                "https://h/b/store.zarrvectors/",
+            ),
+            ("gs://b/store/|zarr-vectors:", "gs://b/store/"),
+            # A parameterised adapter is stripped too.
+            ("https://h/b/store/|zarr-vectors:foo=1", "https://h/b/store/"),
+        ],
+    )
+    def test_strips_the_viewer_pipeline_suffix(self, url, expected):
+        assert store_path_from_url(url) == expected
 
 
 class TestBuildIndex:
@@ -325,6 +342,137 @@ class TestEmptySelection:
         spec["destination"] = {"kind": "gcs", "path": "gs://b/out.trk"}
         with pytest.raises(JobSpecError, match="not supported yet"):
             parse_job(spec)
+
+
+class TestWholeScope:
+    """`scope="whole"` exports every object at the level with no ROI fold."""
+
+    def _patch(self, monkeypatch):
+        def fake(store, *, level, **kwargs):
+            return {
+                "polylines": [line((-5, 0, 0), (5, 0, 0)), line((45, 0, 0), (55, 0, 0))],
+                "object_ids": [2, 1],  # unsorted, to prove the union sorts
+                "polyline_count": 2,
+                "vertex_count": 4,
+            }
+
+        monkeypatch.setattr(run_mod, "_require_zarr_vectors", lambda: fake)
+
+    def test_selects_every_object_and_calls_the_writer_with_all_ids(
+        self, monkeypatch, tmp_path
+    ):
+        self._patch(monkeypatch)
+        captured = {}
+
+        def fake_trk(job, ids, output_path):
+            captured["ids"] = [int(i) for i in ids]
+            return {"streamline_count": len(ids), "vertex_count": 0, "written": True}
+
+        monkeypatch.setattr(run_mod, "_export_trk", fake_trk)
+
+        s = copy.deepcopy(BASE)
+        s["scope"] = "whole"
+        s["groups"] = []  # whole ignores groups
+        s["destination"] = {"kind": "local", "path": str(tmp_path / "out.trk")}
+        summary = run_mod.run_job(parse_job(s))
+
+        assert captured["ids"] == [1, 2]
+        assert summary["object_count"] == 2
+        assert summary["candidate_object_count"] == 2
+        assert summary["groups"] == []
+        assert summary["written"] is True
+
+
+class TestExplicitObjectIds:
+    """v3 fast path: the viewer hands over the passing ids; nothing is read/folded.
+
+    This is the fix for a sparse export that read (and, under Pyodide, re-read to
+    convergence) the whole level. With ids in the spec, `run_job` reads no level
+    and folds nothing -- it just writes the union by id.
+    """
+
+    def _job(self, groups, **overrides):
+        s = copy.deepcopy(BASE)
+        s["schemaVersion"] = 3
+        s["groups"] = groups
+        s.update(overrides)
+        return parse_job(s)
+
+    def test_per_group_from_object_ids_dedups_and_sorts(self):
+        job = self._job(
+            [{"name": "A", "color": "#ff0000", "objectIds": ["5", "5", "3"]}]
+        )
+        per_group = per_group_from_object_ids(job.groups)
+        assert [name for name, _ in per_group] == ["A"]
+        assert per_group[0][1].tolist() == [3, 5]
+
+    def test_run_job_reads_no_level_and_writes_the_id_union(
+        self, monkeypatch, tmp_path
+    ):
+        def explode(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("whole-level read/fold ran for an id-based job")
+
+        monkeypatch.setattr(run_mod, "_read_level", explode)
+        monkeypatch.setattr(run_mod, "select", explode)
+
+        captured = {}
+
+        def fake_trk(job, ids, output_path):
+            captured["ids"] = sorted(int(i) for i in ids)
+            return {"streamline_count": len(ids), "vertex_count": 0, "written": True}
+
+        monkeypatch.setattr(run_mod, "_export_trk", fake_trk)
+
+        # A large id proves the string ids survive as exact uint64.
+        job = self._job(
+            [
+                {"name": "A", "color": "#ff0000", "objectIds": ["1", "2"]},
+                {
+                    "name": "B",
+                    "color": "#00ff00",
+                    "objectIds": ["2", "9007199254740993"],
+                },
+            ],
+            destination={"kind": "local", "path": str(tmp_path / "out.trk")},
+        )
+        summary = run_mod.run_job(job)
+
+        assert captured["ids"] == [1, 2, 9007199254740993]
+        assert summary["object_count"] == 3  # union deduplicates the shared id 2
+        assert summary["groups"] == [
+            {"name": "A", "count": 2},
+            {"name": "B", "count": 2},
+        ]
+        assert summary["written"] is True
+
+    def test_empty_id_selection_writes_nothing(self, monkeypatch, tmp_path):
+        def explode(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("read or writer ran for an empty id selection")
+
+        monkeypatch.setattr(run_mod, "_read_level", explode)
+        monkeypatch.setattr(run_mod, "_export_trk", explode)
+        monkeypatch.setattr(run_mod, "_export_zvf", explode)
+
+        job = self._job(
+            [{"name": "A", "color": "#ff0000", "objectIds": []}],
+            destination={"kind": "local", "path": str(tmp_path / "out.trk")},
+        )
+        summary = run_mod.run_job(job)
+        assert summary["written"] is False
+        assert summary["object_count"] == 0
+
+    def test_mixed_id_and_fold_groups_are_rejected(self, tmp_path):
+        # The viewer sends ids for all selected groups or none; a mixed spec would
+        # drag the whole level back in for the fold groups. Fail fast.
+        job = self._job(
+            [
+                {"name": "A", "color": "#ff0000", "objectIds": ["1"]},
+                {"name": "B", "color": "#00ff00", "rois": [sphere((0, 0, 0), 2)]},
+            ],
+            destination={"kind": "local", "path": str(tmp_path / "out.trk")},
+        )
+        with pytest.raises(ExportRunError, match="objectIds for all groups or none"):
+            run_mod.run_job(job)
 
 
 class TestCliSummaryShape:

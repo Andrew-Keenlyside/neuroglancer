@@ -72,24 +72,61 @@ npm run build-pyodide:watch
 This rebuilds JS/TS automatically on file changes.  The Python zip and example
 script are only regenerated on a full (non-watch) build.
 
+## In-browser tract export (zarr-vectors)
+
+The Streamline Filter layer's **Export** tab runs entirely in the browser here:
+it re-evaluates the dissection at level 0 through `zarr-vectors-py`'s async read
+path and writes a **TrackVis `.trk`** or a **zipped zarr-vectors store** in
+Pyodide's memory, then either **downloads** it (no auth) or **uploads** it to the
+configured GCS bucket (`Save to GCS`, middleauth sign-in). Both **selected
+groups** and **whole store** scopes are supported. No native exporter or sidecar
+is needed.
+
+This needs the (currently unreleased) `zarr-vectors-py` bundled into the Python
+zip via `NEUROGLANCER_PYODIDE_PACKAGES` — a comma/`;`-separated list of package
+directories added to `neuroglancer_pyodide.zip` at build time:
+
+```bash
+NEUROGLANCER_PYODIDE_PACKAGES="/path/to/zarr-vectors-py/zarr_vectors" \
+  npm run build-pyodide
+```
+
+Notes:
+- `zarr` itself is already loaded from the Pyodide distribution; only the
+  `zarr_vectors` package tree needs bundling. `zarr-vectors-tools` is **not**
+  required (the TRK writer is inlined; the ZVF writer uses core `write_polylines`).
+- `nibabel` (TRK only) is pure-Python and installed on first export via
+  `micropip` — the first `.trk` export therefore needs network.
+- **Graceful degradation:** if `zarr_vectors` is not bundled, the export route
+  returns a clear error and the tab falls back to "Download job spec" (run it
+  with `python -m neuroglancer.tract_export`). The ordinary `dist/client` build
+  and CI are unaffected — the imports are Pyodide-only and guarded.
+- The `.zvf` writer drives zarr's synchronous path under JSPI; the export
+  request runs on a serialized promising entrypoint (`pyodide_worker.ts` +
+  `browser_server.py`). Verify a real store round-trips in the target browser
+  before relying on ZVF export (the read/TRK paths are covered by CPython tests;
+  the JSPI write path is not).
+
 ## Local testing
 
-Pyodide requires [`SharedArrayBuffer`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer),
-which in turn requires two HTTP response headers that a plain `python -m http.server`
-cannot set:
-
-```
-Cross-Origin-Opener-Policy: same-origin
-Cross-Origin-Embedder-Policy: require-corp
-```
-
-Use the included dev server instead:
+Use the included dev server:
 
 ```bash
 python python/examples/pyodide/dev_server.py
 ```
 
 Then open <http://localhost:8080/>.
+
+> **Cross-origin isolation (COOP/COEP) is deliberately NOT set.** This runtime is
+> single-threaded — it loads Pyodide with no pthreads and uses no
+> `SharedArrayBuffer` anywhere — so cross-origin isolation buys nothing, and its
+> `COOP: same-origin` would sever the `window.opener` the middleauth sign-in
+> popup needs to save exports to GCS. The dev server and the `ng-pyodide`
+> Firebase deploy both omit the headers to keep sign-in working. (If you ever
+> reintroduce Pyodide threading, you will need the headers back — and will lose
+> middleauth GCS save in this build unless you move it to the `google` OAuth
+> provider, which broadcasts past COOP.) Verify a fresh build still loads in your
+> target browsers after any change here.
 
 Options:
 
@@ -100,6 +137,33 @@ python python/examples/pyodide/dev_server.py --dir /path/to/dist/pyodide
 
 **First load** downloads ~40 MB of Python packages from the Pyodide CDN.
 Subsequent loads use the browser cache and start in a few seconds.
+
+## Sharing a filter session via URL
+
+The whole viewer state — layers **and** the ROI filter groups — lives in the
+address bar as a standard Neuroglancer `#!{…}` link that updates live as you
+work. The link carries the ROI **positions** (sphere centers/radii, box corners,
+half-space planes, label-mask label ids); it never carries the materialised list
+of passing streamline IDs, which the viewer recomputes on load.
+
+Round-trip:
+
+1. Open the app and click **Use test data (HCP1065)** (or open any share link).
+2. Draw/commit ROI filter groups. The address bar keeps updating —
+   `…/v/pyodide/#!{…}`.
+3. **Copy the browser URL** and send it. Opening it (in this app) restores the
+   scene and the committed groups and re-runs the dissection, so the recipient
+   continues exactly where you left off. It auto-loads — no start screen.
+
+You can also paste a share link into the **Load URL** box on the start screen; a
+link containing a `#!` fragment is applied as viewer state (the same as opening
+it directly) rather than passed to the Python script.
+
+> Share links live under the `/v/pyodide/` path (the app moves itself there at
+> boot so the export route has a token). The `ng-pyodide` Firebase target and the
+> local `dev_server.py` both rewrite non-file paths to `index.html`, so those
+> links load instead of 404ing. A bare `…/#!{…}` link (no `/v/…` path) would have
+> its fragment stripped at boot — always share the address-bar URL as-is.
 
 ## Using a custom Python script
 
@@ -139,8 +203,12 @@ via `micropip` inside your script or by extending `loadPackage(...)` in
 
 ## Production deployment
 
-The `dist/pyodide/` directory is a fully static site.  Any host that supports
-custom response headers works.
+The `dist/pyodide/` directory is a fully static site, and — because this build
+sets **no** COOP/COEP headers (see the Local testing note) — any static host
+works, including ones that cannot set custom response headers. The
+header-setting examples below are legacy; **do not** add COOP/COEP if you want
+middleauth GCS save to work (it severs the sign-in popup). The canonical deploy
+is the `ng-pyodide` Firebase target (see `src/roi_store/README.md`).
 
 ### Netlify
 
@@ -184,8 +252,8 @@ COEP headers to all responses.
 
 ### GitHub Pages
 
-GitHub Pages does not support custom response headers, so `SharedArrayBuffer`
-cannot be enabled there.  Use Netlify, Vercel, or Cloudflare Pages instead.
+GitHub Pages cannot set custom response headers, but this build no longer needs
+any (it is single-threaded, with no `SharedArrayBuffer`), so it works there.
 
 ### Requirements for all hosts
 

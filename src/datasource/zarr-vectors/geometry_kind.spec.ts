@@ -37,16 +37,17 @@ describe("KIND_CAPABILITIES table invariants", () => {
     }
   });
 
-  it("streamline auto-applies the RGB-by-tangent default shader", () => {
-    expect(KIND_CAPABILITIES.streamline.defaultFragmentMain).toBe(
-      DEFAULT_STREAMLINE_FRAGMENT_MAIN,
-    );
-  });
-
-  it("polyline / skeleton / graph have no auto-applied default shader", () => {
-    expect(KIND_CAPABILITIES.polyline.defaultFragmentMain).toBeUndefined();
-    expect(KIND_CAPABILITIES.skeleton.defaultFragmentMain).toBeUndefined();
-    expect(KIND_CAPABILITIES.graph.defaultFragmentMain).toBeUndefined();
+  it("every tangent-bearing kind auto-applies the RGB-by-tangent default shader", () => {
+    // All four current kinds synthesise a tangent, so all four nominate the
+    // direction default -- matching the segmentation layer's "direction"
+    // background colour-by default, so a tract layer renders colour-by-direction
+    // on load rather than the generic per-object hash colour.
+    for (const kind of ALL_KINDS) {
+      expect(hasSynthesisedTangent(kind)).toBe(true);
+      expect(KIND_CAPABILITIES[kind].defaultFragmentMain).toBe(
+        DEFAULT_STREAMLINE_FRAGMENT_MAIN,
+      );
+    }
   });
 
   it("streamline / polyline / graph / skeleton all synthesise tangents", () => {

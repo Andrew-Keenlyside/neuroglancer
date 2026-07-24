@@ -21,6 +21,7 @@ import {
   decodeRaggedBlobRows,
   readCrossChunkLinksForChunk,
 } from "#src/datasource/zarr-vectors/links.js";
+import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 
 // --- fixture builders reproducing the writer's on-disk framing ---------------
 
@@ -155,6 +156,18 @@ function makeStore(entries: Record<string, Uint8Array>) {
     entries[subpath];
 }
 
+/** Adapt a subpath store into the `cellRead` contract: `<array>/c/<i/j/k>`
+ * (origin/shard resolution is a no-op for these zero-origin, unsharded fixtures). */
+function cellReadFrom(
+  read: (
+    subpath: string,
+    signal: AbortSignal,
+  ) => Promise<Uint8Array | undefined>,
+): CellReader {
+  return (arrayPath: string, chunkKey: string, signal: AbortSignal) =>
+    read(`${arrayPath}/c/${chunkKey.split(".").join("/")}`, signal);
+}
+
 const FAMILY = enc({
   attributes: {
     zv_array: "links_family",
@@ -182,7 +195,8 @@ describe("readCrossChunkLinksForChunk (GET-only fallback)", () => {
     "links/0/0.0.+1/zarr.json": PLUS_Z_ARRAY,
     "links/0/0.0.+1/c/0/0/0": cell([[29, 63]]),
   });
-  const options = { kvStoreRead: store }; // no kvStoreList -> bounded probe
+  // no kvStoreList -> bounded probe
+  const options = { kvStoreRead: store, cellRead: cellReadFrom(store) };
 
   it("finds a source-side edge and locates its neighbour endpoint", async () => {
     const table = await readCrossChunkLinksForChunk(
@@ -230,8 +244,9 @@ describe("readCrossChunkLinksForChunk (GET-only fallback)", () => {
   });
 
   it("returns undefined when the links family is absent", async () => {
+    const empty = makeStore({});
     const table = await readCrossChunkLinksForChunk(
-      { kvStoreRead: makeStore({}) },
+      { kvStoreRead: empty, cellRead: cellReadFrom(empty) },
       [0, 0, 0],
       createCrossChunkLinksCaches(),
       new AbortController().signal,
@@ -245,7 +260,7 @@ describe("readCrossChunkLinksForChunk (GET-only fallback)", () => {
     });
     await expect(
       readCrossChunkLinksForChunk(
-        { kvStoreRead: bad },
+        { kvStoreRead: bad, cellRead: cellReadFrom(bad) },
         [0, 0, 0],
         createCrossChunkLinksCaches(),
         new AbortController().signal,
