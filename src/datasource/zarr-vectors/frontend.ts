@@ -39,6 +39,11 @@ import {
   type GetKvStoreBasedDataSourceOptions,
   type KvStoreBasedDataSourceProvider,
 } from "#src/datasource/index.js";
+import { resolveAttributeSelection } from "#src/datasource/zarr-vectors/attribute_budget.js";
+import {
+  formatAttributesFragment,
+  parseAttributesFragment,
+} from "#src/datasource/zarr-vectors/attributes_fragment.js";
 import type {
   ZarrVectorsAttributeDtype,
   ZarrVectorsPyramidMode,
@@ -46,13 +51,29 @@ import type {
 import {
   ZarrVectorsAnnotationSourceParameters,
   ZarrVectorsAnnotationSpatialIndexSourceParameters,
-  ZarrVectorsObjectKeyedSkeletonSourceParameters,
-  ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
+  ZarrVectorsObjectKeyedGeometrySourceParameters,
+  ZarrVectorsSpatialGeometrySourceParameters,
 } from "#src/datasource/zarr-vectors/base.js";
+import { resolveDeclaredGeometry } from "#src/datasource/zarr-vectors/declared_geometry.js";
 import {
-  ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource,
-  ZarrVectorsObjectKeyedSkeletonSource,
-} from "#src/datasource/zarr-vectors/skeleton_frontend.js";
+  ZarrVectorsMultiscaleGeometrySource,
+  ZarrVectorsObjectKeyedGeometrySource,
+} from "#src/datasource/zarr-vectors/geometry_frontend.js";
+import type { ZarrVectorsGeometryKind } from "#src/datasource/zarr-vectors/geometry_kind.js";
+import { KIND_CAPABILITIES } from "#src/datasource/zarr-vectors/geometry_kind.js";
+import {
+  levelsAreNested,
+  objectDepths as computeObjectDepths,
+} from "#src/datasource/zarr-vectors/object_admission.js";
+import type { ObjectGroupMembership } from "#src/datasource/zarr-vectors/object_groups.js";
+import {
+  buildObjectGroupMembership,
+  groupSegmentProperties,
+  parseGroupCount,
+} from "#src/datasource/zarr-vectors/object_groups.js";
+import { toAnnotationPropertyId } from "#src/datasource/zarr-vectors/property_id.js";
+import { computePerLevelObjectCount } from "#src/datasource/zarr-vectors/pyramid_objects.js";
+import { decodeVlenBytesChunk } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import type { AutoDetectRegistry } from "#src/kvstore/auto_detect.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
 import type { SharedKvStoreContext } from "#src/kvstore/frontend.js";
@@ -73,6 +94,12 @@ import {
 } from "#src/segmentation_display_state/property_map.js";
 import { makeSliceViewChunkSpecification } from "#src/sliceview/base.js";
 import { DataType } from "#src/util/data_type.js";
+import {
+  OBJECT_ATTR_DTYPE_TABLE,
+  reinterpretObjectAttributeBytes,
+  reinterpretWideToBigUint64,
+  reinterpretWideToFloat32,
+} from "#src/datasource/zarr-vectors/object_attribute_bytes.js";
 import * as matrix from "#src/util/matrix.js";
 import type { ProgressOptions } from "#src/util/progress_listener.js";
 import { ProgressSpan } from "#src/util/progress_listener.js";
@@ -227,15 +254,30 @@ function normalizeUnitScale(
   return { unit: "", scale: rawScale };
 }
 
-const ATTR_DTYPE_TO_NG_TYPE: Record<string, AnnotationPropertySpec["type"]> = {
-  float32: "float32",
-  uint8: "uint8",
-  uint16: "uint16",
-  uint32: "uint32",
-  int8: "int8",
-  int16: "int16",
-  int32: "int32",
-};
+/**
+ * On-disk per-vertex dtypes the reader can decode. Everything here becomes a
+ * float32 property (see `vertex_attribute_float.ts`); the set exists to reject
+ * what it cannot decode at all -- a vlen-string column, say -- rather than to
+ * choose a representation.
+ *
+ * The 64-bit members were missing until this list and the decoder were made to
+ * agree: a store whose obs columns are float64 scores and int64 codes had them
+ * all skipped without a word, which for `Zhuang-ABCA-1` meant nine of its
+ * fourteen non-gene columns simply did not exist as far as the viewer was
+ * concerned.
+ */
+const SUPPORTED_ATTR_DTYPES = new Set<string>([
+  "float32",
+  "uint8",
+  "uint16",
+  "uint32",
+  "int8",
+  "int16",
+  "int32",
+  "float64",
+  "int64",
+  "uint64",
+]);
 
 interface AnnotationSpatialIndexLevelMetadata {
   parameters: ZarrVectorsAnnotationSpatialIndexSourceParameters;
@@ -245,6 +287,8 @@ interface AnnotationSpatialIndexLevelMetadata {
 interface AnnotationMetadata {
   rank: number;
   coordinateSpace: ReturnType<typeof makeCoordinateSpace>;
+  /** Stored→world offset, if the store declares one; see {@link readCoordinateOffset}. */
+  coordinateOffset: Float64Array | undefined;
   parameters: ZarrVectorsAnnotationSourceParameters;
   spatialIndices: AnnotationSpatialIndexLevelMetadata[];
 }
@@ -308,6 +352,52 @@ function buildCoordinateSpaceFromMultiscales(
       makeIdentityTransformedBoundingBox({ lowerBounds, upperBounds }),
     ],
   });
+}
+
+/**
+ * Read `zarr_vectors.coordinate_offset` — the world position of the stored
+ * coordinate origin.  The writer stores `world - coordinate_offset` so that
+ * the spec's origin-0 chunk grid lines up with the source grid; zarr-vectors-py
+ * states the contract as "World position = stored + coordinate_offset"
+ * (`zarr_vectors/types/skeletons.py`) and its own reader adds it back when
+ * returning positions.  Absent or all-zero offsets give `undefined`.
+ */
+function readCoordinateOffset(zv: any, rank: number): Float64Array | undefined {
+  const raw = zv?.coordinate_offset;
+  if (!Array.isArray(raw) || raw.length !== rank) return undefined;
+  const offset = Float64Array.from(raw, Number);
+  if (!offset.every((v) => Number.isFinite(v))) return undefined;
+  if (offset.every((v) => v === 0)) return undefined;
+  return offset;
+}
+
+/**
+ * Model transform placing a store's raw coordinates into world space.
+ *
+ * Identity unless the store declares a `coordinate_offset`, in which case the
+ * offset becomes the transform's translation column.  Expressing it as a model
+ * transform (rather than shifting vertices or bounds) means the whole source
+ * moves coherently — geometry, the declared bounds and the initial view
+ * position neuroglancer derives from them — while every chunk-grid and
+ * spatial-index calculation keeps running in the raw stored frame.
+ *
+ * Keyed on `coordinate_offset` and NOT on the NGFF per-level `translation`:
+ * the writer overloads that field, mirroring the offset onto level 0 while
+ * writing the bin-centre convention on the coarser levels, so it cannot be
+ * read as a coordinate offset.  See the note in `buildGeometryMetadata`.
+ */
+function makeCoordinateOffsetTransform(
+  coordinateSpace: ReturnType<typeof makeCoordinateSpace>,
+  coordinateOffset: Float64Array | undefined,
+) {
+  const identity = makeIdentityTransform(coordinateSpace);
+  if (coordinateOffset === undefined) return identity;
+  const { rank } = coordinateSpace;
+  const transform = matrix.createIdentity(Float64Array, rank + 1);
+  for (let i = 0; i < rank; ++i) {
+    transform[(rank + 1) * rank + i] = coordinateOffset[i];
+  }
+  return { ...identity, transform };
 }
 
 async function listAttributeNames(
@@ -429,11 +519,94 @@ async function readChunkGridParams(
   };
 }
 
+/**
+ * Number of concurrent reads used when opening a store's attribute metadata.
+ * Stores can carry thousands of attributes (one per gene in a MERFISH panel):
+ * reading them one at a time takes minutes, and firing all of them at once
+ * just queues them in the browser's connection pool while starving the reads
+ * the rest of the open depends on.
+ */
+const ATTRIBUTE_READ_CONCURRENCY = 16;
+
+/**
+ * Which `object_attributes/` column supplies the segment-property map's id
+ * space, most authoritative first.
+ *
+ * `segment_id` is the spec's own name for the object id and is what the
+ * per-fragment `fragment_attributes/segment_id` column — the ids the renderer
+ * actually draws and selects with — is drawn from, so it must win. The others
+ * are the CAVE/MICrONS spellings of the same root id, kept as fallbacks for
+ * stores that ship the id under a table-specific name only.
+ *
+ * A column qualifies only if it is a 64-bit integer (see `AttrSpec.wideValues`);
+ * a float column cannot represent a root id exactly and would reintroduce the
+ * mismatch this list exists to fix.
+ */
+const OBJECT_ID_COLUMN_PREFERENCE = [
+  "segment_id",
+  "pt_root_id",
+  "root_id_v1300",
+] as const;
+
+/**
+ * `items.map(fn)` with at most `limit` calls in flight, preserving order.
+ */
+async function mapWithConcurrency<T, U>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<U>,
+): Promise<U[]> {
+  const results = new Array<U>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
+}
+
+/**
+ * Read every attribute's `zarr.json` with bounded concurrency.  Attributes
+ * whose metadata is unreadable are simply absent from the returned map; the
+ * caller skips them (it cannot determine a dtype for them anyway).
+ */
+async function readAttributeMetadata(
+  sharedKvStoreContext: SharedKvStoreContext,
+  levelUrl: string,
+  names: readonly string[],
+  options: Partial<ProgressOptions>,
+): Promise<Map<string, any>> {
+  const metadataByName = new Map<string, any>();
+  await mapWithConcurrency(names, ATTRIBUTE_READ_CONCURRENCY, async (name) => {
+    try {
+      metadataByName.set(
+        name,
+        await getJsonResource(
+          sharedKvStoreContext,
+          joinBaseUrlAndPath(levelUrl, `vertex_attributes/${name}/zarr.json`),
+          `attribute ${JSON.stringify(name)} metadata`,
+          options,
+        ),
+      );
+    } catch {
+      // Leave unset: the attribute is skipped.
+    }
+  });
+  return metadataByName;
+}
+
 async function buildPropertySpecsAndDtypes(
   sharedKvStoreContext: SharedKvStoreContext,
   levelUrl: string,
   hints: any,
   options: Partial<ProgressOptions>,
+  selectedAttributes?: readonly string[],
 ): Promise<{
   properties: AnnotationPropertySpec[];
   attributeNames: string[];
@@ -446,11 +619,28 @@ async function buildPropertySpecsAndDtypes(
     declaredHints.map((p) => [String(p.identifier), p]),
   );
 
-  const names = await listAttributeNames(
+  const listedNames = await listAttributeNames(
     sharedKvStoreContext,
     levelUrl,
     options,
   );
+  // `tangent` is reserved for the synthesised per-vertex direction
+  // (vec3 float32), exposed as `prop_tangent()` for the default
+  // colour-by-direction shader (see geometry_shader_bridge.ts). A store
+  // that ALSO ships its own `tangent` vertex_attribute would redefine
+  // the `prop_tangent` macro and — being multi-component (vec3) while the
+  // reader packs user attributes as 1-component — make the skeleton
+  // shader fail to compile ("illegal vector field selection"), rendering
+  // nothing. The synthesised tangent wins; skip the store's copy. Filtered
+  // here, before the budget, so it does not occupy a slot.
+  const names = listedNames.filter((name) => {
+    if (name !== "tangent") return true;
+    console.warn(
+      'zarr-vectors: ignoring reserved vertex attribute "tangent" — the ' +
+        "reader synthesises prop_tangent() for colour-by-direction.",
+    );
+    return false;
+  });
 
   // Stable order: declared properties first (in their declared order),
   // then any remaining listed attributes in alphabetical order.
@@ -465,43 +655,49 @@ async function buildPropertySpecsAndDtypes(
     if (!orderedNames.includes(n)) orderedNames.push(n);
   }
 
+  // Array metadata for the attributes actually kept, retained for the
+  // dictionary/enum block below. Populated by the dtype reader the selection
+  // resolver drives, so only the pages it reads are ever fetched.
+  const metadataByName = new Map<string, any>();
+  const { names: candidateNames, dtypes: dtypeByName } =
+    await resolveAttributeSelection({
+      orderedNames,
+      availableNames: names,
+      selectedAttributes,
+      isSupported: (dtype) => SUPPORTED_ATTR_DTYPES.has(dtype),
+      readDtypes: async (batch) => {
+        const meta = await readAttributeMetadata(
+          sharedKvStoreContext,
+          levelUrl,
+          batch,
+          options,
+        );
+        const out = new Map<string, string | undefined>();
+        for (const name of batch) {
+          const arrayMeta = meta.get(name);
+          metadataByName.set(name, arrayMeta);
+          const dtype: unknown =
+            arrayMeta?.attributes?.dtype ?? arrayMeta?.data_type;
+          out.set(name, typeof dtype === "string" ? dtype : undefined);
+        }
+        return out;
+      },
+    });
+
   const attributeNames: string[] = [];
   const attributeDtypes: ZarrVectorsAttributeDtype[] = [];
   const rawPropertyJson: any[] = [];
+  // `tangent` and `segment` are the synthesised per-vertex columns the
+  // skeleton render layer adds around the store's own attributes; a store
+  // attribute must not claim either name or it would shadow them in the
+  // shader's `prop_<id>()` namespace.
+  const usedPropertyIds = new Set<string>(["tangent", "segment"]);
 
-  for (const name of orderedNames) {
-    // `tangent` is reserved for the synthesised per-vertex direction
-    // (vec3 float32), exposed as `prop_tangent()` for the default
-    // colour-by-direction shader (see skeleton_shader_bridge.ts). A store
-    // that ALSO ships its own `tangent` vertex_attribute would redefine
-    // the `prop_tangent` macro and — being multi-component (vec3) while the
-    // reader packs user attributes as 1-component — make the skeleton
-    // shader fail to compile ("illegal vector field selection"), rendering
-    // nothing. The synthesised tangent wins; skip the store's copy.
-    if (name === "tangent") {
-      console.warn(
-        'zarr-vectors: ignoring reserved vertex attribute "tangent" — the ' +
-          "reader synthesises prop_tangent() for colour-by-direction.",
-      );
-      continue;
-    }
-    let dtype: string | undefined;
-    let arrayMeta: any | undefined;
-    try {
-      arrayMeta = await getJsonResource(
-        sharedKvStoreContext,
-        joinBaseUrlAndPath(levelUrl, `vertex_attributes/${name}/zarr.json`),
-        `attribute ${JSON.stringify(name)} metadata`,
-        options,
-      );
-      dtype = arrayMeta?.attributes?.dtype ?? arrayMeta?.data_type ?? undefined;
-    } catch {
-      dtype = undefined;
-    }
-    if (dtype === undefined || ATTR_DTYPE_TO_NG_TYPE[dtype] === undefined) {
-      // Skip attributes we can't represent.
-      continue;
-    }
+  for (const name of candidateNames) {
+    const arrayMeta = metadataByName.get(name);
+    // Non-null by construction: `resolveAttributeSelection` only returns names
+    // whose dtype it read and accepted.
+    const dtype = dtypeByName.get(name)!;
     attributeNames.push(name);
     attributeDtypes.push(dtype as ZarrVectorsAttributeDtype);
 
@@ -521,40 +717,36 @@ async function buildPropertySpecsAndDtypes(
       }
     }
 
+    // The property identifier is decoupled from the on-disk attribute name:
+    // `attributeNames[i]` stays the directory to read, while `id` is the
+    // GLSL-legal name the shader sees.  Both arrays remain index-parallel.
     const hint = declaredByName.get(name);
-    if (hint !== undefined) {
-      rawPropertyJson.push({
-        ...hint,
-        type: hint.type ?? dtype,
-        // Hints win for enum metadata; only fill in from the on-disk
-        // dictionary when the user didn't already specify it.
-        enum_values: hint.enum_values ?? enumValues,
-        enum_labels: hint.enum_labels ?? enumLabels,
-      });
-    } else {
-      rawPropertyJson.push({
-        id: name,
-        type: ATTR_DTYPE_TO_NG_TYPE[dtype],
-        enum_values: enumValues,
-        enum_labels: enumLabels,
-      });
-    }
+    const {
+      identifier: _unusedIdentifier,
+      id: _unusedId,
+      ...hintRest
+    } = hint ?? {};
+    const declaredId = String(hint?.identifier ?? hint?.id ?? name);
+    const id = toAnnotationPropertyId(declaredId, usedPropertyIds);
+    rawPropertyJson.push({
+      ...hintRest,
+      id,
+      description:
+        hintRest.description ?? (id === declaredId ? undefined : declaredId),
+      // float32 regardless of the on-disk dtype: every attribute is decoded to
+      // float32 before it reaches the GPU, so the property type the shader UI
+      // advertises has to say the same thing.
+      type: hint?.type ?? "float32",
+      // Hints win for enum metadata; only fill in from the on-disk
+      // dictionary when the user didn't already specify it.
+      enum_values: hint?.enum_values ?? enumValues,
+      enum_labels: hint?.enum_labels ?? enumLabels,
+    });
   }
-
-  // parseAnnotationPropertySpecs expects "id" — normalise from
-  // "identifier" if hints used that key.
-  const normalized = rawPropertyJson.map((p) => {
-    if (p.id !== undefined) return p;
-    if (p.identifier !== undefined) {
-      const { identifier, ...rest } = p;
-      return { id: identifier, ...rest };
-    }
-    return p;
-  });
 
   let properties: AnnotationPropertySpec[];
   try {
-    properties = parseAnnotationPropertySpecs(normalized);
+    properties = parseAnnotationPropertySpecs(rawPropertyJson);
   } catch (e) {
     throw new Error(
       `Failed to parse annotation property specs from zarr-vectors hints: ${(e as Error).message}`,
@@ -562,41 +754,6 @@ async function buildPropertySpecsAndDtypes(
   }
   return { properties, attributeNames, attributeDtypes };
 }
-
-/**
- * Map a zarr-vectors object-attribute dtype string to a neuroglancer
- * `DataType` plus the typed-array constructor that reinterprets the
- * raw bytes.  Subset that matches what `SegmentPropertyMap`'s numerical
- * properties can carry — `uint64` is excluded (the segment-properties
- * UI rejects it; the existing precomputed parser does the same).
- */
-const OBJECT_ATTR_DTYPE_TABLE: Record<
-  string,
-  {
-    dataType: DataType;
-    elementSize: number;
-    ctor: new (
-      buffer: ArrayBuffer,
-      byteOffset: number,
-      length: number,
-    ) =>
-      | Float32Array
-      | Uint8Array
-      | Uint16Array
-      | Uint32Array
-      | Int8Array
-      | Int16Array
-      | Int32Array;
-  }
-> = {
-  float32: { dataType: DataType.FLOAT32, elementSize: 4, ctor: Float32Array },
-  uint8: { dataType: DataType.UINT8, elementSize: 1, ctor: Uint8Array },
-  uint16: { dataType: DataType.UINT16, elementSize: 2, ctor: Uint16Array },
-  uint32: { dataType: DataType.UINT32, elementSize: 4, ctor: Uint32Array },
-  int8: { dataType: DataType.INT8, elementSize: 1, ctor: Int8Array },
-  int16: { dataType: DataType.INT16, elementSize: 2, ctor: Int16Array },
-  int32: { dataType: DataType.INT32, elementSize: 4, ctor: Int32Array },
-};
 
 /**
  * List per-object attribute names by enumerating subdirectories under
@@ -635,88 +792,109 @@ async function listObjectAttributeNames(
 }
 
 /**
- * Reinterpret a raw byte blob into a typed array of `dataType`, copying
- * when the source offset isn't aligned to the element size.  Mirrors
- * the chunk-decoder's `reinterpretBytes` so per-object attribute reads
- * follow the same alignment conventions as per-vertex reads.
+ * Read a level's `groups/` array — the store's own named partition of the
+ * objects (tract bundles, cell classes) — into a per-object group id.
+ *
+ * This is the I/O half: fetch the array metadata, read every chunk of the
+ * group axis, decompress and decode it.  Turning the blobs into a per-object
+ * group id is `buildObjectGroupMembership`.
+ *
+ * Returns `undefined` when the level has no `groups/` array, or when the array
+ * is present but unreadable — a store whose bundles cannot be recovered is
+ * still worth opening for its geometry.
  */
-function reinterpretObjectAttributeBytes(
-  bytes: Uint8Array,
-  ctor: (typeof OBJECT_ATTR_DTYPE_TABLE)[string]["ctor"],
-  elementSize: number,
-  expectedElements: number,
-):
-  | Float32Array
-  | Uint8Array
-  | Uint16Array
-  | Uint32Array
-  | Int8Array
-  | Int16Array
-  | Int32Array {
-  const expectedBytes = expectedElements * elementSize;
-  if (bytes.byteLength !== expectedBytes) {
-    throw new Error(
-      `zarr-vectors object_attributes: expected ${expectedBytes} bytes ` +
-        `(${expectedElements} elements), got ${bytes.byteLength}`,
+async function readObjectGroups(
+  sharedKvStoreContext: SharedKvStoreContext,
+  levelUrl: string,
+  options: Partial<ProgressOptions>,
+): Promise<ObjectGroupMembership | undefined> {
+  const arrayUrl = joinBaseUrlAndPath(levelUrl, "groups/");
+  const meta = await getJsonResource(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(arrayUrl, "zarr.json"),
+    "groups metadata",
+    options,
+  );
+  if (meta === undefined) return undefined;
+  const attrs = meta?.attributes ?? {};
+  if (attrs.zv_array !== undefined && attrs.zv_array !== "groups") {
+    warnOnceFe(
+      "groups-marker",
+      `zarr-vectors: ${arrayUrl} is not a groups array ` +
+        `(zv_array=${JSON.stringify(attrs.zv_array)}); ignoring it.`,
+    );
+    return undefined;
+  }
+  const numGroups = parseGroupCount(attrs, meta?.shape);
+  if (numGroups === 0) return undefined;
+
+  // The array is chunked along its single group axis, so a store with many
+  // groups spreads them over several chunks.  Read every one — stopping at
+  // `c/0` is exactly the bug this reader had for object attributes.
+  const chunkShape = meta?.chunk_grid?.configuration?.chunk_shape;
+  const rowsPerChunk = Array.isArray(chunkShape)
+    ? Number(chunkShape[0])
+    : numGroups;
+  const numChunks =
+    Number.isFinite(rowsPerChunk) && rowsPerChunk > 0
+      ? Math.ceil(numGroups / rowsPerChunk)
+      : 1;
+  const blobs: Uint8Array[] = [];
+  try {
+    for (let chunk = 0; chunk < numChunks; ++chunk) {
+      const response = await sharedKvStoreContext.kvStoreContext.read(
+        joinBaseUrlAndPath(arrayUrl, `c/${chunk}`),
+        options,
+      );
+      // An unwritten chunk is legal zarr (every group in it is empty); the
+      // fill value for vlen-bytes is the empty blob, which is what the
+      // membership builder sees when the blob list runs short.
+      if (response === undefined) continue;
+      const raw = new Uint8Array(
+        (await response.response.arrayBuffer()) as ArrayBuffer,
+      );
+      const bytes = await maybeDecompressObjAttr(
+        raw,
+        options.signal ?? new AbortController().signal,
+      );
+      blobs.push(...decodeVlenBytesChunk(bytes));
+    }
+  } catch (e) {
+    warnOnceFe(
+      "groups-read",
+      "zarr-vectors: could not read groups/; bundle names will be " +
+        `unavailable. ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return undefined;
+  }
+
+  const decoded = buildObjectGroupMembership(attrs, blobs, meta?.shape);
+  if (decoded === undefined) return undefined;
+  if (decoded.overlaps > 0) {
+    // One tag per object is what the segment-properties encoding models here;
+    // say so rather than silently showing the last writer's group.
+    warnOnceFe(
+      "groups-overlap",
+      `zarr-vectors: ${decoded.overlaps} object(s) belong to more than one ` +
+        "group; each is tagged with the highest-numbered group it belongs to.",
     );
   }
-  if (bytes.byteOffset % elementSize === 0) {
-    return new (ctor as any)(bytes.buffer, bytes.byteOffset, expectedElements);
-  }
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  return new (ctor as any)(copy.buffer, 0, expectedElements);
+  return decoded.membership;
 }
 
 /**
- * Reinterpret an 8-byte-per-element blob (float64 / int64 / uint64) as
- * `Float32Array`, downcasting values. The segment-properties columns hold
- * float32 (or the narrow int types), so a float64 tortuosity or int64 vertex
- * count would otherwise be dropped as "exotic"; downcasting keeps them usable
- * for filtering and colouring (precision loss is immaterial for these).
- */
-function reinterpretWideToFloat32(
-  bytes: Uint8Array,
-  kind: "float64" | "int64" | "uint64",
-  expectedElements: number,
-): Float32Array {
-  const elementSize = 8;
-  const expectedBytes = expectedElements * elementSize;
-  if (bytes.byteLength !== expectedBytes) {
-    throw new Error(
-      `zarr-vectors object_attributes: expected ${expectedBytes} bytes ` +
-        `(${expectedElements} elements), got ${bytes.byteLength}`,
-    );
-  }
-  let buffer: ArrayBufferLike = bytes.buffer;
-  let offset = bytes.byteOffset;
-  if (offset % elementSize !== 0) {
-    const copy = new Uint8Array(bytes.byteLength);
-    copy.set(bytes);
-    buffer = copy.buffer;
-    offset = 0;
-  }
-  const out = new Float32Array(expectedElements);
-  if (kind === "float64") {
-    const wide = new Float64Array(buffer, offset, expectedElements);
-    for (let i = 0; i < expectedElements; ++i) out[i] = wide[i];
-  } else {
-    const wide =
-      kind === "int64"
-        ? new BigInt64Array(buffer, offset, expectedElements)
-        : new BigUint64Array(buffer, offset, expectedElements);
-    for (let i = 0; i < expectedElements; ++i) out[i] = Number(wide[i]);
-  }
-  return out;
-}
-
-/**
- * Build a `SegmentPropertyMap` from level-0 `object_attributes/`.  Each
- * scalar (num_channels=1) attribute becomes one numerical column in
- * neuroglancer's segment-properties UI; the row order maps directly to
- * object_ids `[0, 1, ..., O-1]` (dense layout per spec §6).  Returns
- * `undefined` when the store has no object attributes — the caller
- * skips the subsource entry in that case.
+ * Build a `SegmentPropertyMap` from level 0's `object_attributes/` and
+ * `groups/`.  Each scalar (num_channels=1) attribute becomes one numerical
+ * column in neuroglancer's segment-properties UI; the row order maps directly
+ * to object_ids `[0, 1, ..., O-1]` (dense layout per spec §6).  Returns
+ * `undefined` when the store has neither object attributes nor groups — the
+ * caller skips the subsource entry in that case.
+ *
+ * The store's named groups become a `tags` property plus a `label`, which is
+ * what makes them selectable BY NAME: the segment list filters on `#<name>`,
+ * and its visibility-toggle-all control then shows or hides exactly that
+ * group's objects.  A numerical column alone could only be filtered by the
+ * group's id.
  *
  * Multi-channel (num_channels > 1) attributes are silently dropped:
  * neuroglancer's segment-properties UI is scalar-per-column, and
@@ -731,17 +909,16 @@ function reinterpretWideToFloat32(
  * from the segment-properties output so absent objects don't appear
  * with zero-padded values.
  */
-async function buildObjectAttributePropertyMap(
+async function buildSegmentPropertyMap(
   sharedKvStoreContext: SharedKvStoreContext,
   level0Url: string,
   options: Partial<ProgressOptions>,
 ): Promise<SegmentPropertyMap | undefined> {
-  const names = await listObjectAttributeNames(
-    sharedKvStoreContext,
-    level0Url,
-    options,
-  );
-  if (names.length === 0) return undefined;
+  const [names, groups] = await Promise.all([
+    listObjectAttributeNames(sharedKvStoreContext, level0Url, options),
+    readObjectGroups(sharedKvStoreContext, level0Url, options),
+  ]);
+  if (names.length === 0 && groups === undefined) return undefined;
 
   // Read each attribute's metadata in parallel.  Skip attributes the
   // segment-properties UI can't represent rather than failing the whole
@@ -750,11 +927,19 @@ async function buildObjectAttributePropertyMap(
     name: string;
     dataType: DataType;
     values: ReturnType<typeof reinterpretObjectAttributeBytes>;
+    /**
+     * For a 64-bit integer column only: the same values before the lossy
+     * float32 downcast, kept so an id column can key the map exactly. See
+     * {@link OBJECT_ID_COLUMN_PREFERENCE}.
+     */
+    wideValues?: BigUint64Array;
     presentMask?: Uint8Array;
     numObjects: number;
   };
-  const specs = await Promise.all(
-    names.map(async (name): Promise<AttrSpec | undefined> => {
+  const specs = await mapWithConcurrency(
+    names,
+    ATTRIBUTE_READ_CONCURRENCY,
+    async (name): Promise<AttrSpec | undefined> => {
       const arrayUrl = joinBaseUrlAndPath(
         level0Url,
         `object_attributes/${name}/`,
@@ -802,11 +987,34 @@ async function buildObjectAttributePropertyMap(
         return undefined;
       }
       const dataType = entry?.dataType ?? DataType.FLOAT32;
-      // On-disk layout: `object_attributes/<name>/` is itself a single-chunk
-      // zarr v3 array (not a group with a nested `data/` array). Its one chunk
-      // lives at `c/<0…>/` under the default chunk-key encoding ("/" separator):
-      // `c/0` for a scalar `[O]` array, `c/0/0` for a `[O, C]` vector. Read that
-      // blob directly; the semantic dtype is carried in the array attributes.
+      // On-disk layout: `object_attributes/<name>/` is itself a zarr v3 array
+      // (not a group with a nested `data/` array) whose grid holds the whole
+      // column in ONE chunk, at `c/<0…>/` under the default chunk-key encoding
+      // ("/" separator): `c/0` for a scalar `[O]` array, `c/0/0` for a `[O, C]`
+      // vector. Read that blob directly; the semantic dtype is carried in the
+      // array attributes.
+      //
+      // The chunk is full size even when the column is shorter — a writer that
+      // picks a fixed `chunk_shape` (e.g. 65536) stores `shape[0]` real values
+      // followed by fill-value padding — so decode `chunkElements` and trim.
+      const chunkShape: number[] = Array.isArray(
+        meta?.chunk_grid?.configuration?.chunk_shape,
+      )
+        ? (meta.chunk_grid.configuration.chunk_shape as number[]).map(Number)
+        : shape.map(Number);
+      if (chunkShape.length !== shape.length || chunkShape[0] < numObjects) {
+        // More than one chunk along the object axis: this single-chunk read
+        // would silently truncate the column, so skip it instead.
+        warnOnceFe(
+          "object-attributes-multi-chunk",
+          `zarr-vectors: object attribute ${JSON.stringify(name)} spans ` +
+            `multiple chunks (shape ${shape.join(",")}, chunk ` +
+            `${chunkShape.join(",")}); skipping — only single-chunk object ` +
+            "attribute columns are supported.",
+        );
+        return undefined;
+      }
+      const chunkElements = chunkShape.reduce((a, b) => a * b, 1);
       const chunkKey = `c/${shape.map(() => 0).join("/")}`;
       const dataResponse = await sharedKvStoreContext.kvStoreContext.read(
         joinBaseUrlAndPath(arrayUrl, chunkKey),
@@ -830,8 +1038,14 @@ async function buildObjectAttributePropertyMap(
               entry.ctor,
               entry.elementSize,
               numObjects,
+              chunkElements,
             )
-          : reinterpretWideToFloat32(bytes, wideKind!, numObjects);
+          : reinterpretWideToFloat32(
+              bytes,
+              wideKind!,
+              numObjects,
+              chunkElements,
+            );
       let presentMask: Uint8Array | undefined;
       if (attrs?.has_present_mask === true) {
         const maskResponse = await sharedKvStoreContext.kvStoreContext.read(
@@ -842,20 +1056,31 @@ async function buildObjectAttributePropertyMap(
           const rawMaskBytes = new Uint8Array(
             (await maskResponse.response.arrayBuffer()) as ArrayBuffer,
           );
-          presentMask = await maybeDecompressObjAttr(
+          const fullMask = await maybeDecompressObjAttr(
             rawMaskBytes,
             options.signal ?? new AbortController().signal,
           );
+          // Same padded-chunk trim as the values above.
+          presentMask =
+            fullMask.length > numObjects
+              ? fullMask.subarray(0, numObjects)
+              : fullMask;
         }
       }
       return {
         name,
         dataType,
         values,
+        // Keep the undamaged 64-bit values for integer columns so one of them
+        // can supply the id space below. Cheap: 8 bytes per object.
+        wideValues:
+          wideKind === "int64" || wideKind === "uint64"
+            ? reinterpretWideToBigUint64(bytes, numObjects, chunkElements)
+            : undefined,
         presentMask,
         numObjects,
       };
-    }),
+    },
   );
 
   // Reconcile object counts across attributes — they MUST agree because
@@ -863,8 +1088,12 @@ async function buildObjectAttributePropertyMap(
   // first present-mask-aware count as the reference and union of
   // present masks for the id list.
   const present = specs.filter((s): s is AttrSpec => s !== undefined);
-  if (present.length === 0) return undefined;
-  const numObjects = present[0].numObjects;
+  if (present.length === 0 && groups === undefined) return undefined;
+  // The attribute columns are authoritative on the object count when there are
+  // any: `groups/` records only the ids it has members for, so a trailing run
+  // of ungrouped objects would go missing if its length led here.
+  const numObjects =
+    present.length > 0 ? present[0].numObjects : groups!.groupByObject.length;
   for (const s of present) {
     if (s.numObjects !== numObjects) {
       throw new Error(
@@ -895,9 +1124,42 @@ async function buildObjectAttributePropertyMap(
   }
   if (keepIndices.length === 0) return undefined;
 
+  // Key the map by the store's own object ids, not by row position.
+  //
+  // This used to be `ids[i] = BigInt(keepIndices[i])` — the dense row ordinal
+  // 0,1,2,…  But the ids a segment-property map is looked up BY are the
+  // segment ids the geometry carries: the per-fragment `segment_id` the chunk
+  // downloader expands into the per-vertex segment column, which for a
+  // connectomics store is a root id of order 1e17. Row ordinals and root ids
+  // are disjoint id spaces, so every lookup missed and per-object colouring
+  // and the attribute display silently did nothing — no error, because a
+  // property map that answers "no such segment" is indistinguishable from one
+  // that is simply sparse.
+  //
+  // The id column is whichever of these the store carries, in this order; the
+  // fallback to row ordinals is kept for stores that carry none, where row
+  // position genuinely is the id space.
+  const idColumn = OBJECT_ID_COLUMN_PREFERENCE.map((wanted) =>
+    present.find((s) => s.name === wanted && s.wideValues !== undefined),
+  ).find((s) => s !== undefined);
   const ids = new BigUint64Array(keepIndices.length);
-  for (let i = 0; i < keepIndices.length; ++i) {
-    ids[i] = BigInt(keepIndices[i]);
+  if (idColumn !== undefined) {
+    const wide = idColumn.wideValues!;
+    for (let i = 0; i < keepIndices.length; ++i) {
+      ids[i] = wide[keepIndices[i]];
+    }
+  } else {
+    warnOnceFe(
+      "object-attributes-no-id-column",
+      "zarr-vectors: object_attributes/ carries none of " +
+        `${OBJECT_ID_COLUMN_PREFERENCE.join(", ")} as a 64-bit integer ` +
+        "column, so the segment-property map is keyed by row position. " +
+        "Per-object colouring and attribute display will only work if the " +
+        "store's segment ids really are 0,1,2,…",
+    );
+    for (let i = 0; i < keepIndices.length; ++i) {
+      ids[i] = BigInt(keepIndices[i]);
+    }
   }
 
   const properties: InlineSegmentProperty[] = [];
@@ -927,6 +1189,16 @@ async function buildObjectAttributePropertyMap(
       bounds: [min, max],
     };
     properties.push(numerical);
+  }
+
+  if (groups !== undefined) {
+    properties.push(
+      ...groupSegmentProperties(
+        groups,
+        keepIndices,
+        new Set(properties.map((p) => p.id)),
+      ),
+    );
   }
 
   const inline: InlineSegmentPropertyMap = normalizeInlineSegmentPropertyMap({
@@ -965,47 +1237,111 @@ function enumerateLevelPaths(multiscales: any): string[] {
 }
 
 /**
- * Live object count per level, finest-first, or `undefined` per level where it
- * cannot be determined.
+ * Per-object vertex counts at every level, **finest-first**, with `0` marking an
+ * object absent from that level.
  *
- * This is the detail axis of an object-sparsity pyramid: every level covers
- * the whole volume with the same `chunk_shape`, and coarser levels simply hold
- * fewer *complete* objects. It cannot be read off `object_index/manifests`,
- * whose length is the object-id space rather than the live count -- with
- * ``preserves_object_ids`` a dropped object keeps its slot and stores an empty
- * manifest, so every level reports the same shape.
+ * `object_attributes/vertex_count` is written at every level of a per-object
+ * pyramid, dense over the shared object-id space, with the array's `fill_value`
+ * standing in for "this level dropped that object". One ~2 MB read per level
+ * therefore yields two things at once that nothing else in the store provides:
+ * an **exact per-object cost**, and an **exact per-level membership mask**.
+ * Together they are what lets a budget be spent on a chosen subset of objects
+ * instead of on whichever pyramid rung happens to fit.
  *
- * So it is derived instead: ``inherited_num_objects`` scaled by the product of
- * ``object_sparsity`` down the chain (each level's sparsity is relative to its
- * parent). Falls back to ``vertex_count``, which tracks object count closely
- * while vertices-per-object stays roughly constant across levels.
+ * Returns `undefined` if any level lacks the array or reports a different object
+ * count, since a partial picture would silently under-admit whole levels.
  */
-function computePerLevelObjectCount(
-  perLevelMeta: ReadonlyArray<{
-    vertexCount: number | undefined;
-    objectSparsity: number | undefined;
-    numObjects: number | undefined;
-  }>,
-): (number | undefined)[] {
-  const n = perLevelMeta.length;
-  const base = perLevelMeta[0]?.numObjects;
-  if (base !== undefined) {
-    const out: (number | undefined)[] = [];
-    let cumulative = 1;
-    let ok = true;
-    for (let k = 0; k < n; ++k) {
-      const s = perLevelMeta[k].objectSparsity;
-      if (s === undefined) {
-        ok = false;
-        break;
-      }
-      // Level 0's sparsity is 1.0; each later level's is relative to its parent.
-      cumulative *= s;
-      out.push(Math.max(1, base * cumulative));
+/**
+ * Membership of level `level` as a bitset over the object-id space, or
+ * `undefined` when the store carries no membership data.
+ *
+ * A level index past the coarsest yields an all-zero bitset rather than
+ * `undefined`: "no coarser backbone" is a real answer, distinct from "cannot
+ * tell", and the two must not collapse or the coarsest level would silently
+ * lose per-object admission.
+ */
+function coarserMembershipBitset(
+  perLevelObjectVertexCounts: Uint32Array[] | undefined,
+  level: number,
+): Uint8Array | undefined {
+  if (perLevelObjectVertexCounts === undefined) return undefined;
+  const numObjects = perLevelObjectVertexCounts[0].length;
+  const bitset = new Uint8Array((numObjects + 7) >> 3);
+  const counts = perLevelObjectVertexCounts[level];
+  if (counts !== undefined) {
+    for (let id = 0; id < numObjects; ++id) {
+      if (counts[id] !== 0) bitset[id >> 3] |= 1 << (id & 7);
     }
-    if (ok) return out;
   }
-  return perLevelMeta.map((m) => m.vertexCount);
+  return bitset;
+}
+
+let warnedNotNested = false;
+function warnOnceNotNested() {
+  if (warnedNotNested) return;
+  warnedNotNested = true;
+  console.warn(
+    "zarr-vectors: pyramid levels are not nested subsets of one object id " +
+      "space, so per-object budgeting is unavailable; falling back to " +
+      "whole-level selection.",
+  );
+}
+
+async function readPerLevelObjectVertexCounts(
+  sharedKvStoreContext: SharedKvStoreContext,
+  storeUrl: string,
+  levelPaths: readonly string[],
+  options: Partial<ProgressOptions>,
+): Promise<Uint32Array[] | undefined> {
+  const perLevel = await Promise.all(
+    levelPaths.map(async (levelPath) => {
+      const arrayUrl = joinBaseUrlAndPath(
+        kvstoreEnsureDirectoryPipelineUrl(pipelineUrlJoin(storeUrl, levelPath)),
+        "object_attributes/vertex_count/",
+      );
+      const meta = await getJsonResource(
+        sharedKvStoreContext,
+        joinBaseUrlAndPath(arrayUrl, "zarr.json"),
+        `zarr-vectors level ${JSON.stringify(levelPath)} vertex_count metadata`,
+        options,
+      );
+      if (meta === undefined) return undefined;
+      const attrs = meta?.attributes ?? meta;
+      const shape = Array.isArray(attrs?.shape) ? attrs.shape : meta?.shape;
+      if (!Array.isArray(shape) || shape.length !== 1) return undefined;
+      const numObjects = Number(shape[0]);
+      if (!Number.isFinite(numObjects) || numObjects <= 0) return undefined;
+      const response = await sharedKvStoreContext.kvStoreContext.read(
+        joinBaseUrlAndPath(arrayUrl, "c/0"),
+        options,
+      );
+      if (response === undefined) return undefined;
+      const bytes = await maybeDecompressObjAttr(
+        new Uint8Array((await response.response.arrayBuffer()) as ArrayBuffer),
+        options.signal ?? new AbortController().signal,
+      );
+      if (bytes.byteLength < numObjects * 4) return undefined;
+      // Copy rather than view: the decompressed buffer's offset is not
+      // guaranteed 4-byte aligned, and this is retained for the session.
+      const counts = new Uint32Array(numObjects);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, numObjects * 4);
+      // The sentinel means "absent"; normalise it to 0 so membership is simply
+      // `count !== 0` everywhere downstream.
+      const sentinel = Number(
+        meta?.fill_value ?? attrs?.fill_value ?? 0xffffffff,
+      );
+      for (let i = 0; i < numObjects; ++i) {
+        const v = view.getUint32(i * 4, /*littleEndian=*/ true);
+        counts[i] = v === sentinel ? 0 : v;
+      }
+      return counts;
+    }),
+  );
+  if (perLevel.some((c) => c === undefined)) return undefined;
+  const counts = perLevel as Uint32Array[];
+  const numObjects = counts[0].length;
+  if (counts.some((c) => c.length !== numObjects)) return undefined;
+  return counts;
 }
 
 function computeLevelLimit(
@@ -1272,6 +1608,7 @@ async function buildAnnotationMetadata(
   const meta: AnnotationMetadata = {
     rank,
     coordinateSpace,
+    coordinateOffset: readCoordinateOffset(zv, rank),
     parameters,
     spatialIndices,
   };
@@ -1283,7 +1620,10 @@ function getAnnotationDataSource(
   metadata: AnnotationMetadata,
 ): DataSource {
   return {
-    modelTransform: makeIdentityTransform(metadata.coordinateSpace),
+    modelTransform: makeCoordinateOffsetTransform(
+      metadata.coordinateSpace,
+      metadata.coordinateOffset,
+    ),
     subsources: [
       {
         id: "default",
@@ -1307,16 +1647,27 @@ function getAnnotationDataSource(
 // Skeleton / polyline / streamline path
 // ---------------------------------------------------------------
 
-interface SkeletonMetadata {
+interface GeometryMetadata {
   rank: number;
   coordinateSpace: ReturnType<typeof makeCoordinateSpace>;
+  /** Stored→world offset, if the store declares one; see {@link readCoordinateOffset}. */
+  coordinateOffset: Float64Array | undefined;
+  /**
+   * Whether the store's geometry kind has the discrete-object model.  False
+   * for `point_cloud`, which has no `object_index/manifests` for the
+   * per-segment (pass-2) source to resolve and no `object_attributes/` to
+   * build a segment-property map from.
+   */
+  hasObjectModel: boolean;
+  /** What primitive the store's geometry draws as; see {@link KIND_CAPABILITIES}. */
+  primitive: "points" | "lines" | "triangles";
   /** Parameters for the per-segment (pass-2) chunk source. */
-  pass2Params: ZarrVectorsObjectKeyedSkeletonSourceParameters;
+  pass2Params: ZarrVectorsObjectKeyedGeometrySourceParameters;
   /**
    * Per-object attributes assembled into a neuroglancer
    * `SegmentPropertyMap`.  `undefined` when the store has no
    * `object_attributes/` at level 0.  Exposed by
-   * `getSkeletonDataSource` as the opt-in `"properties"` subsource.
+   * `getGeometryDataSource` as the opt-in `"properties"` subsource.
    */
   segmentPropertyMap?: SegmentPropertyMap;
   /**
@@ -1330,7 +1681,7 @@ interface SkeletonMetadata {
    * case.
    */
   pass1Levels?: ReadonlyArray<{
-    parameters: ZarrVectorsSpatiallyIndexedSkeletonSourceParameters;
+    parameters: ZarrVectorsSpatialGeometrySourceParameters;
   }>;
   /** Grid info shared across all pass-1 levels.  Co-defined with `pass1Levels`. */
   spatialGrid?: {
@@ -1347,6 +1698,18 @@ interface SkeletonMetadata {
      * adjacent levels with identical chunk_shape will collapse into a
      * single picker entry.
      */
+    /**
+     * Per-object vertex counts at each level, finest-first, `0` where the level
+     * dropped the object. Both an exact per-object cost table and an exact
+     * per-level membership mask; `undefined` when the store omits
+     * `object_attributes/vertex_count` at any level.
+     */
+    perLevelObjectVertexCounts?: Uint32Array[];
+    /**
+     * Coarsest level containing each object (see `objectDepths`), or `undefined`
+     * when the levels are not nested and the depth model does not apply.
+     */
+    objectDepths?: Uint8Array;
     perLevelChunkShape: Float32Array[];
     /**
      * Live object count per level, parallel to `perLevelChunkShape`;
@@ -1378,12 +1741,13 @@ interface SkeletonMetadata {
   };
 }
 
-const SKELETON_LIKE_GEOM = new Set<string>([
-  "skeleton",
-  "polyline",
-  "streamline",
-  "graph",
-]);
+/**
+ * Geometry types that route through the spatially-indexed geometry path — i.e.
+ * every kind {@link KIND_CAPABILITIES} knows about.  They share one on-disk
+ * layout (`vertices/` + `vertex_fragments/` + optional `links/`); what differs
+ * per kind is recorded in the capability table, not here.
+ */
+const SPATIAL_GEOM_KINDS = new Set<string>(Object.keys(KIND_CAPABILITIES));
 
 /**
  * Read store metadata for a skeleton / polyline / streamline store and
@@ -1399,12 +1763,38 @@ const SKELETON_LIKE_GEOM = new Set<string>([
  * - `links/0/.zattrs.dtype` (or `data_type` fallback) declares the
  *   on-disk link dtype; absent for `implicit_sequential` stores.
  */
-async function buildSkeletonMetadata(
+/**
+ * {@link getJsonResource} that treats an unreadable resource as absent.
+ *
+ * Used where absence is a legitimate answer -- probing whether a store has a
+ * links family at all -- rather than an error to surface.
+ */
+async function getJsonResourceOrUndefined(
+  sharedKvStoreContext: SharedKvStoreContext,
+  url: string,
+  description: string,
+  options: Partial<ProgressOptions>,
+): Promise<any | undefined> {
+  try {
+    return await getJsonResource(
+      sharedKvStoreContext,
+      url,
+      description,
+      options,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+async function buildGeometryMetadata(
   sharedKvStoreContext: SharedKvStoreContext,
   storeUrl: string,
   rootAttrs: any,
   options: Partial<ProgressOptions>,
-): Promise<SkeletonMetadata> {
+  selectedAttributes?: readonly string[],
+  editServiceUrl?: string,
+): Promise<GeometryMetadata> {
   const zv = rootAttrs?.zarr_vectors;
   if (zv === undefined) {
     throw new Error(
@@ -1415,20 +1805,61 @@ async function buildSkeletonMetadata(
   const geometryTypes: string[] = Array.isArray(zv.geometry_types)
     ? zv.geometry_types
     : [];
-  const skeletonKindsPresent = geometryTypes.filter((g) =>
-    SKELETON_LIKE_GEOM.has(g),
+  // A store may DECLARE several geometry types; only one of them can have
+  // readable arrays (see `declared_geometry.ts`). Probe `links/0` first so the
+  // choice is made from what is on disk rather than from declaration order.
+  const linksFamilyJson = await getJsonResourceOrUndefined(
+    sharedKvStoreContext,
+    joinBaseUrlAndPath(
+      kvstoreEnsureDirectoryPipelineUrl(
+        pipelineUrlJoin(
+          storeUrl,
+          enumerateLevelPaths(rootAttrs.multiscales)[0],
+        ),
+      ),
+      "links/0/zarr.json",
+    ),
+    "zarr-vectors links/0 metadata",
+    options,
   );
-  if (skeletonKindsPresent.length !== 1) {
-    throw new Error(
-      `buildSkeletonMetadata: expected exactly one skeleton-like ` +
-        `geometry type (got ${JSON.stringify(skeletonKindsPresent)})`,
+  const declaredLinkWidth = Number(linksFamilyJson?.attributes?.link_width);
+  const resolution = resolveDeclaredGeometry(geometryTypes, {
+    hasLinks: linksFamilyJson !== undefined,
+    linkWidth: Number.isInteger(declaredLinkWidth)
+      ? declaredLinkWidth
+      : undefined,
+  });
+  const geometryKind = resolution.kind;
+  if (resolution.skipped.length > 0) {
+    warnOnceFe(
+      `multi-geometry-${geometryTypes.join(",")}`,
+      `zarr-vectors: this store declares geometry types ` +
+        `${JSON.stringify(geometryTypes)} but a store holds one set of ` +
+        `vertices; reading them as ${JSON.stringify(geometryKind)}` +
+        (resolution.ambiguous
+          ? " (the arrays did not single one out, so declaration order decided)"
+          : "") +
+        `. ${JSON.stringify(resolution.skipped)} not rendered: the writer's ` +
+        "multi-geometry support is unfinished, so no separate arrays exist " +
+        "for them. A partly-written add_geometry() call leaves exactly this " +
+        "metadata.",
     );
   }
-  const geometryKind = skeletonKindsPresent[0] as
-    | "skeleton"
-    | "polyline"
-    | "streamline"
-    | "graph";
+  if (resolution.unsupported.length > 0) {
+    warnOnceFe(
+      `unsupported-geometry-${resolution.unsupported.join(",")}`,
+      `zarr-vectors: ignoring unrecognised geometry type(s) ` +
+        `${JSON.stringify(resolution.unsupported)}.`,
+    );
+  }
+  const caps = KIND_CAPABILITIES[geometryKind];
+  // Optional store hint naming a per-vertex attribute that already holds a
+  // meaningful integer id (a cell label, a particle id).  Only consulted for
+  // kinds without the object model, where each vertex is its own segment.
+  const vertexIdAttribute =
+    typeof zv.vertex_id_attribute === "string"
+      ? zv.vertex_id_attribute
+      : undefined;
 
   // Bounds + rank — identical idiom to the annotation path.
   const bounds = zv.bounds;
@@ -1485,23 +1916,38 @@ async function buildSkeletonMetadata(
   // fragment-attribute schema is store-wide, so level 0's answer holds for every
   // level. `arrays_present` is kept only as a fallback for pre-0.9 stores that
   // do not materialise this array.
-  const segmentIdMeta = await getJsonResource(
-    sharedKvStoreContext,
-    joinBaseUrlAndPath(level0Url, "fragment_attributes/segment_id/zarr.json"),
-    "fragment_attributes/segment_id metadata",
-    options,
-  );
+  // Kinds without the discrete-object model never wrote this array, and each
+  // vertex is its own segment anyway -- don't spend a request finding out.
+  const segmentIdMeta = caps.hasObjectModel
+    ? await getJsonResource(
+        sharedKvStoreContext,
+        joinBaseUrlAndPath(
+          level0Url,
+          "fragment_attributes/segment_id/zarr.json",
+        ),
+        "fragment_attributes/segment_id metadata",
+        options,
+      )
+    : undefined;
   const hasFragmentSegmentIds = segmentIdMeta !== undefined;
 
   // Per-vertex attribute discovery — reuse the annotation-path machinery
   // verbatim; the resulting (attributeNames, attributeDtypes) feed the
   // skeleton render layer's `prop_<name>()` shader bridge.
-  const { attributeNames, attributeDtypes } = await buildPropertySpecsAndDtypes(
+  const {
+    properties: attributeProperties,
+    attributeNames,
+    attributeDtypes,
+  } = await buildPropertySpecsAndDtypes(
     sharedKvStoreContext,
     level0Url,
     ngHints,
     options,
+    selectedAttributes,
   );
+  // Index-parallel to `attributeNames`; these are the GLSL-legal names the
+  // `prop_<name>()` bridge exposes (the on-disk names may not be).
+  const attributePropertyIds = attributeProperties.map((p) => p.identifier);
 
   // Links convention — drives whether explicit `links/0/<chunk>` edges
   // are read in addition to the implicit sequential ones synthesised
@@ -1512,8 +1958,11 @@ async function buildSkeletonMetadata(
     | "implicit_sequential_with_branches"
     | "explicit";
   if (linksConventionRaw === undefined) {
-    // Spec default per geometry: streamline / polyline → implicit_sequential,
-    // skeleton → implicit_sequential_with_branches, graph → explicit.
+    // Spec default per geometry: line / streamline / polyline →
+    // implicit_sequential, skeleton → implicit_sequential_with_branches,
+    // graph → explicit.  A point cloud declares none (it has no links at all);
+    // the value is inert for it, since the capability table suppresses edges
+    // regardless of what the convention says.
     if (geometryKind === "skeleton") {
       linksConvention = "implicit_sequential_with_branches";
     } else if (geometryKind === "graph") {
@@ -1545,7 +1994,10 @@ async function buildSkeletonMetadata(
     | "int16"
     | "int32"
     | "int64";
-  if (linksConvention === "implicit_sequential") {
+  // The links family's record arity. 2 everywhere except a surface, where the
+  // store declares its face arity on `links/0`. Read alongside the dtype below.
+  let linkWidth = 2;
+  if (caps.edgeSource === "none" || linksConvention === "implicit_sequential") {
     linkDtype = "int64";
   } else {
     let linksZarrJson: any | undefined;
@@ -1558,6 +2010,14 @@ async function buildSkeletonMetadata(
       );
     } catch {
       linksZarrJson = undefined;
+    }
+    const declaredWidth = Number(linksZarrJson?.attributes?.link_width);
+    if (Number.isInteger(declaredWidth) && declaredWidth >= 2) {
+      linkWidth = declaredWidth;
+    } else if (caps.primitive === "triangles") {
+      // A surface with no declared arity: assume triangles rather than reading
+      // its faces as edges, which would silently produce garbage geometry.
+      linkWidth = 3;
     }
     const raw =
       linksZarrJson?.attributes?.dtype ?? linksZarrJson?.data_type ?? "int64";
@@ -1577,11 +2037,12 @@ async function buildSkeletonMetadata(
     linkDtype = raw;
   }
 
-  const pass2Params = new ZarrVectorsObjectKeyedSkeletonSourceParameters();
+  const pass2Params = new ZarrVectorsObjectKeyedGeometrySourceParameters();
   pass2Params.baseUrl = level0Url;
   pass2Params.rank = rank;
   pass2Params.attributeNames = attributeNames;
   pass2Params.attributeDtypes = attributeDtypes;
+  pass2Params.attributePropertyIds = attributePropertyIds;
   pass2Params.linksConvention = linksConvention;
   pass2Params.geometryKind = geometryKind;
   pass2Params.linkDtype = linkDtype;
@@ -1606,7 +2067,7 @@ async function buildSkeletonMetadata(
   // or higher-rank stores fall back to pass-2 only.
   let pass1Levels:
     | ReadonlyArray<{
-        parameters: ZarrVectorsSpatiallyIndexedSkeletonSourceParameters;
+        parameters: ZarrVectorsSpatialGeometrySourceParameters;
       }>
     | undefined;
   let spatialGrid:
@@ -1614,6 +2075,8 @@ async function buildSkeletonMetadata(
         perLevelChunkShape: Float32Array[];
         perLevelObjectCount: (number | undefined)[];
         perLevelVertexCount: (number | undefined)[];
+        perLevelObjectVertexCounts?: Uint32Array[];
+        objectDepths?: Uint8Array;
         lowerBounds: Float32Array;
         upperBounds: Float32Array;
       }
@@ -1716,20 +2179,42 @@ async function buildSkeletonMetadata(
     const perLevelObjectCount = computePerLevelObjectCount(perLevelMeta);
     const perLevelVertexCount = perLevelMeta.map((m) => m.vertexCount);
 
+    // Per-object costs and per-level membership, which together let a memory
+    // budget be spent on a chosen SUBSET of a level's objects rather than only
+    // on whichever whole rung fits. Optional: a store without these arrays, or
+    // one whose levels are not nested subsets, keeps whole-level selection.
+    const perLevelObjectVertexCounts = await readPerLevelObjectVertexCounts(
+      sharedKvStoreContext,
+      storeUrl,
+      levelPaths,
+      options,
+    );
+    let objectDepths: Uint8Array | undefined;
+    if (perLevelObjectVertexCounts !== undefined) {
+      if (levelsAreNested(perLevelObjectVertexCounts)) {
+        objectDepths = computeObjectDepths(perLevelObjectVertexCounts);
+      } else {
+        // Not a coincidence worth papering over: the depth model would drop
+        // every object a coarse level holds and a finer one does not.
+        warnOnceNotNested();
+      }
+    }
+
     // Per-level parameter blobs.  Each level gets its own chunkShape
     // (may differ when the writer used ``chunk_scale_factors``).
     const levels: {
-      parameters: ZarrVectorsSpatiallyIndexedSkeletonSourceParameters;
+      parameters: ZarrVectorsSpatialGeometrySourceParameters;
     }[] = [];
     for (let k = 0; k < levelPaths.length; ++k) {
       const levelUrl = kvstoreEnsureDirectoryPipelineUrl(
         pipelineUrlJoin(storeUrl, levelPaths[k]),
       );
-      const params = new ZarrVectorsSpatiallyIndexedSkeletonSourceParameters();
+      const params = new ZarrVectorsSpatialGeometrySourceParameters();
       params.baseUrl = levelUrl;
       params.rank = rank;
       params.attributeNames = attributeNames;
       params.attributeDtypes = attributeDtypes;
+      params.attributePropertyIds = attributePropertyIds;
       params.linksConvention = linksConvention;
       params.geometryKind = geometryKind;
       params.linkDtype = linkDtype;
@@ -1744,10 +2229,37 @@ async function buildSkeletonMetadata(
       // then looks up sources by `gridIndex`.
       params.gridIndex = levelPaths.length - 1 - k;
       params.hasFragmentSegmentIds = perLevelMeta[k].hasFragmentSegmentIds;
+      params.vertexIdAttribute = vertexIdAttribute;
+      // The edit target rides on every level's parameters, but only level 0's
+      // source is the one the editing UI duck-types (`sources3d[0].chunkSource`,
+      // `skeleton/frontend.ts`), so only it can act on this.
+      params.editServiceUrl = editServiceUrl;
+      params.editStore =
+        editServiceUrl === undefined
+          ? undefined
+          : storeUrl.replace(/\/+$/, "").split("/").pop();
+      params.linkWidth = linkWidth;
       params.chunkGridOrigin = perLevelMeta[k].grid.chunkGridOrigin;
       params.sharded = perLevelMeta[k].grid.sharded;
       params.shardChunkShape = perLevelMeta[k].grid.shardChunkShape;
       params.cellSeparator = perLevelMeta[k].grid.cellSeparator;
+      // The next-coarser level's membership, for per-object admission. Static
+      // per level (it is pure store metadata); only the rationing fraction is
+      // supplied dynamically, at request time.
+      //
+      // Gated on `objectDepths`, i.e. on the levels being NESTED, and not
+      // merely on the counts having been read. The partition rule is "an object
+      // a coarser level also holds is that level's to draw"; on non-nested
+      // levels that silently drops every object the coarse level holds and the
+      // fine one does not -- and `canBudgetPerObject` has already declined to
+      // budget there, so the partition would be in force with nothing choosing
+      // what it admits. Tying both to one condition keeps "partitioned" and
+      // "budgetable per object" the same store property.
+      params.coarserMembership =
+        objectDepths === undefined
+          ? undefined
+          : coarserMembershipBitset(perLevelObjectVertexCounts, k + 1);
+      params.partitionsObjects = params.coarserMembership !== undefined;
       levels.push({ parameters: params });
     }
 
@@ -1756,6 +2268,8 @@ async function buildSkeletonMetadata(
       perLevelChunkShape,
       perLevelObjectCount,
       perLevelVertexCount,
+      perLevelObjectVertexCounts,
+      objectDepths,
       lowerBounds: lowerBoundsF32,
       upperBounds: upperBoundsF32,
     };
@@ -1765,29 +2279,36 @@ async function buildSkeletonMetadata(
     pass2Params.hasFragmentSegmentIds = perLevelMeta[0].hasFragmentSegmentIds;
   }
 
-  // Discover per-object attributes at level 0 and build the
+  // Discover per-object attributes and named groups at level 0 and build the
   // segment-properties map.  Pinned to level 0 because object_ids are
   // global across the pyramid; coarser levels reuse the level-0 row
   // assignments via `present_mask` (handled inside the builder).
-  const segmentPropertyMap = await buildObjectAttributePropertyMap(
-    sharedKvStoreContext,
-    level0Url,
-    options,
-  );
+  // `object_attributes/` only exists for kinds with the discrete-object model;
+  // listing it for a point cloud would 404-or-warn for nothing.
+  const segmentPropertyMap = caps.hasObjectModel
+    ? await buildSegmentPropertyMap(sharedKvStoreContext, level0Url, options)
+    : undefined;
 
-  // The model transform is identity: zarr-vectors writers store vertices in
-  // exact physical coordinates.  The NGFF per-level `translation` on
-  // `datasets[0]` is a bin-center convention (`chunk_shape / 2`, written by the
-  // resolution-level writer to round-trip `bin_shape`) that describes the chunk
-  // *grid*, not the vertex positions — this store carries [15.5, 16, 17].
-  // Applying it shifts every vertex half a chunk off its true coordinate
-  // (verified by decoding `0/vertices/c/0/0/0`: chunk (0,0,0)'s vertices already
-  // lie within its absolute [0,31)×[0,32)×[0,34) range), which breaks
-  // coordinate-based navigation and alignment with any reference volume.  All
-  // spatial-index calculations already run in raw coordinates.
+  // The NGFF per-level `translation` on `datasets[0]` is NOT read, because the
+  // writer overloads that field and it cannot be told apart from a real offset:
+  // on a store with no `coordinate_offset` it is the bin-centre convention
+  // (`chunk_shape / 2`, written to round-trip `bin_shape` — the hcp1065 store
+  // carries [15.5, 16, 17]), and applying that shifts every vertex half a chunk
+  // off its true coordinate (verified by decoding `0/vertices/c/0/0/0`: chunk
+  // (0,0,0)'s vertices already lie within its absolute [0,31)×[0,32)×[0,34)
+  // range).  But on a store that DOES declare an offset the writer mirrors the
+  // offset onto level 0 only, leaving the bin-centre value on the coarser
+  // levels — so the same field means two different things at two levels of one
+  // store.  The unambiguous `zarr_vectors.coordinate_offset` root attribute is
+  // read instead (see `readCoordinateOffset`) and becomes the model transform's
+  // translation, so the source moves into world coordinates as a whole while
+  // all spatial-index calculations keep running in raw stored coordinates.
   return {
     rank,
     coordinateSpace,
+    coordinateOffset: readCoordinateOffset(zv, rank),
+    hasObjectModel: caps.hasObjectModel,
+    primitive: caps.primitive,
     pass2Params,
     pass1Levels,
     spatialGrid,
@@ -1799,17 +2320,21 @@ async function buildSkeletonMetadata(
  * Construct a segmentation-shaped `DataSource` from skeleton metadata.
  *
  * The data source exposes up to **two** chunk sources under
- * `subsource.mesh`, each in its own subsource entry:
+ * `subsource.zarrVectors`, each in its own subsource entry:
  *
- *   - `"skeleton-spatial"` — the multiscale spatially-indexed source
- *     that drives **pass 1** (camera-relative chunk loading).  Only
- *     emitted when the store is 3-D (the spatially-indexed skeleton
- *     render layer in neuroglancer assumes vec3 positions).
- *   - `"skeleton"` — the per-segment source that drives **pass 2**
- *     (user-typed object IDs in the segments-list UI).
+ *   - `"zarr-vectors"` — the multiscale spatially-indexed source that drives
+ *     **pass 1** (camera-relative chunk loading).  Only emitted when the store
+ *     is 3-D (the spatially-indexed render layer assumes vec3 positions).
+ *   - `"zarr-vectors-detail"` — the per-segment source that drives **pass 2**
+ *     (user-typed object IDs in the segments-list UI).  Omitted entirely for
+ *     geometry without the discrete-object model, and for surfaces.
  *
- * Neuroglancer's `SegmentationUserLayer.renderLayers` dispatches by
- * `instanceof` on `subsource.mesh`:
+ * Both carry their former ids (`"skeleton-spatial"`, `"skeleton"`) as
+ * `legacyIds`, so a saved link that enabled or disabled one still applies.
+ *
+ * The `zarrVectors` slot is this datasource's own; it is deliberately not the
+ * `mesh` slot, which belongs to neuroglancer's `MeshSource` family.  The
+ * segmentation layer accepts both and picks render layers by source class:
  *
  *   - `MultiscaleSpatiallyIndexedSkeletonSource` → mounts the
  *     spatially-indexed render layer.
@@ -1818,9 +2343,9 @@ async function buildSkeletonMetadata(
  * Both render layers can coexist on the same segmentation layer, which
  * is how the two passes compose visually.
  */
-function getSkeletonDataSource(
+function getGeometryDataSource(
   sharedKvStoreContext: SharedKvStoreContext,
-  metadata: SkeletonMetadata,
+  metadata: GeometryMetadata,
 ): DataSource {
   const subsources: DataSource["subsources"] = [];
 
@@ -1829,10 +2354,14 @@ function getSkeletonDataSource(
     metadata.spatialGrid !== undefined
   ) {
     subsources.push({
-      id: "skeleton-spatial",
+      // The bulk geometry: named for what it IS, not for the render layer it
+      // happens to share with skeletons. `legacyIds` keeps every saved link
+      // that toggled the old name working.
+      id: "zarr-vectors",
+      legacyIds: ["skeleton-spatial"],
       default: true,
       subsource: {
-        mesh: new ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource(
+        zarrVectors: new ZarrVectorsMultiscaleGeometrySource(
           sharedKvStoreContext.chunkManager,
           sharedKvStoreContext,
           {
@@ -1840,6 +2369,9 @@ function getSkeletonDataSource(
             perLevelChunkShape: metadata.spatialGrid.perLevelChunkShape,
             perLevelObjectCount: metadata.spatialGrid.perLevelObjectCount,
             perLevelVertexCount: metadata.spatialGrid.perLevelVertexCount,
+            perLevelObjectVertexCounts:
+              metadata.spatialGrid.perLevelObjectVertexCounts,
+            objectDepths: metadata.spatialGrid.objectDepths,
             metersPerUnit: Float64Array.from(metadata.coordinateSpace.scales),
             lowerBounds: metadata.spatialGrid.lowerBounds,
             upperBounds: metadata.spatialGrid.upperBounds,
@@ -1855,19 +2387,34 @@ function getSkeletonDataSource(
   // high-detail render layer, driven by roiHighDetailSegments; it renders
   // nothing until a group is marked high-detail). Without pass-1 (e.g. 2-d or
   // higher-rank stores) it stays the opt-in per-segment source.
-  subsources.push({
-    id: "skeleton",
-    default: metadata.pass1Levels !== undefined,
-    subsource: {
-      mesh: sharedKvStoreContext.chunkManager.getChunkSource(
-        ZarrVectorsObjectKeyedSkeletonSource,
-        {
-          sharedKvStoreContext,
-          parameters: metadata.pass2Params,
-        },
-      ),
-    },
-  });
+  //
+  // Skipped entirely for kinds without the discrete-object model: pass 2
+  // resolves a selected id through `object_index/manifests`, which a point
+  // cloud does not have, so the subsource could only ever fail.
+  //
+  // Skipped for surfaces too, for a different reason: the per-segment path is
+  // line-only end to end -- it ignores link records of arity != 2 when
+  // aggregating an object (`geometry_segment_download.ts`) and the plain
+  // `SkeletonLayer` that draws it has no face pass -- so a mesh's faces would
+  // arrive as edge pairs and draw as a scribble. Pass 1 already draws the whole
+  // surface; the second pass exists to redraw SELECTED tracts at full detail,
+  // which a surface has no equivalent of.
+  if (metadata.hasObjectModel && metadata.primitive !== "triangles") {
+    subsources.push({
+      id: "zarr-vectors-detail",
+      legacyIds: ["skeleton"],
+      default: metadata.pass1Levels !== undefined,
+      subsource: {
+        zarrVectors: sharedKvStoreContext.chunkManager.getChunkSource(
+          ZarrVectorsObjectKeyedGeometrySource,
+          {
+            sharedKvStoreContext,
+            parameters: metadata.pass2Params,
+          },
+        ),
+      },
+    });
+  }
 
   // Segment-properties subsource.  Beyond the sortable/filterable columns in
   // the segments-list panel, this map now BACKS the streamline filter's per-
@@ -1885,8 +2432,22 @@ function getSkeletonDataSource(
     });
   }
 
+  if (subsources.length === 0) {
+    // Only reachable for a kind with no object model at rank != 3: pass 1 is
+    // gated on vec3 positions and pass 2 does not exist for it. Say so, rather
+    // than handing back a data source that silently renders nothing.
+    throw new Error(
+      `zarr-vectors datasource: a rank-${metadata.rank} store of this geometry ` +
+        "has nothing to render — the spatially-indexed path requires 3-D " +
+        "positions and this geometry has no per-object source to fall back on.",
+    );
+  }
+
   return {
-    modelTransform: makeIdentityTransform(metadata.coordinateSpace),
+    modelTransform: makeCoordinateOffsetTransform(
+      metadata.coordinateSpace,
+      metadata.coordinateOffset,
+    ),
     subsources,
   };
 }
@@ -1904,14 +2465,38 @@ function resolveUrl(options: GetKvStoreBasedDataSourceOptions) {
       `Invalid URL ${JSON.stringify(options.url.url)}: query parameters not supported`,
     );
   }
-  if (fragment) {
+  // `#attributes=a,b,c` selects which per-vertex attributes to expose. A store
+  // may declare far more than the GPU can hold (a MERFISH panel ships one
+  // column per gene), and every exposed attribute costs a texture unit and a
+  // read per chunk, so the user needs a way to name the handful they want
+  // without rewriting the store. Nothing else is accepted as a fragment.
+  // `#edit=<service url>` opts the layer into editing, alongside (and
+  // independent of) the attribute selection. Both may appear, `&`-separated.
+  let editServiceUrl: string | undefined;
+  const fragmentParts = (fragment ?? "").split("&").filter((p) => p.length > 0);
+  const remaining: string[] = [];
+  for (const part of fragmentParts) {
+    if (part.startsWith("edit=")) {
+      editServiceUrl = decodeURIComponent(part.slice("edit=".length));
+    } else {
+      remaining.push(part);
+    }
+  }
+  let selectedAttributes: string[] | undefined;
+  try {
+    selectedAttributes = parseAttributesFragment(
+      remaining.length > 0 ? remaining.join("&") : undefined,
+    );
+  } catch (e) {
     throw new Error(
-      `Invalid URL ${JSON.stringify(options.url.url)}: fragment not supported`,
+      `Invalid URL ${JSON.stringify(options.url.url)}: ${(e as Error).message}`,
     );
   }
   return {
     kvStoreUrl: kvstoreEnsureDirectoryPipelineUrl(options.kvStoreUrl),
     additionalPath: authorityAndPath ?? "",
+    selectedAttributes,
+    editServiceUrl,
   };
 }
 
@@ -1929,12 +2514,22 @@ export class ZarrVectorsDataSource implements KvStoreBasedDataSourceProvider {
   async get(
     options: GetKvStoreBasedDataSourceOptions,
   ): Promise<DataSourceLookupResult> {
-    let { kvStoreUrl, additionalPath } = resolveUrl(options);
+    let { kvStoreUrl, additionalPath, selectedAttributes, editServiceUrl } =
+      resolveUrl(options);
     kvStoreUrl = kvstoreEnsureDirectoryPipelineUrl(
       pipelineUrlJoin(kvStoreUrl, additionalPath),
     );
     return options.registry.chunkManager.memoize.getAsync(
-      { type: "zarr-vectors:get", url: kvStoreUrl },
+      // The attribute selection is part of the identity: two layers on the same
+      // store with different `#attributes=` are different data sources.
+      {
+        type: "zarr-vectors:get",
+        url: kvStoreUrl,
+        attributes: selectedAttributes?.join(","),
+        // A layer opened for editing is a different source from a read-only
+        // one on the same store: it reports `readonly: false`.
+        edit: editServiceUrl,
+      },
       options,
       async (progressOptions) => {
         const { sharedKvStoreContext } = options.registry;
@@ -1969,77 +2564,61 @@ export class ZarrVectorsDataSource implements KvStoreBasedDataSourceProvider {
         const geometryTypes: string[] = Array.isArray(zv.geometry_types)
           ? zv.geometry_types
           : [];
-        const supportedGeom = new Set<string>([
-          "point_cloud",
-          "skeleton",
-          "polyline",
-          "streamline",
-          "graph",
-        ]);
-        const unsupported = geometryTypes.filter((g) => !supportedGeom.has(g));
-        if (unsupported.length > 0) {
-          throw new Error(
-            `zarr-vectors datasource: unsupported geometry types ` +
-              `${JSON.stringify(unsupported)}.  Supported: ` +
-              `${JSON.stringify(Array.from(supportedGeom))}`,
-          );
-        }
-        const hasSkeletonLike = geometryTypes.some((g) =>
-          SKELETON_LIKE_GEOM.has(g),
+        const renderable = geometryTypes.filter((g) =>
+          SPATIAL_GEOM_KINDS.has(g),
         );
-        const hasPointCloud = geometryTypes.includes("point_cloud");
-        if (hasSkeletonLike && hasPointCloud) {
-          throw new Error(
-            `zarr-vectors datasource: stores with both point_cloud and ` +
-              `skeleton/polyline/streamline geometry are not yet supported ` +
-              `(found: ${JSON.stringify(geometryTypes)})`,
-          );
-        }
-        if (!hasSkeletonLike && !hasPointCloud) {
+        // Unrecognised types alongside recognised ones are reported by
+        // `resolveDeclaredGeometry` and skipped; only a store with NOTHING
+        // recognisable is an error.
+        if (renderable.length === 0) {
           throw new Error(
             `zarr-vectors datasource: no recognised geometry type in ` +
-              `${JSON.stringify(geometryTypes)}; expected 'point_cloud' or ` +
-              `one of ${JSON.stringify(Array.from(SKELETON_LIKE_GEOM))}`,
+              `${JSON.stringify(geometryTypes)}; expected one of ` +
+              `${JSON.stringify(Array.from(SPATIAL_GEOM_KINDS))}`,
           );
         }
-
-        let dataSource: DataSource;
-        if (hasSkeletonLike) {
-          // The spec defines two object-index conventions. "standard" maps a
-          // selected segment id to a dense object index via
-          // `object_attributes/segment_id`; "identity" means the selected id IS
-          // the dense index. The backend already degrades to identity when that
-          // attribute is absent (see `resolveObjectIndex`), so both conventions
-          // are supported here.
-          const objectIndexConvention = zv.object_index_convention;
-          if (
-            objectIndexConvention !== "standard" &&
-            objectIndexConvention !== "identity" &&
-            objectIndexConvention !== undefined
-          ) {
-            throw new Error(
-              `zarr-vectors datasource: skeleton/polyline/streamline geometry ` +
-                `requires object_index_convention 'standard' or 'identity' (got ` +
-                `${JSON.stringify(objectIndexConvention)})`,
-            );
-          }
-          const skelMeta = await buildSkeletonMetadata(
-            sharedKvStoreContext,
-            kvStoreUrl,
-            attrs,
-            progressOptions,
+        // The spec defines two object-index conventions. "standard" maps a
+        // selected segment id to a dense object index via
+        // `object_attributes/segment_id`; "identity" means the selected id IS
+        // the dense index. The backend already degrades to identity when that
+        // attribute is absent (see `resolveObjectIndex`), so both conventions
+        // are supported here.  Point clouds have no object index at all, so the
+        // key is not required of them.
+        const objectIndexConvention = zv.object_index_convention;
+        if (
+          renderable.some(
+            (g) =>
+              KIND_CAPABILITIES[g as ZarrVectorsGeometryKind].hasObjectModel,
+          ) &&
+          objectIndexConvention !== "standard" &&
+          objectIndexConvention !== "identity" &&
+          objectIndexConvention !== undefined
+        ) {
+          throw new Error(
+            `zarr-vectors datasource: ${renderable.join("/")} geometry requires ` +
+              `object_index_convention 'standard' or 'identity' (got ` +
+              `${JSON.stringify(objectIndexConvention)})`,
           );
-          dataSource = getSkeletonDataSource(sharedKvStoreContext, skelMeta);
-        } else {
-          const meta = await buildAnnotationMetadata(
-            sharedKvStoreContext,
-            kvStoreUrl,
-            attrs,
-            progressOptions,
-          );
-          dataSource = getAnnotationDataSource(sharedKvStoreContext, meta);
         }
-        dataSource.canonicalUrl = `${kvStoreUrl}|${options.url.scheme}:`;
+        const skelMeta = await buildGeometryMetadata(
+          sharedKvStoreContext,
+          kvStoreUrl,
+          attrs,
+          progressOptions,
+          selectedAttributes,
+          editServiceUrl,
+        );
+        const dataSource = getGeometryDataSource(
+          sharedKvStoreContext,
+          skelMeta,
+        );
+        // Keep the fragment: it selects which attributes exist on this layer,
+        // so dropping it would canonicalise two different sources to one URL.
+        // Re-encoded, so the canonical URL saved into the layer's JSON parses
+        // back to the same names.
+        dataSource.canonicalUrl =
+          `${kvStoreUrl}|${options.url.scheme}:` +
+          formatAttributesFragment(selectedAttributes);
         return dataSource;
       },
     );

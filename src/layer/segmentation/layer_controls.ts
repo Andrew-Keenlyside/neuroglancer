@@ -66,13 +66,17 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
   {
     label: "Opacity (on)",
     toolJson: json_keys.SELECTED_ALPHA_JSON_KEY,
-    // Hidden for spatially-indexed (tract) layers: per-group "on" opacity is set
-    // in the Filter tab, so this global on-opacity is redundant clutter there.
-    isValid: (layer) =>
-      makeCachedDerivedWatchableValue(
-        (has2d, hasSpatialSkeletons) => has2d && !hasSpatialSkeletons,
-        [layer.has2dLayer, layer.hasSpatiallyIndexedSkeletonsLayer],
-      ),
+    // Shown for anything with cross-section geometry.
+    //
+    // This was previously hidden whenever `hasSpatiallyIndexedSkeletonsLayer`
+    // was set, on the reasoning that a tract layer's "on" opacity is set
+    // per-group in the Filter tab. That equates "spatially indexed" with
+    // "tractogram", which zarr-vectors broke: point clouds, graphs, skeletons
+    // and meshes all draw through the same spatially-indexed render layers and
+    // have no per-group opacity to fall back on, so they simply lost the only
+    // control over `selectedAlpha` (which defaults to 0.5). See the
+    // "Opacity (3d)" control below for the same mistake in the 3-d path.
+    isValid: (layer) => layer.has2dLayer,
     title:
       "Opacity in cross-section views of selected segments and of dense " +
       "(spatially-indexed) skeletons",
@@ -169,6 +173,13 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
         onManualTarget: () => {
           layer.displayState.autoSpatialSkeletonGridLevel2d.value = false;
         },
+        // ...and reset hands it back. Taking over used to be one-way: nothing
+        // in the UI could re-enable the camera-driven level once a drag had
+        // switched it off, so a single stray scroll over the control disabled
+        // automatic level selection for the rest of the session.
+        onResetTarget: () => {
+          layer.displayState.autoSpatialSkeletonGridLevel2d.value = true;
+        },
       }),
       SpatialSkeletonGridRenderScaleWidget,
     ),
@@ -198,6 +209,13 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
         onManualTarget: () => {
           layer.displayState.autoSpatialSkeletonGridLevel3d.value = false;
         },
+        // ...and reset hands it back. Taking over used to be one-way: nothing
+        // in the UI could re-enable the camera-driven level once a drag had
+        // switched it off, so a single stray scroll over the control disabled
+        // automatic level selection for the rest of the session.
+        onResetTarget: () => {
+          layer.displayState.autoSpatialSkeletonGridLevel3d.value = true;
+        },
       }),
       SpatialSkeletonGridRenderScaleWidget,
     ),
@@ -205,20 +223,30 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
   {
     label: "Opacity (3d)",
     toolJson: json_keys.OBJECT_ALPHA_JSON_KEY,
-    // Shown for meshes and non-spatial skeletons; hidden for pure tract layers,
-    // whose 3-d opacity is the unified "Opacity (off)" (bulk) plus per-group
-    // opacity (passing). Kept for mesh+skeleton combos so mesh opacity stays
-    // controllable.
-    isValid: (layer) =>
-      makeCachedDerivedWatchableValue(
-        (has3d, hasMesh, hasSpatialSkeletons) =>
-          has3d && (hasMesh || !hasSpatialSkeletons),
-        [
-          layer.has3dLayer,
-          layer.hasMeshLayer,
-          layer.hasSpatiallyIndexedSkeletonsLayer,
-        ],
-      ),
+    // Shown for anything with 3-d geometry.
+    //
+    // This was previously hidden whenever `hasSpatiallyIndexedSkeletonsLayer`
+    // was set and no `MeshLayer` was present, on the reasoning that a tract
+    // layer's 3-d opacity is already covered by the unified "Opacity (off)"
+    // (bulk) plus the per-group "on" opacity. That gate was wrong twice over:
+    //
+    //  - `hasMeshLayer` is true only for MeshLayer/MultiscaleMeshLayer. A
+    //    zarr-vectors store whose geometry_types is ["mesh"] draws through
+    //    PerspectiveViewSpatiallyIndexedSkeletonLayer with
+    //    geometryPrimitive === "triangles", so it read as "spatial skeletons,
+    //    no mesh" and lost the control -- as did every non-tract skeleton
+    //    store, which has no per-group opacity to fall back on.
+    //  - `objectAlpha` is not merely cosmetic here. It is half of the test in
+    //    PerspectiveViewSpatiallyIndexedSkeletonLayer.isTransparent that
+    //    decides whether the layer draws in the opaque pass or in the
+    //    weighted-blended OIT pass. With it pinned below 1 and unreachable,
+    //    the geometry renders additively -- overlapping surfaces of a single
+    //    object summing instead of occluding -- and no visible control could
+    //    restore solid rendering.
+    //
+    // The cost of showing it on a pure tract layer is one extra slider; the
+    // cost of hiding it was an unreachable render mode.
+    isValid: (layer) => layer.has3dLayer,
     title: "Opacity of meshes and skeletons",
     ...rangeLayerControl((layer) => ({
       value: layer.displayState.objectAlpha,
@@ -244,44 +272,23 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     ...checkboxLayerControl((layer) => layer.displayState.hideSegmentZero),
   },
   {
-    label: "Auto full-detail budget",
-    toolJson: json_keys.AUTO_ROI_HIGH_DETAIL_BUDGET_JSON_KEY,
+    label: "Detail focus",
+    toolJson: json_keys.SPATIAL_SKELETON_DETAIL_FOCUS_JSON_KEY,
+    // Only meaningful where a pyramid is being budgeted at all.
     isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
     title:
-      "Derive the full-detail streamline count from the GPU memory limit and " +
-      "the share below, instead of using the manual figure. Falls back to the " +
-      "manual figure when the dataset does not record how many streamlines " +
-      "each level holds.",
-    ...checkboxLayerControl(
-      (layer) => layer.displayState.autoRoiHighDetailBudget,
+      "What the memory left over by the pyramid level being drawn is spent " +
+      "on. LOCAL is the standard behaviour: more detail near the camera, " +
+      "which for long objects means streamlines cut off wherever the finer " +
+      "chunks ran out. OBJECT spends it on whole objects instead, fetched by " +
+      "id and spread across the entire volume, so what it adds is complete " +
+      "tracts rather than fragments. On a store whose levels each hold every " +
+      "object -- meshes and point clouds -- OBJECT still draws one level " +
+      "everywhere and keeps its whole volume resident, but the level is then " +
+      "chosen by the memory ceiling rather than per object.",
+    ...enumLayerControl(
+      (layer) => layer.displayState.spatialSkeletonDetailFocus,
     ),
-  },
-  {
-    label: "Full-detail memory share",
-    toolJson: json_keys.ROI_FULL_DETAIL_MEMORY_SHARE_JSON_KEY,
-    isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
-    title:
-      "How much of the GPU memory limit goes to full-resolution streamlines " +
-      "rather than to the coarse pyramid level underneath them. Both draw " +
-      "from one pool.",
-    ...rangeLayerControl((layer) => ({
-      value: layer.displayState.roiFullDetailMemoryShare,
-      options: { min: 0, max: 1, step: 0.05 },
-    })),
-  },
-  {
-    label: "Full-detail streamlines",
-    toolJson: json_keys.ROI_HIGH_DETAIL_BUDGET_JSON_KEY,
-    isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
-    title:
-      "How many streamlines may be loaded at full resolution on top of the " +
-      "rendered pyramid level. Counted in streamlines, not bytes, because a " +
-      "tract is fetched whole however little of it is in view. 0 disables " +
-      "full-detail loading.",
-    ...rangeLayerControl((layer) => ({
-      value: layer.displayState.roiHighDetailBudget,
-      options: { min: 0, max: 200000, step: 1000 },
-    })),
   },
   {
     label: "Ignore memory ceiling",
@@ -289,10 +296,11 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
     // Only meaningful where a pyramid is being budgeted at all.
     isValid: (layer) => layer.hasSpatiallyIndexedSkeletonsLayer,
     title:
-      "Allow finer pyramid levels than the GPU memory budget nominally " +
-      "permits. The budget compares against a whole-level estimate, so a " +
-      "zoomed-in view is refused detail it would never actually fetch. With " +
-      "this on, a wide view of a dense level can exhaust GPU memory.",
+      "Load as if memory were unlimited. Under object focus that admits every " +
+      "object at the finest level; otherwise it allows finer pyramid levels " +
+      "than the budget nominally permits, whose whole-level estimate refuses a " +
+      "zoomed-in view detail it would never actually fetch. Either way, a wide " +
+      "view of a dense level can then exhaust GPU memory.",
     ...checkboxLayerControl(
       (layer) => layer.displayState.ignoreSpatialSkeletonMemoryCeiling,
     ),
@@ -328,7 +336,9 @@ function getViewSpecificSkeletonRenderingControl(
     {
       label: `Skeleton mode (${viewName})`,
       toolJson: `${json_keys.SKELETON_RENDERING_JSON_KEY}.mode${viewName}`,
-      isValid: (layer) => layer.hasSkeletonsLayer,
+      // Lines-only: a point cloud and a mesh have no lines-versus-points choice
+      // to make, and offering one that does nothing is worse than not offering it.
+      isValid: (layer) => layer.hasLineGeometryLayer,
       ...enumLayerControl(
         (layer) =>
           layer.displayState.skeletonRenderingOptions[

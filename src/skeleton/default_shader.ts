@@ -27,10 +27,18 @@
  * while `value === defaultValue`, so two equivalent-but-different spellings of
  * the same shader would make the state look user-edited and serialise into
  * every link.
+ *
+ * Deliberately swizzle-free. It was written as `vec3 d = prop_tangent();
+ * emitRGB(vec3(abs(d.x), abs(d.y), abs(d.z)))`, which a store carrying a
+ * per-vertex attribute named `z` silently broke: the renderer exposed each
+ * attribute as a bare `#define`, so `d.z` expanded to `d.<varying>` and the
+ * shader stopped compiling, dropping the layer to per-object hash colours.
+ * `isUnsafeBareAttributeAlias` now withholds those aliases, and this spelling
+ * -- componentwise `abs` over the whole vector -- keeps the default clear of
+ * the hazard entirely.
  */
 export const COLOR_BY_DIRECTION_SHADER = `void main() {
-  vec3 d = prop_tangent();
-  emitRGB(vec3(abs(d.x), abs(d.y), abs(d.z)));
+  emitRGB(abs(prop_tangent()));
 }
 `;
 

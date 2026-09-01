@@ -31,24 +31,10 @@ import type { ZarrVectorsAttributeDtype } from "#src/datasource/zarr-vectors/bas
 import type { ZarrVectorsGeometryKind } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
+import type { PackedAttributeRange } from "#src/skeleton/frontend.js";
 import { DataType } from "#src/util/data_type.js";
 
 export { DEFAULT_STREAMLINE_FRAGMENT_MAIN } from "#src/datasource/zarr-vectors/geometry_kind.js";
-
-/**
- * Map a zarr-vectors-declared attribute dtype to neuroglancer's
- * `DataType` enum.  These are the only dtypes the skeleton render
- * layer can sample per-vertex attributes for.
- */
-const ATTR_DTYPE_TO_DATA_TYPE: Record<ZarrVectorsAttributeDtype, DataType> = {
-  float32: DataType.FLOAT32,
-  uint8: DataType.UINT8,
-  uint16: DataType.UINT16,
-  uint32: DataType.UINT32,
-  int8: DataType.INT8,
-  int16: DataType.INT16,
-  int32: DataType.INT32,
-};
 
 /**
  * Build the `Map<name, VertexAttributeInfo>` the skeleton render layer
@@ -59,17 +45,48 @@ const ATTR_DTYPE_TO_DATA_TYPE: Record<ZarrVectorsAttributeDtype, DataType> = {
 export function buildVertexAttributeMap(parameters: {
   attributeNames: string[];
   attributeDtypes: ZarrVectorsAttributeDtype[];
+  attributePropertyIds?: string[];
   geometryKind: ZarrVectorsGeometryKind;
 }): Map<string, VertexAttributeInfo> {
   const map = new Map<string, VertexAttributeInfo>();
   if (hasSynthesisedTangent(parameters.geometryKind)) {
     map.set("tangent", { dataType: DataType.FLOAT32, numComponents: 3 });
   }
+  // Keyed by the shader-facing identifier, not the on-disk directory name:
+  // the map keys become `prop_<key>()` GLSL macros, and store names such as
+  // `gene_H2-Q2` are not legal identifiers.  See `attributePropertyIds`.
+  const shaderNames =
+    parameters.attributePropertyIds ?? parameters.attributeNames;
   for (let i = 0; i < parameters.attributeNames.length; ++i) {
-    map.set(parameters.attributeNames[i], {
-      dataType: ATTR_DTYPE_TO_DATA_TYPE[parameters.attributeDtypes[i]],
+    // Every declared dtype arrives as float32 (see
+    // `vertex_attribute_float.ts`), so the map is uniform and a shader written
+    // against one attribute compiles against any other.
+    map.set(shaderNames[i], {
+      dataType: DataType.FLOAT32,
       numComponents: 1,
     });
   }
   return map;
+}
+
+/**
+ * The run of `vertexAttributes` entries the render layer should hand one
+ * shared texture instead of a texture unit each.
+ *
+ * Both zarr-vectors sources lay their attributes out the same way -- position,
+ * an optional synthesised tangent, the store's own attributes, then the
+ * synthesised segment column -- so the run is the store's attributes, wherever
+ * the tangent puts them. They qualify because the decoder makes every one of
+ * them 1-component float32.
+ */
+export function zvPackedAttributeRange(parameters: {
+  attributeNames: readonly string[];
+  geometryKind: ZarrVectorsGeometryKind;
+}): PackedAttributeRange | undefined {
+  const count = parameters.attributeNames.length;
+  if (count === 0) return undefined;
+  return {
+    start: 1 + (hasSynthesisedTangent(parameters.geometryKind) ? 1 : 0),
+    count,
+  };
 }

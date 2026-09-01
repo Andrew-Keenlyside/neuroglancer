@@ -11,13 +11,13 @@
  * class in `./skeleton_backend.ts` via a matching ``RPC_ID`` on the
  * parameter type.
  *
- * - `ZarrVectorsSpatiallyIndexedSkeletonSource` — the **pass-1** chunk
+ * - `ZarrVectorsSpatialGeometrySource` — the **pass-1** chunk
  *   source.  Subclass of neuroglancer's
  *   `SpatiallyIndexedSkeletonSource`; the backend pairs with
- *   `ZarrVectorsSpatiallyIndexedSkeletonSourceBackend` and downloads one
+ *   `ZarrVectorsSpatialGeometrySourceBackend` and downloads one
  *   chunk per `(chunkGridPosition, lod)` pair.
  *
- * - `ZarrVectorsObjectKeyedSkeletonSource` — the **pass-2** chunk source
+ * - `ZarrVectorsObjectKeyedGeometrySource` — the **pass-2** chunk source
  *   (intentionally **stubbed** in this slice).  Will subclass
  *   `SkeletonSource` and resolve object IDs via the
  *   `object_index/manifests` zarr-vlen-bytes array; that decoder lands
@@ -32,25 +32,41 @@
 import type { ChunkManager } from "#src/chunk_manager/frontend.js";
 import { WithParameters } from "#src/chunk_manager/frontend.js";
 import {
-  ZarrVectorsObjectKeyedSkeletonSourceParameters,
-  ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
+  ZarrVectorsObjectKeyedGeometrySourceParameters,
+  ZarrVectorsSpatialGeometrySourceParameters,
   type ZarrVectorsAttributeDtype,
-  type ZarrVectorsSkeletonGeometryKind,
+  type ZarrVectorsGeometryKind,
 } from "#src/datasource/zarr-vectors/base.js";
+import { ZARR_VECTORS_GET_OBJECT_NODES_RPC_ID } from "#src/datasource/zarr-vectors/base.js";
+import { computeChunkIndexBounds } from "#src/datasource/zarr-vectors/chunk_bounds.js";
 import {
   KIND_CAPABILITIES,
   hasSynthesisedTangent,
 } from "#src/datasource/zarr-vectors/geometry_kind.js";
-import { buildVertexAttributeMap } from "#src/datasource/zarr-vectors/skeleton_shader_bridge.js";
+import {
+  buildVertexAttributeMap,
+  zvPackedAttributeRange,
+} from "#src/datasource/zarr-vectors/geometry_shader_bridge.js";
+import type { ObjectAdmission } from "#src/datasource/zarr-vectors/object_admission.js";
+import { admissionForBudget } from "#src/datasource/zarr-vectors/object_admission.js";
+import { computePyramidDensityScales } from "#src/datasource/zarr-vectors/pyramid_objects.js";
+import type { ZarrVectorsEditTarget } from "#src/datasource/zarr-vectors/spatial_skeleton_edit.js";
+import { makeZarrVectorsEditCommands } from "#src/datasource/zarr-vectors/spatial_skeleton_edit.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
 import type { SharedKvStoreContext } from "#src/kvstore/frontend.js";
-import { bytesPerObjectFromLevelCounts } from "#src/skeleton/spatial_chunk_sizing.js";
+import type {
+  SpatiallyIndexedSkeletonMetadata,
+  SpatiallyIndexedSkeletonNode,
+  SpatiallyIndexedSkeletonNodeBase,
+} from "#src/skeleton/api.js";
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import {
   MultiscaleSpatiallyIndexedSkeletonSource,
   SkeletonSource,
   SPATIAL_SKELETON_SOURCE_OPTIONS,
   SpatiallyIndexedSkeletonSource,
+  type GeometryPrimitive,
+  type PackedAttributeRange,
   type SpatiallyIndexedSkeletonChunkSpecification,
 } from "#src/skeleton/frontend.js";
 import type { SliceViewSourceOptions } from "#src/sliceview/base.js";
@@ -71,7 +87,7 @@ import {
 export {
   DEFAULT_STREAMLINE_FRAGMENT_MAIN,
   buildVertexAttributeMap,
-} from "#src/datasource/zarr-vectors/skeleton_shader_bridge.js";
+} from "#src/datasource/zarr-vectors/geometry_shader_bridge.js";
 
 /**
  * One entry in the array shape `SpatiallyIndexedSkeletonSource`
@@ -88,26 +104,13 @@ interface ZvVertexAttributeRenderInfo {
   glslDataType: string;
 }
 
-/** On-GPU width of each attribute dtype, for the level cost estimate. */
-const ATTR_DTYPE_BYTES: Record<ZarrVectorsAttributeDtype, number> = {
-  float32: 4,
-  uint8: 1,
-  uint16: 2,
-  uint32: 4,
-  int8: 1,
-  int16: 2,
-  int32: 4,
-};
-
-const ATTR_DTYPE_TO_DATA_TYPE: Record<ZarrVectorsAttributeDtype, DataType> = {
-  float32: DataType.FLOAT32,
-  uint8: DataType.UINT8,
-  uint16: DataType.UINT16,
-  uint32: DataType.UINT32,
-  int8: DataType.INT8,
-  int16: DataType.INT16,
-  int32: DataType.INT32,
-};
+/**
+ * On-GPU width of an attribute, for the level cost estimate. Uniform across
+ * dtypes: every per-vertex attribute is decoded to float32 before upload (see
+ * `vertex_attribute_float.ts`), so an int8 column costs the same 4 bytes a
+ * gene does.
+ */
+const ATTR_GPU_BYTES = 4;
 
 /**
  * Map every zarr-vectors attribute dtype to a WebGL2 scalar type enum.
@@ -139,7 +142,7 @@ function zvWebglDataType(dt: DataType): number {
 /**
  * Build the `VertexAttributeRenderInfo[]` shape the existing
  * spatially-indexed skeleton render layer expects.  Mirrors how the
- * backend (`skeleton_backend.ts:ZarrVectorsSpatiallyIndexedSkeletonSourceBackend
+ * backend (`skeleton_backend.ts:ZarrVectorsSpatialGeometrySourceBackend
  * .download`) packs `chunk.vertexAttributes`: position (implicit, slot
  * 0), then synthesised `tangent` (streamline / polyline only), then
  * user-declared attributes in declaration order.
@@ -156,7 +159,8 @@ function zvWebglDataType(dt: DataType): number {
 function buildZvSpatialVertexAttributes(parameters: {
   attributeNames: string[];
   attributeDtypes: ZarrVectorsAttributeDtype[];
-  geometryKind: ZarrVectorsSkeletonGeometryKind;
+  attributePropertyIds?: string[];
+  geometryKind: ZarrVectorsGeometryKind;
 }): ZvVertexAttributeRenderInfo[] {
   const out: ZvVertexAttributeRenderInfo[] = [
     {
@@ -176,14 +180,21 @@ function buildZvSpatialVertexAttributes(parameters: {
       glslDataType: "vec3",
     });
   }
+  // `name` is the shader-facing identifier (`prop_<name>()`), which is not
+  // necessarily the on-disk attribute directory name — see
+  // `attributePropertyIds`.
+  const shaderNames =
+    parameters.attributePropertyIds ?? parameters.attributeNames;
   for (let i = 0; i < parameters.attributeNames.length; ++i) {
-    const dt = ATTR_DTYPE_TO_DATA_TYPE[parameters.attributeDtypes[i]];
+    // float32 whatever the on-disk dtype: the decoder converts, so the render
+    // layer sees one type for every attribute and `prop_<name>()` is always a
+    // plain `float`.
     out.push({
-      name: parameters.attributeNames[i],
-      dataType: dt,
+      name: shaderNames[i],
+      dataType: DataType.FLOAT32,
       numComponents: 1,
-      webglDataType: zvWebglDataType(dt),
-      glslDataType: getShaderType(dt, 1),
+      webglDataType: zvWebglDataType(DataType.FLOAT32),
+      glslDataType: getShaderType(DataType.FLOAT32, 1),
     });
   }
   // Synthesised per-vertex `"segment"` column (last slot — mirrors the
@@ -208,7 +219,7 @@ function buildZvSpatialVertexAttributes(parameters: {
 
 /**
  * Frontend chunk source backing the spatially-indexed (pass-1) render
- * layer.  Paired with `ZarrVectorsSpatiallyIndexedSkeletonSourceBackend`
+ * layer.  Paired with `ZarrVectorsSpatialGeometrySourceBackend`
  * via `RPC_ID` on the parameter class.
  *
  * One instance per resolution level.  The render layer enumerates
@@ -216,9 +227,9 @@ function buildZvSpatialVertexAttributes(parameters: {
  * frustum-culling machinery and the matching backend's `download()`
  * fetches + decodes zarr-vectors chunks.
  */
-export class ZarrVectorsSpatiallyIndexedSkeletonSource extends WithParameters(
+export class ZarrVectorsSpatialGeometrySource extends WithParameters(
   WithSharedKvStoreContext(SpatiallyIndexedSkeletonSource),
-  ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
+  ZarrVectorsSpatialGeometrySourceParameters,
 ) {
   private zvAttributeTextureFormats_?: TextureFormat[];
 
@@ -232,8 +243,17 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSource extends WithParameters(
     // into `chunk.vertexAttributes`: position, then a synthesised tangent
     // (streamline / polyline / graph / skeleton), then user-declared
     // attributes, then a synthesised `"segment"` column last (mirroring
-    // `skeleton_backend.ts:ZarrVectorsSpatiallyIndexedSkeletonSourceBackend`).
+    // `skeleton_backend.ts:ZarrVectorsSpatialGeometrySourceBackend`).
     this.vertexAttributes = buildZvSpatialVertexAttributes(this.parameters);
+  }
+
+  /**
+   * Hand the store's attributes to the render layer as one packed run. Without
+   * it a MERFISH store's columns would take a texture unit and a varying each,
+   * which is what capped a layer at about ten of them.
+   */
+  get packedAttributeRange(): PackedAttributeRange | undefined {
+    return zvPackedAttributeRange(this.parameters);
   }
 
   /**
@@ -260,7 +280,7 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSource extends WithParameters(
 
   /**
    * Map driving the `prop_<name>()` shader bridge.  The order here
-   * must match how `ZarrVectorsSpatiallyIndexedSkeletonSourceBackend.download()`
+   * must match how `ZarrVectorsSpatialGeometrySourceBackend.download()`
    * populates `chunk.vertexAttributes`: tangent (streamline / polyline only)
    * first, then user-declared attributes in declaration order.
    */
@@ -282,11 +302,132 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSource extends WithParameters(
   get defaultFragmentMain(): string | undefined {
     return KIND_CAPABILITIES[this.parameters.geometryKind].defaultFragmentMain;
   }
+
+  /**
+   * What primitive this store's geometry is drawn as, read by the render layer.
+   * A `point_cloud` chunk decodes to zero edges and a `mesh` chunk to faces
+   * rather than edges, so neither can be drawn as line segments.
+   */
+  get geometryPrimitive(): GeometryPrimitive {
+    return KIND_CAPABILITIES[this.parameters.geometryKind].primitive;
+  }
+
+  // -------------------------------------------------------------------------
+  // Spatial-skeleton source contract (`#src/skeleton/api.ts`)
+  //
+  // Implementing these makes the fork's Skeleton tab and node-inspection UI
+  // available for a zarr-vectors layer: `isSpatiallyIndexedSkeletonSource`
+  // duck-types this object for `readonly` plus the four methods below, and the
+  // layer hides the tab when it does not match (`layer/segmentation/index.ts`).
+  // The same duck-type, extended with the edit command factories, is what
+  // `isEditableSpatiallyIndexedSkeletonSource` looks for -- so editing is added
+  // by growing this block, not by changing any UI.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Editable exactly when the layer was opened with an edit service
+   * (`#edit=<url>`), since that is the only way a ZVF store can be written --
+   * neuroglancer's kvstore is read-only by construction. Node inspection and
+   * navigation work either way; only the edit actions are gated on this
+   * (`getSpatialSkeletonActionsDisabledReason`).
+   */
+  get readonly(): boolean {
+    return this.editTarget === undefined;
+  }
+
+  /** Where edits go, or `undefined` for a plain read-only layer. */
+  private get editTarget(): ZarrVectorsEditTarget | undefined {
+    const { editServiceUrl, editStore } = this.parameters;
+    if (!editServiceUrl || !editStore) return undefined;
+    return { serviceUrl: editServiceUrl, store: editStore };
+  }
+
+  private editCommands_?: ReturnType<typeof makeZarrVectorsEditCommands>;
+  private get editCommands() {
+    const target = this.editTarget;
+    if (target === undefined) return undefined;
+    return (this.editCommands_ ??= makeZarrVectorsEditCommands(target));
+  }
+
+  // The duck type inspects these by name and requires all five before the
+  // source counts as editable (`SPATIAL_SKELETON_EDIT_COMMAND_METADATA`).
+  get splitSkeletonsCommand() {
+    return this.editCommands?.splitSkeletonsCommand;
+  }
+  get mergeSkeletonsCommand() {
+    return this.editCommands?.mergeSkeletonsCommand;
+  }
+  get addNodesCommand() {
+    return this.editCommands?.addNodesCommand;
+  }
+  get moveNodesCommand() {
+    return this.editCommands?.moveNodesCommand;
+  }
+  get deleteNodesCommand() {
+    return this.editCommands?.deleteNodesCommand;
+  }
+
+  /**
+   * Never called: `listSkeletons` exists only for the duck-type check. The
+   * segments list is driven by the segment property map, and object ids come
+   * from picking, so nothing enumerates the store this way -- which is just as
+   * well, since a tractography store holds hundreds of thousands of objects.
+   */
+  async listSkeletons(): Promise<number[]> {
+    return [];
+  }
+
+  /**
+   * Also never called; part of the duck-type only. The spatial grid this source
+   * exposes to the framework is the chunk specification built by
+   * `ZarrVectorsMultiscaleGeometrySource.getSources`, not this metadata, which
+   * exists for backends whose node fetches are bounded by a query box.
+   */
+  async getSpatialIndexMetadata(): Promise<SpatiallyIndexedSkeletonMetadata | null> {
+    return null;
+  }
+
+  /**
+   * Part of the duck-type only. The CATMAID backend fetches nodes per spatial
+   * cell to BUILD its chunks; zarr-vectors builds chunks from the store's own
+   * spatial arrays in the worker, so there is nothing to serve here.
+   */
+  async fetchNodes(): Promise<SpatiallyIndexedSkeletonNodeBase[]> {
+    return [];
+  }
+
+  /**
+   * One object's whole geometry as a rooted node tree -- the only one of these
+   * four methods anything calls (`spatial_skeleton_manager.getFullSegmentNodes`,
+   * which caches the result per segment).
+   *
+   * The work happens in the worker, where the store is; see
+   * `ZarrVectorsSpatialGeometrySourceBackend.getObjectSkeletonNodes`.
+   */
+  async getSkeleton(
+    skeletonId: number,
+    options?: { signal?: AbortSignal },
+  ): Promise<SpatiallyIndexedSkeletonNode[]> {
+    const { rpc } = this;
+    if (rpc == null) {
+      throw new Error(
+        "zarr-vectors: this geometry source is not connected to a worker.",
+      );
+    }
+    const { nodes } = await rpc.promiseInvoke<{
+      nodes: SpatiallyIndexedSkeletonNode[];
+    }>(
+      ZARR_VECTORS_GET_OBJECT_NODES_RPC_ID,
+      { source: this.rpcId, objectId: String(BigInt(skeletonId)) },
+      { signal: options?.signal },
+    );
+    return nodes;
+  }
 }
 
 /**
  * Frontend chunk source backing the object-keyed (pass-2) render layer.
- * Paired with `ZarrVectorsObjectKeyedSkeletonSourceBackend` (to be
+ * Paired with `ZarrVectorsObjectKeyedGeometrySourceBackend` (to be
  * implemented in slice 4b once the `object_index/manifests` zarr-vlen-
  * bytes reader exists).
  *
@@ -294,9 +435,9 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSource extends WithParameters(
  * referenced in at least one frontend module and `tsgo` keeps it in the
  * dependency graph; the backend's `download()` is not yet implemented.
  */
-export class ZarrVectorsObjectKeyedSkeletonSource extends WithParameters(
+export class ZarrVectorsObjectKeyedGeometrySource extends WithParameters(
   WithSharedKvStoreContext(SkeletonSource),
-  ZarrVectorsObjectKeyedSkeletonSourceParameters,
+  ZarrVectorsObjectKeyedGeometrySourceParameters,
 ) {
   /**
    * Marks this as the zarr-vectors pass-2 source the ROI filter repurposes as
@@ -306,6 +447,11 @@ export class ZarrVectorsObjectKeyedSkeletonSource extends WithParameters(
    * resolution on top of the coarse pass-1 bulk.
    */
   readonly isRoiHighDetailSource = true;
+
+  /** The store's declared geometry type, for the data-sources tab to name. */
+  get geometryKind(): ZarrVectorsGeometryKind {
+    return this.parameters.geometryKind;
+  }
 
   /**
    * Vertex positions are physical coordinates (NGFF
@@ -325,9 +471,14 @@ export class ZarrVectorsObjectKeyedSkeletonSource extends WithParameters(
     return buildVertexAttributeMap(this.parameters);
   }
 
+  /** See {@link zvPackedAttributeRange}; same layout as the pass-1 source. */
+  get packedAttributeRange(): PackedAttributeRange | undefined {
+    return zvPackedAttributeRange(this.parameters);
+  }
+
   /**
    * Preferred default shader text for streamline stores.  See the
-   * matching getter on `ZarrVectorsSpatiallyIndexedSkeletonSource` for
+   * matching getter on `ZarrVectorsSpatialGeometrySource` for
    * design notes.
    */
   get defaultFragmentMain(): string | undefined {
@@ -347,8 +498,8 @@ export class ZarrVectorsObjectKeyedSkeletonSource extends WithParameters(
  * grid info (`chunkShape`, `gridShapeInVoxels`) since zarr-vectors
  * keeps the chunk grid uniform across levels.
  */
-export interface ZarrVectorsSkeletonSpatialLevel {
-  readonly parameters: ZarrVectorsSpatiallyIndexedSkeletonSourceParameters;
+export interface ZarrVectorsGeometrySpatialLevel {
+  readonly parameters: ZarrVectorsSpatialGeometrySourceParameters;
 }
 
 /**
@@ -363,9 +514,9 @@ export interface ZarrVectorsSkeletonSpatialLevel {
  * `spatiallyIndexedSkeletonTextureAttributeSpecs` hardcodes
  * `position: float32×3` (see `skeleton/frontend.ts:1706-1709`), so 2-D
  * or higher-rank zarr-vectors stores fall back to pass-2 only.  The
- * caller (`buildSkeletonMetadata`) must enforce this.
+ * caller (`buildGeometryMetadata`) must enforce this.
  */
-export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends MultiscaleSpatiallyIndexedSkeletonSource {
+export class ZarrVectorsMultiscaleGeometrySource extends MultiscaleSpatiallyIndexedSkeletonSource {
   /**
    * Opt this source into the ROI streamline filter. Its pass-1 chunks carry a
    * per-vertex segment column and retain a `roiFilterableChunk`, so the render-
@@ -375,7 +526,56 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
    * the segmentation layer gates the whole ROI channel on this flag rather than
    * on the shared source class.
    */
-  readonly supportsRoiStreamlineFilter = true;
+  /**
+   * What primitive every level of this store draws as. All levels share one
+   * geometry kind, so level 0 answers for the source.
+   */
+  get geometryPrimitive(): GeometryPrimitive {
+    return KIND_CAPABILITIES[this.levels[0].parameters.geometryKind].primitive;
+  }
+
+  /** The store's declared geometry type, for the data-sources tab to name. */
+  get geometryKind(): ZarrVectorsGeometryKind {
+    return this.levels[0].parameters.geometryKind;
+  }
+
+  get supportsRoiStreamlineFilter(): boolean {
+    // Every zarr-vectors geometry kind: the pass-1 chunks all carry a per-vertex
+    // segment column and a retained `roiFilterableChunk`, which is what the fold
+    // needs. What differs between kinds is only HOW a chunk is folded, and the
+    // chunk says which: `perVertexObjects` for a point cloud (one id per point,
+    // and a fragment is a spatial bin of unrelated points, so folding per
+    // fragment would put a whole bin in one region), `surfaceVertices` for a
+    // mesh (a face soup has no walk order, so every predicate is "any vertex").
+    return true;
+  }
+
+  /**
+   * Whether the tract export applies to this store. Both of its formats are
+   * streamline-shaped -- TrackVis `.trk` is polylines by definition, and the
+   * zarr-vectors exporter reads whole tracts -- so a point cloud or surface
+   * gets the Filter tab without the Export tab.
+   */
+  get supportsTractExport(): boolean {
+    return this.geometryPrimitive === "lines";
+  }
+
+  /**
+   * The per-vertex attribute names this source actually loaded, in the order it
+   * loaded them: the on-disk `vertex_attributes/<name>` directory names, which
+   * are what an attribute predicate persists and what the worker keys its
+   * retained columns by. Not the GLSL-safe `prop_<id>()` spellings.
+   *
+   * All levels of a store share one selection, so level 0 answers for it.
+   */
+  get vertexAttributeNames(): readonly string[] {
+    return this.levels[0]?.parameters.attributeNames ?? [];
+  }
+
+  /** On-disk dtypes parallel to {@link vertexAttributeNames}. */
+  get vertexAttributeDtypes(): readonly string[] {
+    return this.levels[0]?.parameters.attributeDtypes ?? [];
+  }
 
   /**
    * Opt in to camera-driven LOD picking ONLY when there are ≥2 pyramid
@@ -416,7 +616,7 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
   }
 
   /** Per-level chunk-source parameter blobs in finest-first order. */
-  readonly levels: ReadonlyArray<ZarrVectorsSkeletonSpatialLevel>;
+  readonly levels: ReadonlyArray<ZarrVectorsGeometrySpatialLevel>;
   /**
    * Per-level chunk shape in world units, finest-first.  Length ==
    * `levels.length`.  Each entry comes from the level's own
@@ -531,6 +731,29 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
    * `getSpatialSkeletonGridSizes()`. `undefined` for a level whose count the
    * writer did not stamp.
    */
+  /**
+   * How many grid cells each level's spatial index spans, **coarsest first**.
+   *
+   * Turns a whole-level byte cost into a per-cell one, which is the unit LOCAL
+   * detail focus budgets in: the memory limit divided by the cells in view names
+   * the finest level each cell can afford.
+   */
+  getSpatialSkeletonLevelCellCounts(): number[] {
+    const finestFirst = this.perLevelChunkShape.map((chunkShape) => {
+      const { lowerChunkBound, upperChunkBound } = computeChunkIndexBounds(
+        this.lowerBounds,
+        this.upperBounds,
+        chunkShape,
+      );
+      let cells = 1;
+      for (let i = 0; i < lowerChunkBound.length; ++i) {
+        cells *= Math.max(0, upperChunkBound[i] - lowerChunkBound[i]);
+      }
+      return cells;
+    });
+    return finestFirst.reverse();
+  }
+
   getSpatialSkeletonLevelObjectCounts(): (number | undefined)[] {
     return this.perLevelObjectCount.slice().reverse();
   }
@@ -540,9 +763,7 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     const p = this.levels[k].parameters;
     let bytesPerVertex = p.rank * 4; // positions, float32
     if (hasSynthesisedTangent(p.geometryKind)) bytesPerVertex += 3 * 4;
-    for (const dtype of p.attributeDtypes) {
-      bytesPerVertex += ATTR_DTYPE_BYTES[dtype];
-    }
+    bytesPerVertex += p.attributeDtypes.length * ATTR_GPU_BYTES;
     bytesPerVertex += 8; // synthesised segment column, uvec2
     bytesPerVertex += 8; // ~1 implicit edge per vertex, uvec2 index pair
     return bytesPerVertex;
@@ -558,58 +779,19 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
   }
 
   /**
-   * What ONE full-resolution streamline costs on the GPU, or `undefined` when
-   * the store does not carry enough metadata to say.
-   *
-   * This is the conversion a byte budget needs to become a streamline budget,
-   * and streamlines are the right unit because the object-keyed pass fetches
-   * whole tracts: one clipping the view costs its entire length.
-   *
-   * Measured at the FINEST level, since that is what that pass loads.
-   *
-   * Returns `undefined` when `perLevelObjectCount` has degenerated to
-   * `perLevelVertexCount` -- `computePerLevelObjectCount` falls back to exactly
-   * that when the store omits `inherited_num_objects`/`object_sparsity`, which
-   * would make vertices-per-object a meaningless 1.0 and the derived budget
-   * wrong by two orders of magnitude. Better to decline than to invent one.
-   */
-  getFullDetailBytesPerStreamline(): number | undefined {
-    return bytesPerObjectFromLevelCounts(
-      this.perLevelVertexCount[0],
-      this.perLevelObjectCount[0],
-      this.bytesPerVertexAtLevel(0),
-    );
-  }
-
-  /**
    * Per-level multiplier that spreads levels the chunk-shape signal cannot
    * separate. All 1 when vertex counts are unavailable, when every level has
    * the same count, or when chunk growth already reflects the vertex drop.
    */
   private computeDensityScales(): number[] {
-    const counts = this.perLevelObjectCount;
-    const n = this.perLevelChunkShape.length;
-    const ones = new Array<number>(n).fill(1);
-    if (counts.length !== n) return ones;
-    // Anchor on the densest level; `levels` is finest-first, but derive it
-    // rather than assume, so an unordered store still behaves.
-    let finestCount: number | undefined;
-    for (const c of counts) {
-      if (c === undefined) return ones; // partial metadata: don't half-apply
-      if (finestCount === undefined || c > finestCount) finestCount = c;
-    }
-    if (finestCount === undefined || finestCount <= 0) return ones;
-    const spacing = this.perLevelChunkShape.map((cs) =>
-      Math.min(cs[0], cs[1], cs[2]),
+    // Objects first: on a tractogram the detail axis IS "how many complete
+    // streamlines does this level hold". A store with no object model has no
+    // such count, so `computePyramidDensityScales` falls back to vertices.
+    return computePyramidDensityScales(
+      this.perLevelObjectCount,
+      this.perLevelVertexCount,
+      this.perLevelChunkShape.map((cs) => Math.min(cs[0], cs[1], cs[2])),
     );
-    const finestSpacing = Math.min(...spacing);
-    if (!(finestSpacing > 0)) return ones;
-    return counts.map((c, k) => {
-      const densityFactor = Math.cbrt(finestCount! / c!);
-      const chunkGrowth = spacing[k] / finestSpacing;
-      // Only make up the shortfall the chunk shape does not already express.
-      return Math.max(1, densityFactor / chunkGrowth);
-    });
   }
 
   /**
@@ -634,10 +816,12 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
     chunkManager: Borrowed<ChunkManager>,
     private readonly sharedKvStoreContext: SharedKvStoreContext,
     options: {
-      levels: ReadonlyArray<ZarrVectorsSkeletonSpatialLevel>;
+      levels: ReadonlyArray<ZarrVectorsGeometrySpatialLevel>;
       perLevelChunkShape: Float32Array[];
       perLevelObjectCount?: (number | undefined)[];
       perLevelVertexCount?: (number | undefined)[];
+      perLevelObjectVertexCounts?: Uint32Array[];
+      objectDepths?: Uint8Array;
       metersPerUnit: Float64Array;
       lowerBounds: Float32Array;
       upperBounds: Float32Array;
@@ -656,9 +840,59 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
       new Array<number | undefined>(options.perLevelChunkShape.length).fill(
         undefined,
       );
+    this.perLevelObjectVertexCounts = options.perLevelObjectVertexCounts;
+    this.objectDepths = options.objectDepths;
     this.metersPerUnit = options.metersPerUnit;
     this.lowerBounds = options.lowerBounds;
     this.upperBounds = options.upperBounds;
+  }
+
+  /**
+   * Per-object vertex counts per level, finest-first (`0` = absent), and the
+   * coarsest level holding each object. Present together or not at all; absent
+   * for a store lacking `object_attributes/vertex_count` or whose levels are not
+   * nested. See `object_admission.ts`.
+   */
+  readonly perLevelObjectVertexCounts: Uint32Array[] | undefined;
+  readonly objectDepths: Uint8Array | undefined;
+
+  /**
+   * The largest set of WHOLE objects `budgetBytes` affords, or `undefined` when
+   * this store cannot be budgeted per object.
+   *
+   * Costed at each level's own geometry, so the answer accounts for the fact
+   * that drawing a finer level re-costs even the coarse backbone.
+   */
+  /**
+   * Whether this store actually carries the per-level object membership that
+   * {@link computeObjectAdmission} needs.
+   *
+   * Distinct from the method merely EXISTING.  A store whose levels omit
+   * `object_attributes/vertex_count` still has the method, but it can only ever
+   * answer `undefined` — and a consumer that installs the admission closure on
+   * the strength of the method being present ends up with a store that can
+   * neither budget per object nor fall back to whole-level selection, freezing
+   * the pyramid at whatever level was picked first.
+   */
+  get canBudgetPerObject(): boolean {
+    return (
+      this.perLevelObjectVertexCounts !== undefined &&
+      this.objectDepths !== undefined
+    );
+  }
+
+  computeObjectAdmission(budgetBytes: number): ObjectAdmission | undefined {
+    const counts = this.perLevelObjectVertexCounts;
+    const depths = this.objectDepths;
+    if (counts === undefined || depths === undefined) return undefined;
+    // Bytes per vertex is a property of what the renderer packs, and it is the
+    // same at every level for one store, so level 0 answers for all of them.
+    return admissionForBudget(
+      counts,
+      depths,
+      this.bytesPerVertexAtLevel(0),
+      budgetBytes,
+    );
   }
 
   getSources(
@@ -685,15 +919,25 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
         3,
       );
 
-      const chunkDataSize = new Uint32Array([
-        chunkShape[0],
-        chunkShape[1],
-        chunkShape[2],
-      ]);
+      // FLOAT chunk size, deliberately. A zarr-vectors `chunk_shape` is a
+      // physical extent, not a voxel count, and is routinely fractional -- a
+      // 0.5 mm MERFISH grid, say. Through a Uint32Array it truncates to 0, and
+      // the chunk-index bounds below become +/-Infinity; the frustum walk in
+      // `forEachVolumetricChunkWithinFrustrum` then binary-splits a box it can
+      // never reduce to a single chunk and blows the stack.
+      const chunkDataSize = Float32Array.from(chunkShape.subarray(0, 3));
       // lowerVoxelBound / upperVoxelBound encode the data extent in
-      // world (= chunk-layout) units; `makeSliceViewChunkSpecification`
-      // floors / ceils these to chunk-index bounds, which handle
-      // negative chunk indices fine.
+      // world (= chunk-layout) units.  The chunk-index bounds are computed
+      // here rather than taken from `makeSliceViewChunkSpecification`, whose
+      // `(upper - 1) / size + 1` upper bound assumes integer voxel units and
+      // loses a chunk when the extent is measured in millimetres.  Negative
+      // chunk indices are fine either way: zarr-vectors indexes chunks around
+      // the world origin, and floor/ceil handle the sign.
+      const { lowerChunkBound, upperChunkBound } = computeChunkIndexBounds(
+        lowerBounds,
+        upperBounds,
+        chunkDataSize,
+      );
       const spec: SpatiallyIndexedSkeletonChunkSpecification = {
         ...makeSliceViewChunkSpecification({
           rank: 3,
@@ -701,11 +945,13 @@ export class ZarrVectorsMultiscaleSpatiallyIndexedSkeletonSource extends Multisc
           lowerVoxelBound: lowerBounds,
           upperVoxelBound: upperBounds,
         }),
+        lowerChunkBound,
+        upperChunkBound,
         chunkLayout,
       };
 
       const chunkSource = this.chunkManager.getChunkSource(
-        ZarrVectorsSpatiallyIndexedSkeletonSource,
+        ZarrVectorsSpatialGeometrySource,
         {
           sharedKvStoreContext: this.sharedKvStoreContext,
           spec,

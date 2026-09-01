@@ -34,6 +34,7 @@
 
 import type {
   Roi,
+  RoiAttrFilter,
   RoiColorSpec,
   RoiLengthFilter,
   RoiOperator,
@@ -228,7 +229,7 @@ function entryFromJson(obj: any): Roi {
  * polyline and are realised in the layer shader (a group choosing one of them
  * "inherits" the background per-vertex colour).
  */
-export type { RoiColorSpec, RoiLengthFilter };
+export type { RoiAttrFilter, RoiColorSpec, RoiLengthFilter };
 
 export const DEFAULT_GROUP_COLOR_BY: RoiColorSpec = { kind: "group" };
 export const DEFAULT_BACKGROUND_COLOR_BY: RoiColorSpec = { kind: "direction" };
@@ -244,6 +245,25 @@ export function lengthFilterEquals(
 ): boolean {
   if (a === undefined || b === undefined) return a === b;
   return a.name === b.name && a.min === b.min && a.max === b.max;
+}
+
+/** Whether two attribute-predicate lists are the same, in the same order. */
+export function attrFiltersEqual(
+  a: readonly RoiAttrFilter[],
+  b: readonly RoiAttrFilter[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; ++i) {
+    if (
+      a[i].name !== b[i].name ||
+      a[i].min !== b[i].min ||
+      a[i].max !== b[i].max ||
+      (a[i].scope ?? "object") !== (b[i].scope ?? "object")
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Compact, URL-friendly encoding (`"direction"`, `"object:<name>"`, …). */
@@ -283,6 +303,36 @@ function lengthFilterToJson(f: RoiLengthFilter): any {
   return { name: f.name, min: f.min, max: f.max };
 }
 
+/**
+ * An attribute predicate's JSON. `scope` is omitted for the default `"object"`
+ * tier, which is also what an old `lengthFilter` key migrates to, so a state
+ * saved before per-vertex predicates existed round-trips byte-identically.
+ */
+function attrFilterToJson(f: RoiAttrFilter): any {
+  const json: any = { name: f.name, min: f.min, max: f.max };
+  if (f.scope !== undefined && f.scope !== "object") json.scope = f.scope;
+  return json;
+}
+
+function attrFilterFromJson(obj: any): RoiAttrFilter {
+  verifyObject(obj);
+  const base = {
+    name: verifyObjectProperty(obj, "name", verifyString),
+    min: verifyObjectProperty(obj, "min", verifyFiniteFloat),
+    max: verifyObjectProperty(obj, "max", verifyFiniteFloat),
+  };
+  const scope = verifyOptionalObjectProperty(obj, "scope", (v) => {
+    const s = verifyString(v);
+    if (s !== "object" && s !== "vertex") {
+      throw new Error(`Invalid attribute scope: ${JSON.stringify(s)}`);
+    }
+    return s;
+  });
+  // Spread-free so an object-scope predicate has no `scope` key at all, which
+  // is what makes the legacy round-trip exact (see `attrFilterToJson`).
+  return scope === undefined ? base : { ...base, scope };
+}
+
 function lengthFilterFromJson(obj: any): RoiLengthFilter {
   verifyObject(obj);
   return {
@@ -301,12 +351,15 @@ export interface RoiGroup {
   readonly visible: boolean;
   /** Opacity of this group's passing streamlines, in [0, 1]. */
   readonly opacity: number;
-  /** Load this group's passing tracts at full detail (object-keyed pass 2). */
-  readonly highDetail: boolean;
   /** How this group's passing streamlines are coloured. */
   readonly colorBy: RoiColorSpec;
-  /** Restrict this group to streamlines whose attribute value is in range. */
-  readonly lengthFilter?: RoiLengthFilter;
+  /**
+   * Attribute predicates restricting this group, ANDed with each other and with
+   * the ROI fold. Always present (possibly empty) so every reader can treat it
+   * as a list rather than as an optional single filter -- which is what the
+   * legacy `lengthFilter` key was, and what it migrates into.
+   */
+  readonly attrFilters: readonly RoiAttrFilter[];
   readonly rois: readonly Roi[];
 }
 
@@ -324,11 +377,10 @@ export function groupToJson(group: RoiGroup): any {
   };
   if (!group.visible) json.visible = false;
   if (group.opacity !== DEFAULT_GROUP_OPACITY) json.opacity = group.opacity;
-  if (group.highDetail) json.highDetail = true;
   if (!colorSpecEquals(group.colorBy, DEFAULT_GROUP_COLOR_BY))
     json.colorBy = colorSpecToJson(group.colorBy);
-  if (group.lengthFilter !== undefined)
-    json.lengthFilter = lengthFilterToJson(group.lengthFilter);
+  if (group.attrFilters.length !== 0)
+    json.attrFilters = group.attrFilters.map(attrFilterToJson);
   return json;
 }
 
@@ -345,11 +397,18 @@ export function groupFromJson(
   defaultColorBy: RoiColorSpec = DEFAULT_GROUP_COLOR_BY,
 ): RoiGroup {
   verifyObject(obj);
-  const lengthFilter = verifyOptionalObjectProperty(
+  // `lengthFilter` is the pre-list spelling: one object-scope range. Read it
+  // when `attrFilters` is absent so a saved dissection (URL or ROI store) keeps
+  // filtering exactly as it did.
+  const legacy = verifyOptionalObjectProperty(
     obj,
     "lengthFilter",
     lengthFilterFromJson,
   );
+  const attrFilters =
+    verifyOptionalObjectProperty(obj, "attrFilters", (v) =>
+      parseArray(v, attrFilterFromJson),
+    ) ?? (legacy === undefined ? [] : [legacy]);
   const base = {
     id,
     name: verifyObjectProperty(obj, "name", verifyString),
@@ -361,19 +420,15 @@ export function groupFromJson(
     opacity:
       verifyOptionalObjectProperty(obj, "opacity", verifyFiniteFloat) ??
       DEFAULT_GROUP_OPACITY,
-    highDetail:
-      verifyOptionalObjectProperty(obj, "highDetail", (v) => v === true) ??
-      false,
     colorBy:
       verifyOptionalObjectProperty(obj, "colorBy", colorSpecFromJson) ??
       defaultColorBy,
+    attrFilters,
     rois: verifyObjectProperty(obj, "rois", (v) =>
       parseArray(v, entryFromJson),
     ),
   };
-  // Spread-free so an absent lengthFilter has no key at all (round-trip tests
-  // use toStrictEqual), matching the unnamed-ROI handling above.
-  return lengthFilter === undefined ? base : { ...base, lengthFilter };
+  return base;
 }
 
 /**
@@ -494,14 +549,24 @@ export class RoiFilterState {
   }
 
   /**
-   * Promote the staged label selection to a real, persisted group and clear the
+   * Promote the staged selection to a real, persisted group and clear the
    * preview; returns the new group's id, or `undefined` if nothing was staged.
    * A fresh palette colour and (optional) name are assigned so the committed
    * group reads as a first-class dissection.
+   *
+   * "Nothing staged" means neither ROIs nor attribute predicates: an
+   * attribute-only selection (the "By attribute" panel) is a complete
+   * dissection on its own, and refusing to commit it would make that panel's
+   * one action a no-op.
    */
   commitPreviewGroup(name?: string): number | undefined {
     const preview = this.previewGroup_;
-    if (preview === undefined || preview.rois.length === 0) return undefined;
+    if (
+      preview === undefined ||
+      (preview.rois.length === 0 && preview.attrFilters.length === 0)
+    ) {
+      return undefined;
+    }
     const id = this.nextGroupId_++;
     this.groups_ = [
       ...this.groups_,
@@ -528,15 +593,18 @@ export class RoiFilterState {
       : [...this.groups_, this.previewGroup_];
   }
 
-  /** Whether any visible group has at least one ROI (i.e. the filter can act). */
+  /**
+   * Whether any visible group can select anything -- it has an ROI or an
+   * attribute predicate. Either makes it a dissection; a group with neither is
+   * an empty shell (a just-added group) and the filter stays inert for it.
+   */
   hasVisibleRois(): boolean {
-    if (
-      this.previewGroup_ !== undefined &&
-      this.previewGroup_.rois.length > 0
-    ) {
+    const selects = (g: Pick<RoiGroup, "rois" | "attrFilters">) =>
+      g.rois.length > 0 || g.attrFilters.length > 0;
+    if (this.previewGroup_ !== undefined && selects(this.previewGroup_)) {
       return true;
     }
-    return this.groups_.some((g) => g.visible && g.rois.length > 0);
+    return this.groups_.some((g) => g.visible && selects(g));
   }
 
   private groupIndex(id: number): number {
@@ -554,8 +622,8 @@ export class RoiFilterState {
         color: paletteColor(this.groups_.length),
         visible: true,
         opacity: DEFAULT_GROUP_OPACITY,
-        highDetail: false,
         colorBy: DEFAULT_GROUP_COLOR_BY,
+        attrFilters: [],
         rois: [],
       },
     ];
@@ -593,10 +661,9 @@ export class RoiFilterState {
       color?: vec3;
       visible?: boolean;
       opacity?: number;
-      highDetail?: boolean;
       colorBy?: RoiColorSpec;
-      // `undefined` clears the length filter.
-      lengthFilter?: RoiLengthFilter | undefined;
+      /** Replaces the whole predicate list; `[]` clears it. */
+      attrFilters?: readonly RoiAttrFilter[];
     },
   ): void {
     const idx = this.groupIndex(id);
@@ -732,7 +799,7 @@ export class RoiFilterState {
                 color: paletteColor(0),
                 visible: true,
                 opacity: DEFAULT_GROUP_OPACITY,
-                highDetail: false,
+                attrFilters: [],
                 colorBy: legacyDefaultColorBy,
                 rois: flatRois,
               },

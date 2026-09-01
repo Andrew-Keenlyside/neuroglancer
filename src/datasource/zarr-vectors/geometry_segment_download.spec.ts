@@ -11,16 +11,16 @@ import {
   FRAGMENT_INDEX_VERSION,
   FragmentIndex,
 } from "#src/datasource/zarr-vectors/fragment_index.js";
-import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
-import { MANIFEST_MODE_SINGLE } from "#src/datasource/zarr-vectors/object_manifest.js";
-import { buildSkeletonChunk } from "#src/datasource/zarr-vectors/skeleton_chunk.js";
+import { buildGeometryChunk } from "#src/datasource/zarr-vectors/geometry_chunk.js";
 import {
   collectOwnedCrossChunkEdges,
   deriveImplicitSequentialCrossChunkEdges,
   downloadSegmentSkeleton,
   filterChunkByFragments,
   type OrderedManifestBlock,
-} from "#src/datasource/zarr-vectors/skeleton_segment_download.js";
+} from "#src/datasource/zarr-vectors/geometry_segment_download.js";
+import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
+import { MANIFEST_MODE_SINGLE } from "#src/datasource/zarr-vectors/object_manifest.js";
 import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 
 // ---------------------------------------------------------------------------
@@ -242,7 +242,7 @@ describe("filterChunkByFragments", () => {
       { range: { start: 0, count: 3 } },
       { range: { start: 3, count: 3 } },
     ]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -269,7 +269,7 @@ describe("filterChunkByFragments", () => {
       { range: { start: 0, count: 3 } },
       { range: { start: 3, count: 3 } },
     ]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -293,7 +293,7 @@ describe("filterChunkByFragments", () => {
     const positions = new Float32Array(15);
     for (let i = 0; i < 5; ++i) positions[i * 3] = i;
     const fi = buildFragmentIndex([{ range: { start: 0, count: 5 } }]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -317,7 +317,7 @@ describe("filterChunkByFragments", () => {
       { range: { start: 0, count: 3 } },
       { range: { start: 3, count: 3 } },
     ]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -334,7 +334,7 @@ describe("filterChunkByFragments", () => {
     // 3 vertices marching +X.  Tangents = (1,0,0) for all.
     const positions = new Float32Array([0, 0, 0, 1, 0, 0, 2, 0, 0]);
     const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -358,7 +358,7 @@ describe("filterChunkByFragments", () => {
     const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
     const radius = new Float32Array([0.1, 0.2, 0.3]);
     const swcType = new Int32Array([1, 2, 3]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -387,7 +387,7 @@ describe("filterChunkByFragments", () => {
       { explicit: [0, 1, 2] },
       { explicit: [2, 3] },
     ]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,

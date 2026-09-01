@@ -48,9 +48,13 @@ const SECTIONS: GuideSection[] = [
     heading: "What a group is",
     body: [
       "A GROUP is one named, coloured dissection: an ordered list of regions " +
-        "that a streamline is tested against. A tract belongs to the group if " +
-        "it passes that group's regions. Passing tracts are drawn in the " +
-        "group's colour; everything else is ghosted back.",
+        "that the geometry is tested against, and/or a set of attribute " +
+        "conditions it has to meet. Whatever passes is drawn in the group's " +
+        "colour; everything else is ghosted back.",
+      'What "whatever" means follows the data: a tract for a tractogram, a ' +
+        "surface for a mesh, and a single point for a point cloud — where " +
+        "each point is its own object, so a dissection selects individual " +
+        "cells.",
       "Groups are independent. Several can be active at once, each with its " +
         "own colour, visibility and opacity, so you can compare dissections " +
         "side by side in one view.",
@@ -69,6 +73,28 @@ const SECTIONS: GuideSection[] = [
         "Exclude.",
       "Add more regions to narrow the dissection. The tract count under the " +
         "panel updates as you go.",
+    ],
+  },
+  {
+    heading: "Selecting by attribute",
+    body: [
+      "A group does not have to be made of regions. Anything the store " +
+        "records about its geometry — a flag it carries, a measurement it " +
+        "stores, a gene's expression — can select just as well, and for data " +
+        "with no shape to draw around (a cell point cloud) it is the only " +
+        "thing that can.",
+      "By attribute, above the group list, stages a selection the same way By " +
+        "segmentation label does: pick an attribute, narrow it, watch the " +
+        "view update, then press Create group from selection. Until you do, " +
+        "it is a preview and not a group.",
+      "Attributes measured over the loaded data get a ≥ / ≤ pair; ones that " +
+        "only ever take two values get a checkbox instead. Several attributes " +
+        "in one group must all match, and where the values are stored per " +
+        "point they must all match at the SAME point — two genes in one group " +
+        "means cells expressing both, not cells expressing either.",
+      "Ranges are measured over what is currently loaded, so a slider's ends " +
+        "describe the data on screen. Only the columns the source loaded can " +
+        "be filtered on; name others with #attributes= on the source URL.",
     ],
   },
   {

@@ -10,13 +10,15 @@ import { FragmentIndex } from "#src/datasource/zarr-vectors/fragment_index.js";
 import {
   appendGhostVertices,
   appendIntraChunkEdges,
-  buildSkeletonChunk,
+  appendBoundaryFaces,
+  buildGeometryChunk,
   computeTangents,
   computeTangentsFromEdges,
   mergeEdges,
   recomputeTangentsForBridges,
+  resolveBoundaryFaces,
   synthesizeSequentialEdges,
-} from "#src/datasource/zarr-vectors/skeleton_chunk.js";
+} from "#src/datasource/zarr-vectors/geometry_chunk.js";
 
 /**
  * Build a `FragmentIndex` directly from a list of fragments — used to
@@ -372,11 +374,11 @@ describe("computeTangentsFromEdges", () => {
   });
 });
 
-describe("buildSkeletonChunk", () => {
+describe("buildGeometryChunk", () => {
   it("produces a streamline chunk with tangents and sequential edges", () => {
     const positions = new Float32Array([0, 0, 0, 1, 0, 0, 2, 0, 0]);
     const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -394,13 +396,145 @@ describe("buildSkeletonChunk", () => {
     }
   });
 
+  it("produces a point-cloud chunk with no edges and no tangents", () => {
+    // A point-cloud fragment is a spatial BIN holding unrelated points, so the
+    // implicit-sequential rule would wire the bin into a spaghetti polyline.
+    // The geometry kind has to win over the fragment layout.
+    const positions = new Float32Array([0, 0, 0, 5, 0, 0, 0, 7, 0, 0, 0, 9]);
+    const fi = buildFragmentIndex([{ range: { start: 0, count: 4 } }]);
+    const chunk = buildGeometryChunk({
+      rank: 3,
+      positions,
+      fragmentIndex: fi,
+      linksConvention: "implicit_sequential",
+      geometryKind: "point_cloud",
+      vertexAttributes: [],
+    });
+    expect(chunk.numVertices).toBe(4);
+    expect(chunk.numEdges).toBe(0);
+    expect(chunk.edges.length).toBe(0);
+    // No connectivity means no direction: `prop_tangent()` must not exist.
+    expect(chunk.tangents).toBeUndefined();
+  });
+
+  it("ignores link records on a point-cloud chunk rather than drawing them", () => {
+    const positions = new Float32Array(9);
+    const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
+    const chunk = buildGeometryChunk({
+      rank: 3,
+      positions,
+      fragmentIndex: fi,
+      explicitEdges: new Uint32Array([0, 1, 1, 2]),
+      linksConvention: "explicit",
+      geometryKind: "point_cloud",
+      vertexAttributes: [],
+    });
+    expect(chunk.numEdges).toBe(0);
+  });
+
+  it("carries face records for mesh geometry and synthesises no edges", () => {
+    // A mesh chunk's links are faces, and its fragment order says nothing about
+    // connectivity -- so an edge list must not be invented from it.
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0]);
+    const fi = buildFragmentIndex([{ range: { start: 0, count: 4 } }]);
+    const chunk = buildGeometryChunk({
+      rank: 3,
+      positions,
+      fragmentIndex: fi,
+      linksConvention: "explicit",
+      geometryKind: "mesh",
+      vertexAttributes: [],
+      faces: new Uint32Array([0, 1, 2, 1, 3, 2]),
+      faceArity: 3,
+    });
+    expect(chunk.numEdges).toBe(0);
+    expect(chunk.numFaces).toBe(2);
+    expect(Array.from(chunk.faces!)).toEqual([0, 1, 2, 1, 3, 2]);
+    // A surface has no per-vertex direction.
+    expect(chunk.tangents).toBeUndefined();
+  });
+
+  it("fans a quad into two triangles, preserving winding", () => {
+    // ZVF allows link_width > 3; the GPU path draws triangles, so a quad has to
+    // become (v0,v1,v2) + (v0,v2,v3) -- the order the producer wrote, kept.
+    const positions = new Float32Array(12);
+    const fi = buildFragmentIndex([{ range: { start: 0, count: 4 } }]);
+    const chunk = buildGeometryChunk({
+      rank: 3,
+      positions,
+      fragmentIndex: fi,
+      linksConvention: "explicit",
+      geometryKind: "mesh",
+      vertexAttributes: [],
+      faces: new Uint32Array([0, 1, 3, 2]),
+      faceArity: 4,
+    });
+    expect(chunk.numFaces).toBe(2);
+    expect(Array.from(chunk.faces!)).toEqual([0, 1, 3, 0, 3, 2]);
+  });
+
+  it("rejects a face list that does not divide by the declared arity", () => {
+    const positions = new Float32Array(9);
+    const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
+    expect(() =>
+      buildGeometryChunk({
+        rank: 3,
+        positions,
+        fragmentIndex: fi,
+        linksConvention: "explicit",
+        geometryKind: "mesh",
+        vertexAttributes: [],
+        faces: new Uint32Array([0, 1, 2, 0]),
+        faceArity: 3,
+      }),
+    ).toThrow(/not a multiple of link_width=3/);
+  });
+
+  it("treats a mesh chunk with no intra-chunk faces as empty, not broken", () => {
+    // Legitimate under Draco encoding: intra-chunk faces live in the bitstream,
+    // so the links family holds only boundary faces (possibly none).
+    const positions = new Float32Array(9);
+    const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
+    const chunk = buildGeometryChunk({
+      rank: 3,
+      positions,
+      fragmentIndex: fi,
+      linksConvention: "explicit",
+      geometryKind: "mesh",
+      vertexAttributes: [],
+    });
+    expect(chunk.numFaces).toBe(0);
+    expect(chunk.numVertices).toBe(3);
+  });
+
+  it("produces one edge per 2-vertex fragment for line geometry", () => {
+    // `line` is independent 2-point segments: two fragments, two edges, and no
+    // edge joining fragment 0 to fragment 1.
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 6, 0]);
+    const fi = buildFragmentIndex([
+      { range: { start: 0, count: 2 } },
+      { range: { start: 2, count: 2 } },
+    ]);
+    const chunk = buildGeometryChunk({
+      rank: 3,
+      positions,
+      fragmentIndex: fi,
+      linksConvention: "implicit_sequential",
+      geometryKind: "line",
+      vertexAttributes: [],
+    });
+    expect(chunk.numEdges).toBe(2);
+    expect(Array.from(chunk.edges)).toEqual([0, 1, 2, 3]);
+    expect(chunk.tangents).toBeDefined();
+  });
+
   it("produces a skeleton chunk with both implicit + explicit edges and edge-adjacency tangents", () => {
     // 5 vertices, one fragment, three implicit edges (0,1),(1,2),(2,3),
     // (3,4), plus one explicit branch (1,4) — total 5 edges.
     const positions = new Float32Array(15);
     for (let i = 0; i < 5; ++i) positions[i * 3] = i;
     const fi = buildFragmentIndex([{ range: { start: 0, count: 5 } }]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -419,7 +553,7 @@ describe("buildSkeletonChunk", () => {
   it("produces an explicit-only chunk with no implicit edges", () => {
     const positions = new Float32Array(9);
     const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -436,7 +570,7 @@ describe("buildSkeletonChunk", () => {
     // 4 vertices on a Y junction: center=0 at origin, arms 1=+x, 2=+y, 3=+z.
     const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
     const fi = buildFragmentIndex([{ range: { start: 0, count: 4 } }]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -466,7 +600,7 @@ describe("buildSkeletonChunk", () => {
     const positions = new Float32Array(9);
     const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
     expect(() =>
-      buildSkeletonChunk({
+      buildGeometryChunk({
         rank: 3,
         positions,
         fragmentIndex: fi,
@@ -482,7 +616,7 @@ describe("buildSkeletonChunk", () => {
     const positions = new Float32Array(9);
     const fi = buildFragmentIndex([{ range: { start: 0, count: 3 } }]);
     expect(() =>
-      buildSkeletonChunk({
+      buildGeometryChunk({
         rank: 3,
         positions,
         fragmentIndex: fi,
@@ -498,7 +632,7 @@ describe("buildSkeletonChunk", () => {
     const fi = buildFragmentIndex([{ range: { start: 0, count: 2 } }]);
     const radius = new Float32Array([0.5, 0.7]);
     const swcType = new Int32Array([1, 3]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: fi,
@@ -519,14 +653,14 @@ describe("buildSkeletonChunk", () => {
 describe("recomputeTangentsForBridges", () => {
   function coarseChunk(
     positions: number[],
-  ): ReturnType<typeof buildSkeletonChunk> {
+  ): ReturnType<typeof buildGeometryChunk> {
     // Coarser-pyramid-level layout: one metavertex per fragment.
     // computeTangents will assign zero tangents to all of them.
     const n = positions.length / 3;
     const fragments = Array.from({ length: n }, (_, i) => ({
       range: { start: i, count: 1 },
     }));
-    return buildSkeletonChunk({
+    return buildGeometryChunk({
       rank: 3,
       positions: new Float32Array(positions),
       fragmentIndex: buildFragmentIndex(fragments),
@@ -574,7 +708,7 @@ describe("recomputeTangentsForBridges", () => {
   });
 
   it("returns input unchanged for skeleton geometry (no walk-order bridge fixup)", () => {
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions: new Float32Array([0, 0, 0, 1, 0, 0]),
       fragmentIndex: buildFragmentIndex([
@@ -651,8 +785,8 @@ describe("recomputeTangentsForBridges", () => {
 // ---------------------------------------------------------------------------
 
 describe("appendIntraChunkEdges", () => {
-  function streamline2(): ReturnType<typeof buildSkeletonChunk> {
-    return buildSkeletonChunk({
+  function streamline2(): ReturnType<typeof buildGeometryChunk> {
+    return buildGeometryChunk({
       rank: 3,
       positions: new Float32Array([0, 0, 0, 1, 0, 0]),
       fragmentIndex: buildFragmentIndex([
@@ -679,7 +813,7 @@ describe("appendIntraChunkEdges", () => {
   });
 
   it("appends multiple extra edges, preserving original edges", () => {
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions: new Float32Array([0, 0, 0, 1, 0, 0, 2, 0, 0]),
       fragmentIndex: buildFragmentIndex([{ range: { start: 0, count: 3 } }]),
@@ -724,14 +858,14 @@ describe("appendIntraChunkEdges", () => {
 describe("appendGhostVertices", () => {
   function streamlineChunk(
     numVerts: number,
-  ): ReturnType<typeof buildSkeletonChunk> {
+  ): ReturnType<typeof buildGeometryChunk> {
     const positions = new Float32Array(numVerts * 3);
     for (let i = 0; i < numVerts; ++i) {
       positions[i * 3] = i;
       positions[i * 3 + 1] = 0;
       positions[i * 3 + 2] = 0;
     }
-    return buildSkeletonChunk({
+    return buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: buildFragmentIndex([
@@ -883,7 +1017,7 @@ describe("appendGhostVertices", () => {
 
   it("works for skeleton geometry (edge-adjacency tangents extended for ghost)", () => {
     const positions = new Float32Array([0, 0, 0, 1, 0, 0, 2, 0, 0]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: buildFragmentIndex([{ range: { start: 0, count: 3 } }]),
@@ -911,7 +1045,7 @@ describe("appendGhostVertices", () => {
     const positions = new Float32Array([0, 0, 0, 1, 0, 0, 2, 0, 0]);
     // segmentIds is interleaved [lo, hi] per vertex; use a genuine uint64
     // (lo=2, hi=1 → 0x1_0000_0002) to confirm BOTH halves are copied.
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: buildFragmentIndex([{ range: { start: 0, count: 3 } }]),
@@ -934,7 +1068,7 @@ describe("appendGhostVertices", () => {
 
   it("preserves attribute dtype (uint8 host → uint8 output)", () => {
     const positions = new Float32Array([0, 0, 0, 1, 0, 0]);
-    const chunk = buildSkeletonChunk({
+    const chunk = buildGeometryChunk({
       rank: 3,
       positions,
       fragmentIndex: buildFragmentIndex([{ range: { start: 0, count: 2 } }]),
@@ -992,5 +1126,82 @@ describe("appendGhostVertices", () => {
         },
       ]),
     ).toThrow(/attributes/);
+  });
+});
+
+describe("boundary faces across chunk seams", () => {
+  const ghost = (requestIndex: number) => ({
+    position: new Float32Array([0, 0, 0]),
+    attributes: [],
+    bridgeFromLocalVertex: 0,
+    requestIndex,
+  });
+
+  it("places each ghost corner at its post-append index", () => {
+    // Template entries: >= 0 is a local vertex, -(r+1) refers to request r.
+    // Ghosts land after the chunk's own vertices, in fetch order.
+    const faces = resolveBoundaryFaces(
+      [Int32Array.from([2, -1, -2])],
+      [ghost(0), ghost(1)],
+      10,
+    );
+    expect(Array.from(faces)).toEqual([2, 10, 11]);
+  });
+
+  it("drops a face whose ghost never arrived rather than drawing it wrong", () => {
+    // Request 1's neighbour chunk was sparse, so only request 0 came back. The
+    // face that needed request 1 must vanish; the other must survive.
+    const faces = resolveBoundaryFaces(
+      [Int32Array.from([0, -1, -2]), Int32Array.from([1, 2, -1])],
+      [ghost(0)],
+      5,
+    );
+    expect(Array.from(faces)).toEqual([1, 2, 5]);
+  });
+
+  it("fans a boundary quad the same way an intra-chunk one is fanned", () => {
+    const faces = resolveBoundaryFaces(
+      [Int32Array.from([0, 1, -1, 3])],
+      [ghost(0)],
+      7,
+    );
+    expect(Array.from(faces)).toEqual([0, 1, 7, 0, 7, 3]);
+  });
+
+  it("appends ghost corners as real vertices and keeps the existing faces", () => {
+    const base = buildGeometryChunk({
+      rank: 3,
+      positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
+      fragmentIndex: buildFragmentIndex([{ range: { start: 0, count: 3 } }]),
+      linksConvention: "explicit",
+      geometryKind: "mesh",
+      vertexAttributes: [new Float32Array([1, 2, 3])],
+      segmentIds: Uint32Array.from([7, 0, 7, 0, 7, 0]),
+      faces: new Uint32Array([0, 1, 2]),
+      faceArity: 3,
+    });
+    const appended = appendBoundaryFaces(
+      base,
+      [
+        {
+          position: new Float32Array([5, 5, 5]),
+          attributes: [new Float32Array([9])],
+          bridgeFromLocalVertex: 1,
+          requestIndex: 0,
+        },
+      ],
+      new Uint32Array([0, 1, 3]),
+    );
+    expect(appended.numVertices).toBe(4);
+    expect(Array.from(appended.positions.slice(9))).toEqual([5, 5, 5]);
+    expect(Array.from(appended.vertexAttributes[0] as Float32Array)).toEqual([
+      1, 2, 3, 9,
+    ]);
+    // The ghost belongs to the same surface as the corner that pulled it in.
+    expect(Array.from(appended.segmentIds!.slice(6))).toEqual([7, 0]);
+    expect(appended.numFaces).toBe(2);
+    expect(Array.from(appended.faces!)).toEqual([0, 1, 2, 0, 1, 3]);
+    // A surface still has no edges to draw.
+    expect(appended.numEdges).toBe(0);
   });
 });

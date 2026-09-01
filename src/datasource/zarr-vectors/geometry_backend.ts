@@ -9,13 +9,13 @@
  * Worker-side `SharedObject` chunk-source backends for zarr-vectors
  * skeleton / polyline / streamline rendering.  Provides:
  *
- * - `ZarrVectorsSpatiallyIndexedSkeletonSourceBackend` — the **pass-1**
+ * - `ZarrVectorsSpatialGeometrySourceBackend` — the **pass-1**
  *   backing store.  Subclasses neuroglancer's existing
  *   `SpatiallyIndexedSkeletonSourceBackend` and overrides `download()`
  *   to fetch + decode zarr-vectors chunks via the
- *   `downloadSkeletonChunk()` orchestrator.
+ *   `downloadGeometryChunk()` orchestrator.
  *
- * - `ZarrVectorsObjectKeyedSkeletonSourceBackend` — the **pass-2**
+ * - `ZarrVectorsObjectKeyedGeometrySourceBackend` — the **pass-2**
  *   backing store, intentionally **not implemented in this slice**.
  *   Will subclass `SkeletonSource` once the `object_index/manifests`
  *   zarr-vlen-bytes reader is in place (slice 4b).
@@ -28,13 +28,38 @@ import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
 import { requestAsyncComputation } from "#src/async_computation/request.js";
 import { WithParameters } from "#src/chunk_manager/backend.js";
 import {
-  ZarrVectorsObjectKeyedSkeletonSourceParameters,
-  ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
+  ZarrVectorsObjectKeyedGeometrySourceParameters,
+  ZarrVectorsSpatialGeometrySourceParameters,
   type ZarrVectorsLinkDtype,
   type ZarrVectorsLinksConvention,
-  type ZarrVectorsSkeletonGeometryKind,
+  type ZarrVectorsGeometryKind,
+  ZARR_VECTORS_GET_OBJECT_NODES_RPC_ID,
 } from "#src/datasource/zarr-vectors/base.js";
-import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
+import { ChunkCoalescingCache } from "#src/datasource/zarr-vectors/chunk_coalescing_cache.js";
+import {
+  appendBoundaryFaces,
+  appendGhostVertices,
+  resolveBoundaryFaces,
+  appendIntraChunkEdges,
+  recomputeTangentsForBridges,
+  type ResolvedBridge,
+  type AttributeTypedArray,
+  type SkeletonChunk as DecodedGeometryChunk,
+} from "#src/datasource/zarr-vectors/geometry_chunk.js";
+import {
+  downloadGeometryChunk,
+  fetchGhostVertices,
+  type AttributeDtype,
+  type GhostVertexRequest,
+  type LinkDtype,
+} from "#src/datasource/zarr-vectors/geometry_chunk_download.js";
+import {
+  hasSynthesisedTangent,
+  isSurfaceGeometry,
+  KIND_CAPABILITIES,
+} from "#src/datasource/zarr-vectors/geometry_kind.js";
+import { buildSpatialSkeletonNodes } from "#src/datasource/zarr-vectors/geometry_nodes.js";
+import { downloadSegmentSkeleton } from "#src/datasource/zarr-vectors/geometry_segment_download.js";
 import {
   createCrossChunkLinksCaches,
   readCrossChunkLinks,
@@ -42,27 +67,15 @@ import {
   type CrossChunkLinksCaches,
   type CrossChunkLinksTable,
 } from "#src/datasource/zarr-vectors/links.js";
-import {
-  appendGhostVertices,
-  appendIntraChunkEdges,
-  recomputeTangentsForBridges,
-  type ResolvedBridge,
-} from "#src/datasource/zarr-vectors/skeleton_chunk.js";
-import { ChunkCoalescingCache } from "#src/datasource/zarr-vectors/chunk_coalescing_cache.js";
-import {
-  downloadSkeletonChunk,
-  fetchGhostVertices,
-  type AttributeDtype,
-  type GhostVertexRequest,
-  type LinkDtype,
-} from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
-import { downloadSegmentSkeleton } from "#src/datasource/zarr-vectors/skeleton_segment_download.js";
+import { objectRank } from "#src/datasource/zarr-vectors/object_admission.js";
+import { filterChunkByAdmittedObjects } from "#src/datasource/zarr-vectors/object_filter.js";
 import {
   ShardCellReader,
   type CellReader,
 } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 import { WithSharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
 import { joinBaseUrlAndPath } from "#src/kvstore/url.js";
+import type { SpatiallyIndexedSkeletonNode } from "#src/skeleton/api.js";
 import type {
   SkeletonChunk,
   SpatiallyIndexedSkeletonChunk,
@@ -71,7 +84,9 @@ import {
   SkeletonSource,
   SpatiallyIndexedSkeletonSourceBackend,
 } from "#src/skeleton/backend.js";
-import { registerSharedObject } from "#src/worker_rpc.js";
+import type { ProgressOptions } from "#src/util/progress_listener.js";
+import type { RPC } from "#src/worker_rpc.js";
+import { registerPromiseRPC, registerSharedObject } from "#src/worker_rpc.js";
 
 const ZSTD_MAGIC = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]);
 
@@ -233,9 +248,9 @@ function asAttributeDtype(d: string): AttributeDtype {
  * "direction at this vertex" abstraction.
  */
 @registerSharedObject()
-export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParameters(
+export class ZarrVectorsSpatialGeometrySourceBackend extends WithParameters(
   WithSharedKvStoreContextCounterpart(SpatiallyIndexedSkeletonSourceBackend),
-  ZarrVectorsSpatiallyIndexedSkeletonSourceParameters,
+  ZarrVectorsSpatialGeometrySourceParameters,
 ) {
   /**
    * Shared shard-discovery / shard-byte caches for this level's
@@ -262,7 +277,7 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
    * `CrossChunkLinksCaches` docstring for the full rationale.
    *
    * Mirror of the same field on
-   * {@link ZarrVectorsObjectKeyedSkeletonSourceBackend}; the two
+   * {@link ZarrVectorsObjectKeyedGeometrySourceBackend}; the two
    * backends share a parameter type's ``baseUrl`` for the same store
    * level, but each holds its own cache instance.
    */
@@ -295,6 +310,150 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
       );
     }
     return reader.read;
+  }
+
+  /** See {@link ObjectIndexResolver}. */
+  private objectIndex = new ObjectIndexResolver();
+
+  /**
+   * Shared across the editing UI's per-object reads, for the same reason the
+   * pass-2 source has one: a tract's manifest names many spatial chunks, and
+   * neighbouring tracts name the same ones.
+   */
+  private nodeChunkCache = new ChunkCoalescingCache<
+    Awaited<ReturnType<typeof downloadGeometryChunk>>
+  >();
+
+  /**
+   * Session-stable id bases for synthesised node ids, keyed by dense object
+   * index.
+   *
+   * ZVF has no per-vertex identity -- a vertex is only `(level, chunk coords,
+   * row index)`, and coarser levels replace vertices with bin centroids -- so
+   * until a store carries a real id column these ids are minted here. They must
+   * be unique ACROSS objects, because the edit overlay keys one `Map` by node id
+   * for every segment it holds (`segment_overlay.ts`), so each object gets a
+   * disjoint range rather than restarting at 1. Retaining the base means
+   * re-reading an object after its chunks were evicted yields the same ids
+   * within a session; across sessions it does not, which is exactly why an
+   * editable store must supply its own ids.
+   */
+  private nodeIdBases = new Map<number, number>();
+  private nextNodeIdBase = 0;
+
+  /**
+   * One object's geometry, as the rooted node tree the spatial-skeleton editing
+   * UI consumes. Backs `getSkeleton` on the frontend source; see
+   * `spatial_skeleton_manager.getFullSegmentNodes`, its only caller.
+   *
+   * Reads through the pass-2 aggregation path (`downloadSegmentSkeleton`)
+   * rather than the resident pass-1 chunks: the UI wants the WHOLE object at
+   * full detail, and pass 1 holds only what the camera admitted, decimated to
+   * the level in view.
+   */
+  async getObjectSkeletonNodes(
+    objectId: bigint,
+    signal: AbortSignal,
+  ): Promise<SpatiallyIndexedSkeletonNode[]> {
+    const {
+      baseUrl,
+      rank,
+      attributeNames,
+      attributeDtypes,
+      linksConvention,
+      geometryKind,
+      linkDtype,
+      hasFragmentSegmentIds,
+    } = this.parameters;
+    if (
+      !KIND_CAPABILITIES[geometryKind as ZarrVectorsGeometryKind].hasObjectModel
+    ) {
+      // A point cloud has no `object_index/manifests` to resolve an id
+      // against: every vertex is its own segment. There are no nodes to
+      // inspect, so answer empty rather than 404 on the manifest read.
+      return [];
+    }
+    if (linksConvention === "explicit") {
+      // `explicit` keeps EVERY edge in the links family, so reconstructing one
+      // object means the whole-level decode documented on
+      // `ZarrVectorsObjectKeyedGeometrySourceBackend.crossChunkLinks_` --
+      // tens of millions of records, multiple gigabytes. Refuse rather than
+      // hang the worker on the first node inspection.
+      throw new Error(
+        "zarr-vectors: reading a skeleton for editing is not supported for " +
+          "`explicit` link stores; every edge would require a whole-level " +
+          "links decode.",
+      );
+    }
+    const kvStoreRead = makeKvStoreRead(baseUrl, this.sharedKvStoreContext);
+    const { numObjects, chunkSize } = await readManifestArrayShape(
+      baseUrl,
+      this.sharedKvStoreContext,
+      signal,
+    );
+    const oid = await this.objectIndex.resolve(
+      objectId,
+      numObjects,
+      kvStoreRead,
+      signal,
+    );
+    if (oid === undefined) return [];
+
+    const aggregated = await downloadSegmentSkeleton(
+      oid,
+      {
+        manifestReader: { numObjects, chunkSize, sidNdim: rank, kvStoreRead },
+        cellRead: this.cellRead,
+        rank,
+        linkDtype: asLinkDtype(linkDtype),
+        attributeNames,
+        attributeDtypes: attributeDtypes.map(asAttributeDtype),
+        linksConvention: linksConvention as ZarrVectorsLinksConvention,
+        geometryKind: geometryKind as ZarrVectorsGeometryKind,
+        // Not fetched. `implicit_sequential` reconstructs its cross-chunk
+        // edges from manifest block order instead. For
+        // `implicit_sequential_with_branches` the intra-chunk branch links
+        // arrive with each decoded chunk, so an object living in ONE chunk --
+        // which is what the edit prototype writes -- is complete; an object
+        // spanning several would come back missing the edges BETWEEN chunks,
+        // i.e. as one component per chunk. Fetching the table to fix that is
+        // the whole-level decode this method refuses above.
+        crossChunkLinks: undefined,
+        hasFragmentSegmentIds,
+        chunkCache: this.nodeChunkCache,
+      },
+      signal,
+    );
+    if (aggregated === undefined) return [];
+
+    const numVertices = Math.floor(aggregated.vertexPositions.length / rank);
+    let idOffset = this.nodeIdBases.get(oid);
+    if (idOffset === undefined) {
+      idOffset = this.nextNodeIdBase;
+      this.nodeIdBases.set(oid, idOffset);
+      this.nextNodeIdBase += numVertices;
+    }
+
+    // The UI's segment ids are `number`-typed throughout the editing path
+    // (`normalizeIdentifier` in `command_history.ts` rejects anything else), so
+    // an id past 2^53 cannot round-trip. Say so rather than silently aliasing
+    // two objects onto one segment.
+    const segmentId = Number(objectId);
+    if (!Number.isSafeInteger(segmentId) || segmentId <= 0) {
+      throw new Error(
+        `zarr-vectors: object id ${objectId} cannot be edited -- the editing ` +
+          "path carries segment ids as JavaScript numbers, so ids must be " +
+          "positive and below 2^53.",
+      );
+    }
+
+    return buildSpatialSkeletonNodes({
+      vertexPositions: aggregated.vertexPositions,
+      indices: aggregated.indices,
+      rank,
+      segmentId,
+      idOffset,
+    });
   }
 
   private async getCrossChunkLinksForChunk(
@@ -465,6 +624,122 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
     };
   }
 
+  /**
+   * Plan the ghost fetches for a surface chunk's BOUNDARY faces.
+   *
+   * A face whose corners do not all sit in one chunk is an ordinary record in
+   * the links family, filed under the offsets naming where its other corners
+   * live (spec: geometry_types/mesh.md). Each foreign corner becomes a ghost
+   * request; the face itself is held as a template of corner references --
+   * a non-negative entry is a local vertex, a negative entry `-(r + 1)` is the
+   * ghost answering request `r` -- because a request may be dropped (sparse
+   * neighbour) and the face must then be dropped with it rather than drawn
+   * against a wrong vertex.
+   */
+  private buildFaceBridgeRequests(
+    table: CrossChunkLinksTable,
+    selfChunkCoords: Float32Array,
+    selfNumVertices: number,
+  ): { ghostRequests: GhostVertexRequest[]; faceTemplates: Int32Array[] } {
+    const selfCoords = Array.from(selfChunkCoords, (v) => Number(v));
+    const ghostRequests: GhostVertexRequest[] = [];
+    const faceTemplates: Int32Array[] = [];
+    // One request per distinct foreign vertex: a corner is commonly shared by
+    // several boundary faces, and refetching it per face would multiply the
+    // ghost count (and the vertex texture) for nothing.
+    const requestByForeignVertex = new Map<string, number>();
+    for (const record of table.records) {
+      const { endpoints } = record;
+      if (endpoints.length < 3) continue;
+      // Any local corner will do as the ghost's host: it is used only to
+      // inherit a segment id, and every corner of a face is the same object.
+      let hostLocalVertex = -1;
+      for (const endpoint of endpoints) {
+        if (
+          endpointMatchesChunk(endpoint.chunkCoords, selfCoords) &&
+          endpoint.vertexIndex >= 0 &&
+          endpoint.vertexIndex < selfNumVertices
+        ) {
+          hostLocalVertex = endpoint.vertexIndex;
+          break;
+        }
+      }
+      // No corner here: the face belongs to another chunk, which will draw it.
+      if (hostLocalVertex < 0) continue;
+
+      const template = new Int32Array(endpoints.length);
+      let usable = true;
+      for (let i = 0; i < endpoints.length; ++i) {
+        const endpoint = endpoints[i];
+        if (endpointMatchesChunk(endpoint.chunkCoords, selfCoords)) {
+          if (
+            endpoint.vertexIndex < 0 ||
+            endpoint.vertexIndex >= selfNumVertices
+          ) {
+            usable = false;
+            break;
+          }
+          template[i] = endpoint.vertexIndex;
+          continue;
+        }
+        const foreignKey = `${endpoint.chunkCoords.join(".")}/${endpoint.vertexIndex}`;
+        let requestIndex = requestByForeignVertex.get(foreignKey);
+        if (requestIndex === undefined) {
+          requestIndex = ghostRequests.length;
+          ghostRequests.push({
+            hostLocalVertex,
+            neighborChunkKey: endpoint.chunkCoords.join("."),
+            neighborLocalVertex: endpoint.vertexIndex,
+          });
+          requestByForeignVertex.set(foreignKey, requestIndex);
+        }
+        template[i] = -(requestIndex + 1);
+      }
+      if (usable) faceTemplates.push(template);
+    }
+    return { ghostRequests, faceTemplates };
+  }
+
+  /**
+   * `chunk` reduced to the objects THIS level is responsible for drawing.
+   *
+   * The levels of a per-object pyramid are nested, so drawing each of them
+   * whole would draw the coarse backbone once per level. Instead each level
+   * draws only the objects that are NEW at it -- present here and absent from
+   * the next level up -- and the union across levels is exactly the admitted
+   * set, with every object drawn exactly once, at exactly one level.
+   *
+   * That partition is what makes the load coarse-to-fine. The coarse levels are
+   * tiny (tens of tracts, under a megabyte) so they appear at once and the whole
+   * volume is populated immediately; each finer level then adds its own share on
+   * top without redrawing what is already there. Picking a single level instead
+   * means nothing at all is visible until that level's chunks arrive, which for
+   * the finest level is gigabytes.
+   *
+   * `currentAdmissionFraction` carries both the mode and the ration: negative
+   * disables the partition entirely (LOCAL focus, where one level is drawn whole
+   * per cell), `1` keeps every object new at this level, and a value in between
+   * keeps that share of them -- used only at the finest admitted level, where
+   * the budget runs out partway.
+   */
+  private admitObjects(decoded: DecodedGeometryChunk): DecodedGeometryChunk {
+    const fraction = this.currentAdmissionFraction;
+    const coarser = this.parameters.coarserMembership;
+    if (fraction < 0 || coarser === undefined) return decoded;
+    const addressableIds = coarser.length * 8;
+    const ration = fraction < 1;
+    return filterChunkByAdmittedObjects(decoded, (low, high) => {
+      // An id the membership bitset cannot address is KEPT. Rationing it would
+      // be a decision made on no information, and dropping it could lose
+      // geometry no other level is drawing. Note `low >>> 3`: ids at or above
+      // 2^31 are negative as signed int32 and would index before the array.
+      if (high !== 0 || low < 0 || low >= addressableIds) return true;
+      // Present in the coarser level => that level draws it, not this one.
+      if (((coarser[low >>> 3] >> (low & 7)) & 1) !== 0) return false;
+      return ration ? objectRank(low) < fraction : true;
+    });
+  }
+
   async download(
     chunk: SpatiallyIndexedSkeletonChunk,
     signal: AbortSignal,
@@ -478,6 +753,8 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
       geometryKind,
       linkDtype,
       hasFragmentSegmentIds,
+      vertexIdAttribute,
+      linkWidth,
     } = this.parameters;
     const { chunkGridPosition } = chunk;
     const chunkKey = Array.from(chunkGridPosition, (v) => String(v)).join(".");
@@ -492,7 +769,7 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
     const kvStoreList = makeKvStoreList(baseUrl, this.sharedKvStoreContext);
     const cellRead = this.cellRead;
 
-    const decoded = await downloadSkeletonChunk(
+    const decoded = await downloadGeometryChunk(
       {
         chunkKey,
         rank,
@@ -500,8 +777,10 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
         attributeNames,
         attributeDtypes: attributeDtypes.map(asAttributeDtype),
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
-        geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
+        geometryKind: geometryKind as ZarrVectorsGeometryKind,
         hasFragmentSegmentIds,
+        vertexIdAttribute,
+        linkWidth,
         cellRead,
       },
       signal,
@@ -533,7 +812,35 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
       kvStoreList,
       signal,
     );
-    if (table !== undefined) {
+    if (table !== undefined && isSurfaceGeometry(geometryKind)) {
+      // Boundary faces: the surface analogue of the bridge logic below. Kept
+      // separate because the two resolve different things -- a bridge is one
+      // edge to one ghost with a walk direction, a boundary face is up to three
+      // corners in three chunks with no direction at all.
+      const { ghostRequests, faceTemplates } = this.buildFaceBridgeRequests(
+        table,
+        chunkGridPosition,
+        decoded.numVertices,
+      );
+      if (faceTemplates.length > 0) {
+        const ghosts = await fetchGhostVertices(
+          ghostRequests,
+          {
+            rank,
+            attributeNames,
+            attributeDtypes: attributeDtypes.map(asAttributeDtype),
+            cellRead,
+          },
+          signal,
+        );
+        const extraFaces = resolveBoundaryFaces(
+          faceTemplates,
+          ghosts,
+          withBridges.numVertices,
+        );
+        withBridges = appendBoundaryFaces(withBridges, ghosts, extraFaces);
+      }
+    } else if (table !== undefined) {
       const {
         ghostRequests,
         intraChunkEdges,
@@ -620,8 +927,31 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
       }
     }
 
-    chunk.vertexPositions = withBridges.positions;
-    chunk.indices = withBridges.edges;
+    // Per-object admission: drop the objects the memory budget did not buy.
+    //
+    // Last, on the fully assembled chunk, because a ghost vertex inherits its
+    // host's segment id -- so a cross-chunk bridge is kept or dropped together
+    // with the tract it belongs to, and admitted tracts stay continuous across
+    // cell boundaries with no separate reasoning about bridges. Inert unless a
+    // fraction below 1 is in force, so every other store and mode decodes
+    // byte-identically.
+    const drawn = this.admitObjects(withBridges);
+
+    // Node identity survives only while the vertex array is the one it was
+    // decoded against. The bridge and admission transforms above may append or
+    // drop vertices, and each drops `nodeIds` when it can no longer vouch for
+    // the alignment, so this assignment is either correct or absent.
+    if (
+      drawn.nodeIds !== undefined &&
+      drawn.nodeIds.length === drawn.numVertices
+    ) {
+      chunk.nodeIds = drawn.nodeIds;
+    }
+    chunk.vertexPositions = drawn.positions;
+    // `indices` carries whatever primitive this geometry draws: vertex pairs
+    // for lines, vertex triples for a surface. The render layer knows which
+    // from the source's `geometryPrimitive`, so one field serves both.
+    chunk.indices = drawn.faces ?? drawn.edges;
     // Order: synthesised tangent first (streamline/polyline only), then
     // user-declared attributes in declaration order, then the synthesised
     // per-vertex `"segment"` column last.  The frontend
@@ -637,32 +967,77 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceBackend extends WithParame
       | Int16Array
       | Int32Array
     )[] = [];
-    if (withBridges.tangents !== undefined) {
-      attrs.push(withBridges.tangents);
+    if (drawn.tangents !== undefined) {
+      attrs.push(drawn.tangents);
     }
-    for (const a of withBridges.vertexAttributes) attrs.push(a);
-    if (withBridges.segmentIds !== undefined) {
-      attrs.push(withBridges.segmentIds);
+    for (const a of drawn.vertexAttributes) attrs.push(a);
+    if (drawn.segmentIds !== undefined) {
+      attrs.push(drawn.segmentIds);
     }
     chunk.vertexAttributes = attrs;
 
-    // Retain a slim view of this chunk's geometry for the ROI streamline
-    // filter: the render-layer backend re-tests it whenever the ROI list
-    // changes, so the filter runs within memory without refetching. Only when
-    // a segment column exists — otherwise geometry cannot be attributed to an
-    // object and there is nothing to test. The decoded `SkeletonChunk` already
-    // has exactly the `RoiFilterableChunk` shape, and these references stay
-    // valid after serialize (see `roiFilterableChunk`'s docstring).
-    if (withBridges.segmentIds !== undefined) {
+    // Retain a slim view of this chunk's geometry for the ROI filter: the
+    // render-layer backend re-tests it whenever the ROI list changes, so the
+    // filter runs within memory without refetching. Only when a segment column
+    // exists — otherwise geometry cannot be attributed to an object and there
+    // is nothing to test. The decoded `SkeletonChunk` already has exactly the
+    // `RoiFilterableChunk` shape, and these references stay valid after
+    // serialize (see `roiFilterableChunk`'s docstring).
+    if (drawn.segmentIds !== undefined) {
+      const caps = KIND_CAPABILITIES[geometryKind as ZarrVectorsGeometryKind];
       chunk.roiFilterableChunk = {
         rank,
-        numVertices: withBridges.numVertices,
-        positions: withBridges.positions,
-        segmentIds: withBridges.segmentIds,
-        fragmentIndex: withBridges.fragmentIndex,
+        numVertices: drawn.numVertices,
+        positions: drawn.positions,
+        segmentIds: drawn.segmentIds,
+        fragmentIndex: drawn.fragmentIndex,
+        // Without the object model the segment column holds one id per VERTEX,
+        // so the fold must run per vertex; see `perVertexObjects`.
+        perVertexObjects: !caps.hasObjectModel,
+        surfaceVertices: caps.primitive === "triangles",
+        // Per-vertex attribute values, for attribute predicates. Retained only
+        // for the kinds with no per-OBJECT attribute tier to read instead: the
+        // arrays are otherwise dropped after `serialize` transfers its packed
+        // copy, so keeping them is real worker RAM (`downloadSucceeded` charges
+        // it) and a store that can answer from `object_attributes/` must not
+        // pay it. Keyed by the on-disk attribute name — what the filter state
+        // persists, and stable across the pyramid.
+        ...(caps.hasObjectModel
+          ? {}
+          : {
+              vertexAttributes: retainedVertexAttributes(
+                attributeNames,
+                drawn.vertexAttributes,
+              ),
+            }),
       };
     }
   }
+}
+
+/**
+ * The per-vertex attribute columns to retain for attribute predicates, keyed by
+ * on-disk attribute name.
+ *
+ * Everything the reader decodes is already float32 (`vertex_attribute_float.ts`),
+ * so the common case aliases the decoded array rather than copying it -- the
+ * retention then costs nothing beyond keeping it reachable past `serialize`.
+ * A narrower array (a store read by an older path) is widened once here so the
+ * filter has one representation to test against.
+ */
+function retainedVertexAttributes(
+  attributeNames: readonly string[],
+  columns: readonly AttributeTypedArray[],
+): Map<string, Float32Array> {
+  const retained = new Map<string, Float32Array>();
+  for (let i = 0; i < attributeNames.length && i < columns.length; ++i) {
+    const column = columns[i];
+    retained.set(
+      attributeNames[i],
+      column instanceof Float32Array ? column : Float32Array.from(column),
+    );
+  }
+  return retained;
 }
 
 /**
@@ -683,6 +1058,85 @@ function endpointMatchesChunk(
 }
 
 /**
+ * Resolves a selected segment id to the dense object index the manifests are
+ * keyed by, caching the store's ``object_attributes/segment_id`` column.
+ *
+ * Shared by both backends: the per-object (pass-2) source resolves an id per
+ * download, and the spatially-indexed (pass-1) source resolves one per
+ * `getSkeleton` call for the editing UI. Each backend owns an instance, so the
+ * cached column is amortized within a source but never shared across levels.
+ */
+class ObjectIndexResolver {
+  /**
+   * Cached ``object_attributes/segment_id`` array (uint64, dense-OID
+   * order → sorted ascending) mapping the dense object index ↔ the
+   * original (e.g. flywire) segment id.  ``null`` = no such attribute
+   * (selected id IS the dense index — identity); ``undefined`` = not yet
+   * probed.
+   */
+  private segmentIds_: BigUint64Array | null | undefined;
+
+  /**
+   * Resolve a selected segment id to its dense object index.  When the
+   * store carries ``object_attributes/segment_id`` (standard object-index
+   * convention) binary-search the sorted ids; otherwise the id IS the
+   * dense index.  Returns ``undefined`` when the id is absent.
+   */
+  async resolve(
+    objectId: number | bigint,
+    numObjects: number,
+    kvStoreRead: (
+      subpath: string,
+      signal: AbortSignal,
+    ) => Promise<Uint8Array | undefined>,
+    signal: AbortSignal,
+  ): Promise<number | undefined> {
+    if (this.segmentIds_ === undefined) {
+      // `object_attributes/<name>/` is itself a zarr v3 array, NOT a group
+      // wrapping a nested `data/` array — the same layout the frontend reads
+      // and documents in `buildSegmentPropertyMap`. The old
+      // `.../segment_id/data/c/0` spelling matched nothing, so every read
+      // returned undefined, `segmentIds_` latched to null, and the identity
+      // fallback below took over. For a connectomics store that fallback
+      // cannot work: the ids are root ids of order 1e17 while `numObjects` is
+      // a few thousand, so `target < numObjects` is false and EVERY object
+      // lookup resolved to undefined.
+      //
+      // `kvStoreRead` already zstd-decompresses (see `makeKvStoreRead`), and
+      // the chunk is writer-padded to its full `chunk_shape` (65536), which
+      // the length check and `slice` below trim to the real object count.
+      const bytes = await kvStoreRead(
+        "object_attributes/segment_id/c/0",
+        signal,
+      );
+      if (bytes === undefined || bytes.byteLength < numObjects * 8) {
+        this.segmentIds_ = null;
+      } else {
+        const copy = bytes.slice(0, numObjects * 8);
+        this.segmentIds_ = new BigUint64Array(copy.buffer);
+      }
+    }
+    const ids = this.segmentIds_;
+    const target = BigInt(objectId);
+    if (ids === null) {
+      return target >= 0n && target < BigInt(numObjects)
+        ? Number(target)
+        : undefined;
+    }
+    let lo = 0;
+    let hi = ids.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const v = ids[mid];
+      if (v === target) return mid;
+      if (v < target) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return undefined;
+  }
+}
+
+/**
  * Per-segment (object-keyed) skeleton chunk source — the **pass-2**
  * backing store.  One chunk per `objectId`.  The render layer (a
  * subclass of `SkeletonLayer`) iterates `forEachVisibleSegment` and
@@ -697,10 +1151,17 @@ function endpointMatchesChunk(
  * these fields before constructing the source.
  */
 @registerSharedObject()
-export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
+export class ZarrVectorsObjectKeyedGeometrySourceBackend extends WithParameters(
   WithSharedKvStoreContextCounterpart(SkeletonSource),
-  ZarrVectorsObjectKeyedSkeletonSourceParameters,
+  ZarrVectorsObjectKeyedGeometrySourceParameters,
 ) {
+  /**
+   * This source draws ON TOP OF a coarse pass-1 bulk that shares the same chunk
+   * budget, so its chunks must never outbid that bulk. `SkeletonLayer` reads
+   * this to anchor their priority; see `getSkeletonChunkPriority`.
+   */
+  readonly drawsOverSpatialBulk = true;
+
   /**
    * Shared across this source's concurrent object downloads.
    *
@@ -710,7 +1171,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
    * transfer, is what made a large full-detail set unusable.
    */
   private chunkCoalescingCache = new ChunkCoalescingCache<
-    Awaited<ReturnType<typeof downloadSkeletonChunk>>
+    Awaited<ReturnType<typeof downloadGeometryChunk>>
   >();
   /**
    * Cached decoded ``cross_chunk_links/0/`` table for this level.  Read
@@ -744,6 +1205,9 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
    */
   private crossChunkLinks_: CrossChunkLinksTable | null | undefined;
 
+  /** See {@link ObjectIndexResolver}. */
+  private objectIndex = new ObjectIndexResolver();
+
   private cellReader_: ShardCellReader | undefined;
   /**
    * One {@link ShardCellReader} per source (amortizes the per-shard index
@@ -771,61 +1235,6 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       );
     }
     return reader.read;
-  }
-
-  /**
-   * Cached ``object_attributes/segment_id`` array (uint64, dense-OID
-   * order → sorted ascending) mapping the dense object index ↔ the
-   * original (e.g. flywire) segment id.  ``null`` = no such attribute
-   * (selected id IS the dense index — identity); ``undefined`` = not yet
-   * probed.
-   */
-  private segmentIds_: BigUint64Array | null | undefined;
-
-  /**
-   * Resolve a selected segment id to its dense object index.  When the
-   * store carries ``object_attributes/segment_id`` (standard object-index
-   * convention) binary-search the sorted ids; otherwise the id IS the
-   * dense index.  Returns ``undefined`` when the id is absent.
-   */
-  private async resolveObjectIndex(
-    objectId: number | bigint,
-    numObjects: number,
-    kvStoreRead: (
-      subpath: string,
-      signal: AbortSignal,
-    ) => Promise<Uint8Array | undefined>,
-    signal: AbortSignal,
-  ): Promise<number | undefined> {
-    if (this.segmentIds_ === undefined) {
-      const bytes = await kvStoreRead(
-        "object_attributes/segment_id/data/c/0",
-        signal,
-      );
-      if (bytes === undefined || bytes.byteLength < numObjects * 8) {
-        this.segmentIds_ = null;
-      } else {
-        const copy = bytes.slice(0, numObjects * 8);
-        this.segmentIds_ = new BigUint64Array(copy.buffer);
-      }
-    }
-    const ids = this.segmentIds_;
-    const target = BigInt(objectId);
-    if (ids === null) {
-      return target >= 0n && target < BigInt(numObjects)
-        ? Number(target)
-        : undefined;
-    }
-    let lo = 0;
-    let hi = ids.length - 1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      const v = ids[mid];
-      if (v === target) return mid;
-      if (v < target) lo = mid + 1;
-      else hi = mid - 1;
-    }
-    return undefined;
   }
 
   private async getCrossChunkLinks(
@@ -898,7 +1307,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
     // Map the selected segment id (e.g. a flywire uint64) to the dense
     // object index via object_attributes/segment_id before the manifest
     // lookup.  Out-of-store ids yield an empty skeleton.
-    const resolvedOid = await this.resolveObjectIndex(
+    const resolvedOid = await this.objectIndex.resolve(
       chunk.objectId,
       numObjects,
       kvStoreRead,
@@ -908,9 +1317,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       chunk.vertexPositions = new Float32Array(0);
       chunk.indices = new Uint32Array(0);
       chunk.vertexAttributes = attributeNames.map(() => new Float32Array(0));
-      if (
-        hasSynthesisedTangent(geometryKind as ZarrVectorsSkeletonGeometryKind)
-      ) {
+      if (hasSynthesisedTangent(geometryKind as ZarrVectorsGeometryKind)) {
         chunk.vertexAttributes = [
           new Float32Array(0),
           ...chunk.vertexAttributes,
@@ -934,7 +1341,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
         attributeNames,
         attributeDtypes: attributeDtypes.map(asAttributeDtype),
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
-        geometryKind: geometryKind as ZarrVectorsSkeletonGeometryKind,
+        geometryKind: geometryKind as ZarrVectorsGeometryKind,
         crossChunkLinks,
         hasFragmentSegmentIds,
         chunkCache: this.chunkCoalescingCache,
@@ -953,9 +1360,7 @@ export class ZarrVectorsObjectKeyedSkeletonSourceBackend extends WithParameters(
       // across passes even when an OID has no geometry.  See
       // `hasSynthesisedTangent` in `geometry_kind.ts` for the canonical
       // per-kind capability table.
-      if (
-        hasSynthesisedTangent(geometryKind as ZarrVectorsSkeletonGeometryKind)
-      ) {
+      if (hasSynthesisedTangent(geometryKind as ZarrVectorsGeometryKind)) {
         chunk.vertexAttributes = [
           new Float32Array(0),
           ...chunk.vertexAttributes,
@@ -1034,3 +1439,28 @@ async function readManifestArrayShape(
   }
   return { numObjects, chunkSize };
 }
+
+/**
+ * Request/response RPC backing `ZarrVectorsSpatialGeometrySource.getSkeleton`.
+ *
+ * A round trip rather than a chunk: the store lives in the worker, and the
+ * editing UI needs one named object's whole node list on demand -- not
+ * whatever the camera happens to have admitted.
+ */
+registerPromiseRPC(
+  ZARR_VECTORS_GET_OBJECT_NODES_RPC_ID,
+  async function (
+    this: RPC,
+    x: { source: number; objectId: string },
+    progressOptions: Partial<ProgressOptions>,
+  ) {
+    const source = this.get(
+      x.source,
+    ) as ZarrVectorsSpatialGeometrySourceBackend;
+    const nodes = await source.getObjectSkeletonNodes(
+      BigInt(x.objectId),
+      progressOptions.signal ?? new AbortController().signal,
+    );
+    return { value: { nodes }, transfers: [] };
+  },
+);

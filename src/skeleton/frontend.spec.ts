@@ -37,6 +37,7 @@ if (!("WebGL2RenderingContext" in globalThis)) {
 const {
   SpatiallyIndexedSkeletonLayer,
   getSpatialSkeletonCellKeyPrefix,
+  isUnsafeBareAttributeAlias,
   resolveSpatiallyIndexedSkeletonSegmentPick,
   computeDiagonalModelToGlobalMetersScale,
   maybeUpdateAutoSpatialSkeletonGridResolutionTarget,
@@ -162,13 +163,13 @@ describe("SpatiallyIndexedSkeletonLayer targeted source invalidation", () => {
         new Float32Array([100, 200, 300]),
         new Float32Array([100, 100, 100]),
       ),
-    ).toBe("1,2,3:");
+    ).toBe("1,2,3|");
     expect(
       getSpatialSkeletonCellKeyPrefix(
         new Float32Array([99.999, 199.999, 299.999]),
         new Float32Array([100, 100, 100]),
       ),
-    ).toBe("0,1,2:");
+    ).toBe("0,1,2|");
   });
 
   it("dedupes cell prefixes per unique source entry", () => {
@@ -206,12 +207,12 @@ describe("SpatiallyIndexedSkeletonLayer targeted source invalidation", () => {
     expect(invalidated).toBe(true);
     expect(invalidateCacheKeyPrefixes).toHaveBeenCalledTimes(1);
     expect([...invalidateCacheKeyPrefixes.mock.calls[0][0]]).toEqual([
-      "1,2,3:",
+      "1,2,3|",
     ]);
     expect(source2d.invalidateCacheKeyPrefixes).toHaveBeenCalledTimes(1);
     expect([...source2d.invalidateCacheKeyPrefixes.mock.calls[0][0]]).toEqual([
-      "2,4,6:",
-      "3,4,6:",
+      "2,4,6|",
+      "3,4,6|",
     ]);
     expect(redrawNeeded.dispatch).toHaveBeenCalledTimes(1);
   });
@@ -396,5 +397,40 @@ describe("maybeUpdateAutoSpatialSkeletonGridResolutionTarget bias stability", ()
 
     expect(bias.value).toBe(1);
     expect(target.value).toBeCloseTo(0.2, 10);
+  });
+});
+
+describe("isUnsafeBareAttributeAlias", () => {
+  it("withholds the bare alias for swizzle-shaped attribute names", () => {
+    // The real case: a tractogram shipping a per-vertex `z`. `#define z` is
+    // preprocessor-level, so it rewrote `d.z` in the colour-by-direction
+    // default into a member that does not exist -- the shader failed to
+    // compile and the layer fell back to per-object hash colours.
+    for (const name of ["x", "y", "z", "w", "r", "g", "b", "a", "s", "t"]) {
+      expect(isUnsafeBareAttributeAlias(name)).toBe(true);
+    }
+  });
+
+  it("withholds it for multi-component swizzles too", () => {
+    // `.xy` / `.rgb` are just as much a member access as `.z`.
+    expect(isUnsafeBareAttributeAlias("xy")).toBe(true);
+    expect(isUnsafeBareAttributeAlias("rgb")).toBe(true);
+    expect(isUnsafeBareAttributeAlias("xyzw")).toBe(true);
+  });
+
+  it("keeps it for names that cannot be a swizzle", () => {
+    // Ordinary attribute names stay usable bare, as they always were --
+    // withholding more than necessary would break existing hand-written
+    // shaders for no gain.
+    for (const name of ["arc_length", "fa", "tangent", "curvature", "xyzwr"]) {
+      expect(isUnsafeBareAttributeAlias(name)).toBe(false);
+    }
+  });
+
+  it("does not mix components from different swizzle sets", () => {
+    // `.xr` is not a legal swizzle, so `#define xr` cannot corrupt a member
+    // access.
+    expect(isUnsafeBareAttributeAlias("xr")).toBe(false);
+    expect(isUnsafeBareAttributeAlias("")).toBe(false);
   });
 });

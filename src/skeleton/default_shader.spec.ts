@@ -15,7 +15,10 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { resolveSkeletonDefaultShader } from "#src/skeleton/default_shader.js";
+import {
+  COLOR_BY_DIRECTION_SHADER,
+  resolveSkeletonDefaultShader,
+} from "#src/skeleton/default_shader.js";
 
 const DIRECTIONAL = "void main() { emitRGB(abs(prop_tangent())); }";
 const OTHER = "void main() { emitRGB(vec3(1.0)); }";
@@ -59,5 +62,20 @@ describe("resolveSkeletonDefaultShader", () => {
 
   it("treats a lone abstention as no opinion", () => {
     expect(resolveSkeletonDefaultShader([undefined])).toBeUndefined();
+  });
+});
+
+describe("COLOR_BY_DIRECTION_SHADER", () => {
+  it("reads the tangent through the namespaced prop_ accessor", () => {
+    expect(COLOR_BY_DIRECTION_SHADER).toContain("prop_tangent()");
+  });
+
+  it("uses no swizzle, so an attribute name cannot rewrite it", () => {
+    // A per-vertex attribute is also exposed as a bare `#define`, so a store
+    // shipping a `z` column turned this shader's `d.z` into `d.<varying>`: it
+    // stopped compiling and the layer silently drew per-object hash colours.
+    // `isUnsafeBareAttributeAlias` withholds those aliases; keeping the
+    // default swizzle-free means it never depended on that in the first place.
+    expect(COLOR_BY_DIRECTION_SHADER).not.toMatch(/\.[xyzwrgbastpq]/);
   });
 });

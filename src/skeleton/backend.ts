@@ -39,7 +39,6 @@ import {
 // Inert for every other skeleton layer: the whole feature is guarded on the
 // per-layer `roiPassingSegments` shared set being present (undefined here).
 import {
-  selectHighDetail,
   computeGroupedPassingSet,
   computePerGroupPassingSets,
   diffPassingSet,
@@ -71,10 +70,14 @@ import {
 import type { SharedWatchableValue } from "#src/shared_watchable_value.js";
 import type { SpatialSkeletonSourceState } from "#src/skeleton/api.js";
 import {
+  forEachSpatialSkeletonVolumeCell,
   SKELETON_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_VERTEX_ATTR_STATS_RPC_ID,
+  SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR,
+  type VertexAttrStats,
 } from "#src/skeleton/base.js";
 import {
   freeSkeletonChunkSystemMemory,
@@ -84,8 +87,10 @@ import {
 } from "#src/skeleton/chunk_serialization.js";
 import {
   getSpatiallyIndexedSkeletonGridIndex,
+  getSpatiallyIndexedSkeletonPartitionsObjects,
   selectSpatiallyIndexedSkeletonEntriesByGridWithFallback,
 } from "#src/skeleton/source_selection.js";
+import { SpatialSkeletonDetailFocus } from "#src/skeleton/spatial_chunk_sizing.js";
 import {
   BASE_PRIORITY,
   deserializeTransformedSources,
@@ -123,6 +128,9 @@ export interface SpatiallyIndexedSkeletonChunkSpecification
 }
 
 const SKELETON_CHUNK_PRIORITY = 60;
+
+/** Re-downloads a failed spatially-indexed skeleton chunk is given. */
+const MAX_SPATIALLY_INDEXED_SKELETON_RETRIES = 3;
 const SPATIALLY_INDEXED_SKELETON_LOD_DEBOUNCE_MS = 300;
 const tempCenter = vec3.create();
 const tempChunkSize = vec3.create();
@@ -415,6 +423,29 @@ registerPromiseRPC(
   },
 );
 
+/**
+ * How many distinct values of one attribute to count before giving up.
+ *
+ * The count exists to tell a FLAG (two values) or a small category set from a
+ * measurement, and that question is answered long before a gene column's
+ * hundreds of thousands of distinct floats are enumerated.
+ */
+const VERTEX_ATTR_DISTINCT_LIMIT = 64;
+
+registerPromiseRPC(
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_VERTEX_ATTR_STATS_RPC_ID,
+  function (this: RPC, x: { layer: number; names: string[] }) {
+    const layer = this.get(
+      x.layer,
+    ) as SpatiallyIndexedSkeletonRenderLayerBackend;
+    // A scan of already-decoded columns; synchronous, like the export fold.
+    return Promise.resolve({
+      value: layer.computeRoiVertexAttrStats(x.names),
+      transfers: [],
+    });
+  },
+);
+
 // Chunk that contains the skeleton of a single object.
 export class SkeletonChunk extends Chunk implements SkeletonChunkData {
   objectId: bigint = 0n;
@@ -435,6 +466,8 @@ export class SkeletonChunk extends Chunk implements SkeletonChunkData {
     super.serialize(msg, transfers);
     serializeSkeletonChunkData(this, msg, transfers);
     freeSkeletonChunkSystemMemory(this);
+    // `systemMemoryBytes` deliberately left alone; see the note on
+    // `SpatiallyIndexedSkeletonChunk.serialize`.
   }
 
   downloadSucceeded() {
@@ -485,17 +518,28 @@ export class SkeletonLayer extends withSegmentationLayerBackendState(
     const priorityTier = getPriorityTier(visibility);
     const basePriority = getBasePriority(visibility);
     const { source, chunkManager } = this;
+    // A source that draws over a spatially-indexed bulk shares that bulk's chunk
+    // budget, and every pass-1 chunk is anchored at `BASE_PRIORITY` (-1e12) so
+    // that skeletons compete with image and mesh layers on equal terms. Leaving
+    // this path at the unanchored `+60` put it a full 1e12 ABOVE the geometry it
+    // is meant to embellish, so populating the high-detail set evicted the
+    // background wholesale and never the reverse. Anchoring puts it just above
+    // the finest pass-1 level and below the level actually being drawn (which
+    // carries `SCALE_PRIORITY_MULTIPLIER * scaleIndex`, scaleIndex >= 1 whenever
+    // a finer level exists). Ordinary skeleton layers, which have no bulk to
+    // sit on top of, keep the upstream priority unchanged.
+    const priority =
+      (source as { drawsOverSpatialBulk?: boolean }).drawsOverSpatialBulk ===
+      true
+        ? basePriority + BASE_PRIORITY + SKELETON_CHUNK_PRIORITY
+        : basePriority + SKELETON_CHUNK_PRIORITY;
     forEachVisibleSegment(this, (objectId) => {
       const chunk = source.getChunk(objectId);
       ++this.numVisibleChunksNeeded;
       if (chunk.state === ChunkState.GPU_MEMORY) {
         ++this.numVisibleChunksAvailable;
       }
-      chunkManager.requestChunk(
-        chunk,
-        priorityTier,
-        basePriority + SKELETON_CHUNK_PRIORITY,
-      );
+      chunkManager.requestChunk(chunk, priorityTier, priority);
     });
   }
 }
@@ -534,9 +578,10 @@ export class SpatiallyIndexedSkeletonChunk
   vertexPositions: Float32Array | null = null;
   vertexAttributes: TypedNumberArray[] | null = null;
   indices: Uint32Array | null = null;
-  lod: number = 0;
   requestGeneration = -1;
   requestOwners = SpatiallyIndexedSkeletonChunkRequestOwner.NONE;
+  /** Downloads of this chunk that ended in `FAILED`; see `retryFailedChunks`. */
+  failedAttempts = 0;
   nodeIds: Int32Array | undefined;
   nodeSourceStates: Array<SpatialSkeletonSourceState | undefined> | undefined;
 
@@ -567,18 +612,43 @@ export class SpatiallyIndexedSkeletonChunk
     super.serialize(msg, transfers);
     serializeSkeletonChunkData(this, msg, transfers);
     freeSkeletonChunkSystemMemory(this);
+    // `systemMemoryBytes` is deliberately NOT reduced here.
+    //
+    // It looks like double-charging: a `GPU_MEMORY` chunk is billed against both
+    // capacities (`adjustCapacitiesForChunk` in `chunk_manager/backend.ts`),
+    // and this method has just freed the worker's copy. But the copy did not
+    // disappear, it moved -- the frontend `SpatiallyIndexedSkeletonChunk` keeps
+    // `vertexAttributes` and `indices` as live fields for the chunk's whole
+    // life, `copyToGPU` uploads from them without releasing them. So exactly one
+    // host-RAM copy exists at all times, before and after transfer, and one
+    // charge against the system budget is what models it. The GPU charge models
+    // the separate VRAM the upload occupies.
+    //
+    // Cutting this to the worker's own retention would take skeleton chunks out
+    // of the 2 GB system budget altogether and let the frontend's copies grow
+    // unbounded.
   }
 
   downloadSucceeded() {
     const attributeBytes =
       this.indices!.byteLength + getVertexAttributeBytes(this);
     this.gpuMemoryBytes = attributeBytes;
-    // The retained roiFilterableChunk aliases the positions/segment buffers
-    // already counted above (conservatively kept charged for GPU-state chunks);
-    // its fragmentIndex is the one net-new retained allocation, so make it
-    // visible to the system-memory budget.
-    this.systemMemoryBytes =
-      attributeBytes + (this.roiFilterableChunk?.fragmentIndex.byteLength ?? 0);
+    // One host-RAM copy of the geometry (see `serialize`), plus what the ROI
+    // view keeps past transfer that the transferred copy does not replace: its
+    // own `fragmentIndex`, and — for a store whose attribute predicates read
+    // per-VERTEX values — the retained attribute columns. Those columns are a
+    // genuine second copy (the frontend holds the packed one), so charging them
+    // is what keeps a wide MERFISH panel from silently doubling worker RAM
+    // against a budget that cannot see it.
+    let roiRetainedBytes =
+      this.roiFilterableChunk?.fragmentIndex.byteLength ?? 0;
+    const retainedAttributes = this.roiFilterableChunk?.vertexAttributes;
+    if (retainedAttributes !== undefined) {
+      for (const column of retainedAttributes.values()) {
+        roiRetainedBytes += column.byteLength;
+      }
+    }
+    this.systemMemoryBytes = attributeBytes + roiRetainedBytes;
     super.downloadSucceeded();
     // Reaching SYSTEM_MEMORY_WORKER is what makes this chunk's geometry
     // filterable (roiFilterableChunk is set and deliberately retained past
@@ -612,20 +682,48 @@ export class SpatiallyIndexedSkeletonSourceBackend extends SliceViewChunkSourceB
   SpatiallyIndexedSkeletonChunk
 > {
   chunkConstructor = SpatiallyIndexedSkeletonChunk;
-  currentLod: number = 0;
   currentRequestGeneration = -1;
   currentRequestOwner = SpatiallyIndexedSkeletonChunkRequestOwner.NONE;
+  /**
+   * Share of this level's NEW objects to keep when decoding, in [0, 1]; `1`
+   * disables per-object admission entirely and is the default, so every source
+   * that never hears otherwise behaves exactly as before.
+   *
+   * Set by the render layer before requesting, alongside the request generation.
+   * Safe to read at download time rather than stamping it on each chunk because
+   * a change to it invalidates this source's cache on the frontend — no chunk
+   * survives a change, so none can be decoded against a stale value.
+   */
+  currentAdmissionFraction = 1;
 
+  /**
+   * Chunks are keyed by grid position ALONE.
+   *
+   * They used to carry a `:${lod}` suffix, where `lod` is the normalised index
+   * of the pyramid level the layer was drawing. That salt discriminated nothing:
+   * every level is already its own `ChunkSource` with its own `chunks` map and
+   * its own `baseUrl`, and the download path never reads `lod`. What it did do
+   * was orphan the entire resident set every time the drawn level changed --
+   * identical bytes for the same source and position became unreachable under
+   * the new key and were re-downloaded, while the old-key chunks stayed fully
+   * charged against the GPU and system budgets until something outbid them. It
+   * also made the 2-d and 3-d views materialise the same bytes twice whenever
+   * they sat at different levels, since each view supplies its own `lod`.
+   */
   getChunk(chunkGridPosition: Float32Array) {
-    const lodValue = this.currentLod;
-    const key = `${chunkGridPosition.join()}:${lodValue}`;
+    const key =
+      chunkGridPosition.join() + SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR;
     let chunk = this.chunks.get(key);
     if (chunk === undefined) {
       chunk = this.getNewChunk_(
         this.chunkConstructor,
       ) as SpatiallyIndexedSkeletonChunk;
       chunk.initializeVolumeChunk(key, chunkGridPosition);
-      chunk.lod = lodValue;
+      // Chunks come from a free-list and are reused, so a field initializer runs
+      // only for a genuinely new object. Left unreset, a recycled chunk would
+      // inherit the retry count of whatever grid position last used it and could
+      // be denied its retries before ever failing once.
+      chunk.failedAttempts = 0;
       this.addChunk(chunk);
     }
     markSpatiallyIndexedSkeletonChunkRequested(
@@ -645,6 +743,42 @@ interface SpatiallyIndexedSkeletonRenderLayerAttachmentState {
   >[][];
 }
 
+type SpatiallyIndexedSkeletonTransformedSource = TransformedSource<
+  SpatiallyIndexedSkeletonRenderLayerBackend,
+  SpatiallyIndexedSkeletonSourceBackend
+>;
+
+/**
+ * The scales that make up the layer's BACKGROUND at `gridLevel`.
+ *
+ * One level: whichever the grid-level control selects, resolved through the
+ * same fallback ordering the draw path uses so an absent level lands on the
+ * same substitute both sides. A source publishing no grid indices has no level
+ * selection to speak of, so every scale is returned, as before.
+ *
+ * This is what the ROI filter treats as "already loaded": it completes regions
+ * and folds verdicts here and nowhere finer.
+ */
+export function selectRoiBackgroundScales(
+  scales: readonly SpatiallyIndexedSkeletonTransformedSource[],
+  gridLevel: number,
+): SpatiallyIndexedSkeletonTransformedSource[] {
+  if (scales.length === 0) return [];
+  if (
+    !scales.every(
+      (tsource) => getSpatiallyIndexedSkeletonGridIndex(tsource) !== undefined,
+    )
+  ) {
+    return [...scales];
+  }
+  const ordered = selectSpatiallyIndexedSkeletonEntriesByGridWithFallback(
+    scales.map((tsource) => ({ tsource })),
+    gridLevel,
+    ({ tsource }) => getSpatiallyIndexedSkeletonGridIndex(tsource),
+  );
+  return ordered.length > 0 ? [ordered[0].tsource] : [];
+}
+
 @registerSharedObject(SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID)
 export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager(
   RenderLayerBackend,
@@ -655,6 +789,17 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   skeletonGridLevel: SharedWatchableValue<number>;
   skeletonLod2d: SharedWatchableValue<number>;
   skeletonGridLevel2d: SharedWatchableValue<number>;
+  /**
+   * Which detail-focus mode the layer is in ({@link SpatialSkeletonDetailFocus}).
+   * LOCAL lets each visible cell pick its own level; OBJECT pins every cell to
+   * the one selected level and spends the leftover memory on whole objects
+   * instead, which is a main-thread concern this backend never sees.
+   */
+  skeletonDetailFocus: SharedWatchableValue<number>;
+  /** See `SpatiallyIndexedSkeletonSourceBackend.currentAdmissionFraction`. */
+  skeletonAdmissionFraction: SharedWatchableValue<number>;
+  /** Per-level chunk spacing in METRES, indexed by grid level; see its use. */
+  skeletonLevelSpacingsMeters: SharedWatchableValue<number[]>;
   skeletonGridResolutionTarget3d: SharedWatchableValue<number>;
   private pendingLodCleanup = false;
 
@@ -683,15 +828,6 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   roiLabelField?: SharedWatchableValue<RoiLabelField | undefined>;
   /** Shared id -> packed group colour for passing tracts (colour-by-group). */
   roiSegmentColors?: Uint64Map;
-  /** Shared set of passing tracts of visible high-detail groups (drives pass-2). */
-  roiHighDetailSegments?: Uint64Set;
-  /**
-   * Maximum streamlines pass 2 may load, or undefined for no cap.
-   *
-   * A count, not a byte figure: pass 2 fetches whole objects, so a tract that
-   * merely clips the view costs its entire length.
-   */
-  roiHighDetailBudget?: SharedWatchableValue<number>;
   /** Set when an ROI edit needs a recompute even if the resident chunk set is unchanged. */
   private roiRecomputePending = false;
   /** An evaluation is outstanding; at most one runs at a time. */
@@ -702,8 +838,101 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
   private roiFilterServiceClient: RoiFilterServiceClient | undefined;
   /** Signature of the last resident-chunk set filtered over, to skip redundant recomputes. */
   private roiLastChunkSignature = "";
+
+  /**
+   * Grid levels the last priority pass selected to DRAW -- the layer's
+   * background. Filled by `recomputeChunkPriorities`, read by the ROI
+   * evaluation to keep the dissection inside what the background already shows
+   * (see {@link selectRoiEvaluationLevel}). Empty until a visible view has been
+   * processed, or for a source with no grid indices at all.
+   */
+  private roiBackgroundLevels = new Set<number>();
   /** The colour attribution last pushed to `roiSegmentColors`, for diffing. */
   private roiLastColorById = new Map<bigint, number>();
+
+  /**
+   * The single pyramid level the ROI fold runs over, given the levels with
+   * resident filterable geometry.
+   *
+   * The dissection is confined to the level being drawn: a group is a selection
+   * WITHIN the paths the background already holds, never a reason to fetch a
+   * finer level. Filtering therefore costs only what the view already paid for,
+   * which is what keeps dragging an ROI interactive on a whole-brain tractogram.
+   * (Finer geometry is a per-layer decision -- raise the layer's grid level, or
+   * put the group on its own layer -- not something a filter does behind the
+   * user's back.)
+   *
+   * Finest among the drawn levels when several are (3-d per-chunk arbitration
+   * can mix them), since that is the most detailed thing on screen. Falls back
+   * to the finest resident level only when nothing has been recorded -- no
+   * visible view yet, or a source without grid indices -- so a filter still
+   * yields a verdict there instead of silently emptying.
+   *
+   * Returns -1 when no level qualifies (the caller then folds over no chunks).
+   */
+  private selectRoiEvaluationLevel(levels: Iterable<number>): number {
+    let target = -1;
+    const background = this.roiBackgroundLevels;
+    if (background.size !== 0) {
+      for (const level of levels) {
+        if (background.has(level) && level > target) target = level;
+      }
+      return target;
+    }
+    for (const level of levels) {
+      if (level > target) target = level;
+    }
+    return target;
+  }
+
+  /**
+   * The levels whose geometry the dissection folds over.
+   *
+   * Normally ONE. Mixing levels would let two differently-decimated copies of
+   * the same tract vote separately, and a coarse copy could then decide a fine
+   * verdict.
+   *
+   * Under the object partition it is ALL contributing levels, and that is safe
+   * for exactly the reason the single-level rule existed: each level draws only
+   * the objects that are new at it, so no object appears at two levels and
+   * there are never two copies to disagree. Restricting to one level there
+   * would instead judge the dissection on the slice of tracts that happened to
+   * be new at it, and ghost every other tract on screen.
+   */
+  /**
+   * Whether this layer's sources partition their objects between levels, so
+   * that several levels may be drawn -- and folded over -- at once.
+   *
+   * See `getSpatiallyIndexedSkeletonPartitionsObjects`. Object focus is
+   * available on any pyramid; only the multi-level half of it is gated on this.
+   * `every`, and false for a layer with no sources: the union has to be sound
+   * for all of them or for none.
+   */
+  private objectPartitionAvailable(): boolean {
+    let any = false;
+    for (const source of this.roiFilterableSources()) {
+      if (!getSpatiallyIndexedSkeletonPartitionsObjects(source)) return false;
+      any = true;
+    }
+    return any;
+  }
+
+  private roiEvaluationLevels(levels: Iterable<number>): number[] {
+    if (
+      this.skeletonDetailFocus.value !== SpatialSkeletonDetailFocus.OBJECT ||
+      !this.objectPartitionAvailable()
+    ) {
+      const single = this.selectRoiEvaluationLevel(levels);
+      return single < 0 ? [] : [single];
+    }
+    const background = this.roiBackgroundLevels;
+    const out: number[] = [];
+    for (const level of levels) {
+      if (background.size === 0 || background.has(level)) out.push(level);
+    }
+    out.sort((a, b) => a - b);
+    return out;
+  }
 
   constructor(rpc: RPC, options: any) {
     super(rpc, options);
@@ -713,6 +942,11 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     this.skeletonGridLevel = rpc.get(options.skeletonGridLevel);
     this.skeletonLod2d = rpc.get(options.skeletonLod2d);
     this.skeletonGridLevel2d = rpc.get(options.skeletonGridLevel2d);
+    this.skeletonDetailFocus = rpc.get(options.skeletonDetailFocus);
+    this.skeletonAdmissionFraction = rpc.get(options.skeletonAdmissionFraction);
+    this.skeletonLevelSpacingsMeters = rpc.get(
+      options.skeletonLevelSpacingsMeters,
+    );
     this.skeletonGridResolutionTarget3d = rpc.get(
       options.skeletonGridResolutionTarget3d,
     );
@@ -746,6 +980,21 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         scheduleUpdateAndMarkStaleCleanup,
       ),
     );
+    // Both change which level each cell resolves to, so in-flight downloads for
+    // the superseded selection must be marked stale like any other change to it.
+    this.registerDisposer(
+      this.skeletonDetailFocus.changed.add(scheduleUpdateAndMarkStaleCleanup),
+    );
+    this.registerDisposer(
+      this.skeletonAdmissionFraction.changed.add(
+        scheduleUpdateAndMarkStaleCleanup,
+      ),
+    );
+    this.registerDisposer(
+      this.skeletonLevelSpacingsMeters.changed.add(
+        scheduleUpdateAndMarkStaleCleanup,
+      ),
+    );
 
     // Debounce LOD changes to avoid making requests for every slider value
     const debouncedLodUpdate = debounce(() => {
@@ -770,7 +1019,6 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         // set reflects exactly the chunks now resident at the current level.
         // A no-op unless this is an ROI-filtered (zarr-vectors tract) layer.
         this.maybeRecomputeRoiPassingSet();
-        if (!this.pendingLodCleanup) return;
         const sources = new Set<SpatiallyIndexedSkeletonSourceBackend>();
         for (const attachment of this.attachments.values()) {
           const attachmentState = attachment.state as
@@ -785,6 +1033,8 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
             }
           }
         }
+        this.retryFailedChunks(sources);
+        if (!this.pendingLodCleanup) return;
         cancelStaleSpatiallyIndexedSkeletonDownloads(
           this.chunkManager,
           sources,
@@ -801,9 +1051,6 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
       this.roiPassingSegments = rpc.get(options.roiPassingSegments);
       if (options.roiSegmentColors !== undefined) {
         this.roiSegmentColors = rpc.get(options.roiSegmentColors);
-      }
-      if (options.roiHighDetailSegments !== undefined) {
-        this.roiHighDetailSegments = rpc.get(options.roiHighDetailSegments);
       }
       const roiGroups = (this.roiGroups = rpc.get(options.roiGroups));
       const scheduleRoiRecompute = () => {
@@ -824,16 +1071,6 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         // A parcellation loading (or the linked layer changing) changes which
         // tracts a label-mask ROI selects, so it is a recompute trigger too.
         this.registerDisposer(field.changed.add(scheduleRoiRecompute));
-      }
-      if (options.roiHighDetailBudget !== undefined) {
-        const budget = (this.roiHighDetailBudget = rpc.get(
-          options.roiHighDetailBudget,
-        ));
-        // Lowering the cap must evict, raising it must fetch, so a change is a
-        // recompute trigger exactly like an ROI edit. Registered after
-        // `scheduleRoiRecompute` exists -- a `const` arrow referenced above its
-        // declaration is a temporal dead zone, not a hoisted function.
-        this.registerDisposer(budget.changed.add(scheduleRoiRecompute));
       }
     }
   }
@@ -867,13 +1104,12 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
    * Recompute which loaded streamlines pass the ROI filter and push the delta
    * to the shared passing set. A no-op for non-ROI (non-tract) layers.
    *
-   * Evaluated at a SINGLE pyramid level: object ids are stable across levels, so
+   * Evaluated at a SINGLE pyramid level, and that level is the one being drawn
+   * ({@link selectRoiEvaluationLevel}): object ids are stable across levels, so
    * folding two levels' differently-decimated geometry for one id into one
-   * verdict would let a coarse level pollute the fine view and vice versa. The
-   * 3-d level is preferred; the recompute falls back to the 2-d level only when
-   * no 3-d chunk is resident (a 2-d-only layout). One backend serves both views
-   * of a tract layer, so its attachments span both — the recompute sees every
-   * resident source.
+   * verdict would let a coarse level pollute the fine view and vice versa. One
+   * backend serves both views of a tract layer, so its attachments span both —
+   * the recompute sees every resident source.
    *
    * Crossings are OR-merged over that level's RESIDENT chunks. At the intended
    * coarse whole-brain operating point the level is fully resident, so a
@@ -896,7 +1132,11 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     // yields an empty passing set; the shader treats "active with no ROIs" as
     // off, so an empty set is never mistaken for "everything fails".
     const groups = this.roiGroups.value;
-    const hasRois = groups.some((g) => g.visible && g.rois.length !== 0);
+    const hasRois = groups.some(
+      (g) =>
+        g.visible &&
+        (g.rois.length !== 0 || (g.attrFilters ?? []).length !== 0),
+    );
     // Bucket by PYRAMID LEVEL (the source's `gridIndex`), not by `chunk.lod`.
     // `lod` records which render level a chunk was requested for; the level it
     // actually belongs to is a property of its source. Bucketing by `lod` tied
@@ -924,28 +1164,25 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         }
       }
     }
-    // Evaluate at the FINEST level with any resident geometry -- larger
-    // gridIndex is finer (`frontend.ts`: levelPaths[0], the finest, is assigned
-    // `numLevels - 1`).
+    // Evaluate at the level the layer DRAWS (larger gridIndex is finer --
+    // `frontend.ts`: levelPaths[0], the finest, is assigned `numLevels - 1`).
+    // `requestRoiRegionChunks` completes that level's ROI-overlapping chunks
+    // even where the frustum does not reach them, so the fold is decided over
+    // the background's own geometry rather than over whatever a finer level
+    // happened to leave resident. See {@link selectRoiEvaluationLevel}.
     //
-    // `requestRoiRegionChunks` guarantees the ROI regions' chunks at every
-    // level, and a fragment outside every region cannot change a crossing test,
-    // so the finest level is fully decidable from a bounded set of chunks even
-    // though the level as a whole is nowhere near resident. That is what lets
-    // the dissection see streamlines that exist ONLY at fine levels, rather
-    // than being confined to whatever level the camera happens to draw.
-    //
-    // Still a SINGLE level: mixing differently-decimated geometry for one id
-    // would let a coarse level pollute a fine verdict (see the note above
-    // `roiFilterableSources`). Mixing happens over OBJECTS, not geometry.
-    let targetLevel = -1;
-    for (const level of byLevel.keys()) {
-      if (level > targetLevel) targetLevel = level;
+    // A SINGLE level: mixing differently-decimated geometry for one id would
+    // let a coarse level pollute a fine verdict (see the note above
+    // `roiFilterableSources`).
+    const targetLevels = this.roiEvaluationLevels(byLevel.keys());
+    const chunks: RoiFilterChunkEntry[] = [];
+    let signature = "";
+    for (const level of targetLevels) {
+      const bucket = byLevel.get(level);
+      if (bucket === undefined) continue;
+      chunks.push(...bucket.chunks);
+      signature += `${level}:${bucket.count}:${bucket.hash}|`;
     }
-    const bucket = targetLevel < 0 ? undefined : byLevel.get(targetLevel);
-    const chunks = bucket?.chunks ?? [];
-
-    const signature = `${targetLevel}:${bucket?.count ?? 0}:${bucket?.hash ?? 0}`;
 
     // While an evaluation is outstanding, ALWAYS queue and return. This check
     // must come before the signature comparison below, because during a flight
@@ -1036,67 +1273,57 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         `${this.rpcId}`,
       );
     }
-    // Applied to BOTH paths. The Python/WASM service does its own fold and
-    // returns early, so capping only the TypeScript fallback would make the
-    // budget silently stop applying wherever the service is available -- which
-    // is precisely the build the budget matters most in.
-    const budget = this.roiHighDetailBudget?.value;
     const attrColumns = this.roiObjectAttrColumns?.value;
     const labelField = this.roiLabelField?.value;
     const sampleLabel: LabelSampler | undefined =
       labelField !== undefined ? makeLabelSampler(labelField) : undefined;
-    // The dissection service knows nothing about per-object length filtering,
-    // attribute colouring (or the unified colour-by model, where a group can opt
-    // out of the flat colour override), OR label-mask ROIs (which need the dense
+    // The dissection service knows nothing about attribute predicates, attribute
+    // colouring (or the unified colour-by model, where a group can opt out of
+    // the flat colour override), OR label-mask ROIs (which need the dense
     // parcellation grid the service does not have). When any visible group needs
     // that, fall back to the in-worker TypeScript path, which has the values and
     // applies it per group. The common case (all groups flat "group" colour, no
-    // length filter, only geometric ROIs) still takes the fast service path.
-    const needsLocal = groups.some(
-      (g) =>
-        g.visible &&
-        (g.lengthRange !== undefined ||
-          (g.colorBy !== undefined && g.colorBy.kind !== "group") ||
-          g.rois.some((r) => r.shape.kind === "labelMask")),
-    );
+    // attribute predicates, only geometric ROIs) still takes the fast service
+    // path.
+    const needsLocal =
+      groups.some(
+        (g) =>
+          g.visible &&
+          ((g.attrFilters ?? []).length !== 0 ||
+            (g.colorBy !== undefined && g.colorBy.kind !== "group") ||
+            g.rois.some((r) => r.shape.kind === "labelMask")),
+      ) ||
+      // The service's wire format is fragment-shaped: it gathers each chunk's
+      // vertices per fragment and folds one verdict per fragment. That is only
+      // the right shape for a curve whose fragments are object slices. A point
+      // cloud's fragment is a spatial BIN of unrelated points (one object each),
+      // and a mesh's is a face soup with no walk order -- both need the
+      // per-chunk switches only the local fold honours
+      // (`RoiFilterableChunk.perVertexObjects` / `surfaceVertices`).
+      chunks.some(
+        (c) =>
+          c.data.perVertexObjects === true || c.data.surfaceVertices === true,
+      );
     if (!client.isUnavailable && !needsLocal) {
       const remote = await client.compute(chunks, groups);
-      if (remote !== undefined) {
-        return {
-          ...remote,
-          highDetail: selectHighDetail(
-            remote.passing,
-            remote.highDetail,
-            budget,
-          ),
-        };
-      }
+      if (remote !== undefined) return remote;
     }
     return computeGroupedPassingSet(
       chunks.map((c) => c.data),
       groups,
-      budget,
       attrColumns,
       sampleLabel,
     );
   }
 
-  /** Push one evaluation's result to the three shared objects, as minimal diffs. */
-  private applyRoiResult({ passing, colorById, highDetail }: RoiFilterResult) {
+  /** Push one evaluation's result to the two shared objects, as minimal diffs. */
+  private applyRoiResult({ passing, colorById }: RoiFilterResult) {
     const passingSet = this.roiPassingSegments;
     if (passingSet === undefined) return;
     const current = new Set<bigint>(passingSet.keys());
     const { added, removed } = diffPassingSet(passing, current);
     if (removed.length !== 0) passingSet.delete(removed);
     if (added.length !== 0) passingSet.add(added);
-
-    const highDetailSet = this.roiHighDetailSegments;
-    if (highDetailSet !== undefined) {
-      const currentHd = new Set<bigint>(highDetailSet.keys());
-      const hdDiff = diffPassingSet(highDetail, currentHd);
-      if (hdDiff.removed.length !== 0) highDetailSet.delete(hdDiff.removed);
-      if (hdDiff.added.length !== 0) highDetailSet.add(hdDiff.added);
-    }
 
     // Push the colour attribution to the shared map as a minimal diff (the
     // frontend mirrors it into segmentStatedColors when colour-by-group is on).
@@ -1119,18 +1346,22 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
    * hands these ids to the exporter, which reads exactly those objects instead
    * of re-reading and re-folding the whole level.
    *
-   * WYSIWYG by construction: it folds over the same finest-resident-level chunks
-   * the on-screen passing set is computed from (see `maybeRecomputeRoiPassingSet`
-   * for why a single level, and why the finest resident one). The result is
-   * positional -- `perGroup[i]` corresponds to `groups[i]` -- because group
-   * names are not unique.
+   * WYSIWYG by construction: it folds over the same background-level chunks the
+   * on-screen passing set is computed from (see `maybeRecomputeRoiPassingSet`
+   * for why a single level, and `selectRoiEvaluationLevel` for which). The
+   * result is positional -- `perGroup[i]` corresponds to `groups[i]` -- because
+   * group names are not unique.
    *
    * Ids are strings, not numbers: an object id is a uint64 and JSON would round
    * one past 2**53. Synchronous: the fold is pure once the chunks are in hand.
    */
-  computeRoiExportIds(groups: readonly RoiGroupConfig[]): {
-    perGroup: string[][];
-  } {
+  /**
+   * The resident filterable chunks at the level the fold evaluates, in the same
+   * selection the on-screen passing set uses -- see `maybeRecomputeRoiPassingSet`
+   * for why a single level and `selectRoiEvaluationLevel` for which. Shared so
+   * an export and an attribute range describe the same geometry the filter does.
+   */
+  private residentRoiChunks(): RoiFilterableChunk[] {
     const byLevel = new Map<number, RoiFilterableChunk[]>();
     for (const source of this.roiFilterableSources()) {
       const gridIndex = getSpatiallyIndexedSkeletonGridIndex(source);
@@ -1147,12 +1378,62 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         arr.push(data);
       }
     }
-    // Finest level with any resident geometry (larger gridIndex is finer).
-    let targetLevel = -1;
-    for (const level of byLevel.keys()) {
-      if (level > targetLevel) targetLevel = level;
+    const chunks: RoiFilterableChunk[] = [];
+    for (const level of this.roiEvaluationLevels(byLevel.keys())) {
+      const bucket = byLevel.get(level);
+      if (bucket !== undefined) chunks.push(...bucket);
     }
-    const chunks = targetLevel < 0 ? [] : byLevel.get(targetLevel)!;
+    return chunks;
+  }
+
+  /**
+   * The observed range of each named per-vertex attribute over the resident
+   * chunks, for the Filter tab's attribute picker.
+   *
+   * `distinct` stops counting at {@link VERTEX_ATTR_DISTINCT_LIMIT}: the tab
+   * only needs to know whether a column is a flag (two values) or a small
+   * category set, and a gene panel has as many distinct values as vertices.
+   * A name no resident chunk carries comes back with `count: 0`, which the tab
+   * shows as "not loaded" rather than as an empty range.
+   */
+  computeRoiVertexAttrStats(names: readonly string[]): {
+    stats: VertexAttrStats[];
+  } {
+    const chunks = this.residentRoiChunks();
+    return {
+      stats: names.map((name) => {
+        let count = 0;
+        let min = Number.POSITIVE_INFINITY;
+        let max = Number.NEGATIVE_INFINITY;
+        let integral = true;
+        const seen = new Set<number>();
+        for (const chunk of chunks) {
+          const column = chunk.vertexAttributes?.get(name);
+          if (column === undefined) continue;
+          const n = Math.min(chunk.numVertices, column.length);
+          for (let v = 0; v < n; ++v) {
+            const value = column[v];
+            // NaN is how a fill value survives the float decode; it is not a
+            // measurement and must not drag a range to infinity.
+            if (!Number.isFinite(value)) continue;
+            ++count;
+            if (value < min) min = value;
+            if (value > max) max = value;
+            if (integral && !Number.isInteger(value)) integral = false;
+            if (seen.size < VERTEX_ATTR_DISTINCT_LIMIT) seen.add(value);
+          }
+        }
+        return count === 0
+          ? { name, count: 0, min: 0, max: 0, integral: true, distinct: 0 }
+          : { name, count, min, max, integral, distinct: seen.size };
+      }),
+    };
+  }
+
+  computeRoiExportIds(groups: readonly RoiGroupConfig[]): {
+    perGroup: string[][];
+  } {
+    const chunks = this.residentRoiChunks();
     const attrColumns = this.roiObjectAttrColumns?.value;
     const labelField = this.roiLabelField?.value;
     const sampleLabel: LabelSampler | undefined =
@@ -1205,6 +1486,12 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
    * this is a handful of chunks, and it holds the single-level evaluation intact
    * rather than folding differently-decimated geometry together.
    *
+   * Issued for the BACKGROUND level only (the caller passes exactly that
+   * tsource). Completing the regions at every level pinned finer levels
+   * resident, which then won the evaluation-level choice, so merely having a
+   * filter made the layer fetch and fold geometry the view never drew. A group
+   * selects within the background; it does not deepen it.
+   *
    * Skipped when any region is a halfspace: unbounded, so no finite chunk set
    * can be guaranteed and the camera's residency is all there is.
    */
@@ -1215,6 +1502,8 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     >,
     priorityTier: number,
     basePriority: number,
+    currentGeneration: number,
+    requestOwner: SpatiallyIndexedSkeletonChunkRequestOwner,
   ) {
     const groups = this.roiGroups?.value;
     if (groups === undefined) return;
@@ -1249,6 +1538,20 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     // level resident, defeating the memory ceiling entirely.
     if (total > MAX_ROI_REGION_CHUNKS) return;
 
+    // Stamp the CURRENT generation before the first `getChunk`.
+    //
+    // `getChunk` marks each chunk with whatever the source is carrying at the
+    // time, and this block runs before the frustum blocks below that normally
+    // assign it -- so these chunks were being stamped with the PREVIOUS pass's
+    // generation (or `-1`, which `markSpatiallyIndexedSkeletonChunkRequested`
+    // skips entirely). Any region chunk the frustum does not also enumerate
+    // therefore looked stale to `cancelStaleSpatiallyIndexedSkeletonDownloads`
+    // and had its download aborted on the very next cleanup, over and over,
+    // never completing. Those are exactly the chunks the dissection needs:
+    // the ones outside the view.
+    source.currentRequestGeneration = currentGeneration;
+    source.currentRequestOwner = requestOwner;
+
     const pos = tempRoiChunkPosition;
     for (let z = lower[2]; z <= upper[2]; ++z) {
       for (let y = lower[1]; y <= upper[1]; ++y) {
@@ -1269,9 +1572,44 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
     }
   }
 
+  /**
+   * Give a failed chunk a bounded number of further attempts.
+   *
+   * `FAILED` is terminal in the chunk manager: the chunk enters no promotion
+   * queue and is never retried, and it is never deleted either, so `getChunk`
+   * keeps handing back the same dead object. For a spatially-indexed skeleton
+   * that is worse than it sounds — the draw-side arbitration treats a `FAILED`
+   * candidate as a reason to fall back to a coarser level for that cell, which
+   * means one transient network error leaves a permanent hole (or a permanent
+   * coarse patch) in the volume for the rest of the session. The larger the
+   * level being read, the likelier that is.
+   *
+   * Capped rather than unbounded: a chunk that is genuinely unreadable must
+   * settle into failure rather than re-requesting for ever.
+   */
+  private retryFailedChunks(
+    sources: Iterable<SpatiallyIndexedSkeletonSourceBackend>,
+  ) {
+    const { queueManager } = this.chunkManager;
+    for (const source of sources) {
+      for (const chunk of source.chunks.values()) {
+        const typed = chunk as SpatiallyIndexedSkeletonChunk;
+        if (typed.state !== ChunkState.FAILED) continue;
+        if (typed.failedAttempts >= MAX_SPATIALLY_INDEXED_SKELETON_RETRIES) {
+          continue;
+        }
+        ++typed.failedAttempts;
+        queueManager.updateChunkState(typed, ChunkState.QUEUED);
+      }
+    }
+  }
+
   private recomputeChunkPriorities() {
     this.chunkManager.registerLayer(this);
     const currentGeneration = this.chunkManager.recomputeChunkPriorities.count;
+    // Rebuilt from scratch each pass: the ROI evaluation must follow the level
+    // now being drawn, not one the camera has since left.
+    this.roiBackgroundLevels.clear();
     for (const attachment of this.attachments.values()) {
       const { view } = attachment;
       const visibility = view.visibility.value;
@@ -1369,6 +1707,24 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
           // always true), including in 2D views where this is the only
           // code path (the grid-anchor arbitration path below only runs
           // for 3D views).
+          if (objectPartition) {
+            // EVERY level from the finest admitted one up to the coarsest, all
+            // at once. They partition the objects between them (see
+            // `admitObjects` in the zarr-vectors backend), so this is not
+            // redundant work: it is what lets the coarse levels -- tens of
+            // tracts, well under a megabyte -- populate the whole volume
+            // immediately while the finer ones stream in behind them. Grid
+            // index counts from the coarsest, so "coarser than or equal to the
+            // selected level" is `gridIndex <= skeletonGridLevel`.
+            return scales
+              .map((tsource, scaleIndex) => ({ tsource, scaleIndex }))
+              .filter(({ tsource }) => {
+                const gridIndex = getSpatiallyIndexedSkeletonGridIndex(tsource);
+                return (
+                  gridIndex !== undefined && gridIndex <= skeletonGridLevel
+                );
+              });
+          }
           const ordered =
             selectSpatiallyIndexedSkeletonEntriesByGridWithFallback(
               scales.map((tsource, scaleIndex) => ({ tsource, scaleIndex })),
@@ -1440,24 +1796,73 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
         return selected;
       };
 
-      const lodValue = (is2dView ? this.skeletonLod2d : this.skeletonLod).value;
+      // Per-object admission: what share of the level's NEW objects to decode.
+      // Only meaningful when one level is drawn everywhere; LOCAL focus mixes
+      // levels per cell and draws each cell's level entire, so it opts out.
+      const objectFocus =
+        this.skeletonDetailFocus.value === SpatialSkeletonDetailFocus.OBJECT;
+      // The multi-level half of object focus: requesting every level from the
+      // drawn one up to the coarsest, and rationing the finest. Both rest on
+      // the levels partitioning the objects between them, which a resolution
+      // pyramid (mesh, point cloud) does not do -- there object focus is the
+      // single-level, whole-volume request set and nothing more.
+      const objectPartition = objectFocus && this.objectPartitionAvailable();
+      const admissionFraction = objectPartition
+        ? this.skeletonAdmissionFraction.value
+        : 1;
       for (const scales of transformedSources) {
-        // Every level, before any frustum work: the dissection's geometry
-        // requirement is set by the ROI regions and the budget, not by what is
-        // on screen, so this must not sit inside a branch that has already
-        // narrowed to one level.
+        // Stamp every source's ration ONCE, before anything asks it for a chunk.
+        //
+        // It used to be set at each request site, which let the ROI-region pass
+        // and the frustum pass disagree about the same source within a single
+        // priority pass -- and since the ration is read at DOWNLOAD time, long
+        // after, chunks of one source could decode against different rations and
+        // hold different subsets of the same level.
         for (const tsource of scales) {
+          const source =
+            tsource.source as SpatiallyIndexedSkeletonSourceBackend;
+          const gridIndex = getSpatiallyIndexedSkeletonGridIndex(tsource);
+          source.currentAdmissionFraction = !objectPartition
+            ? -1
+            : gridIndex === skeletonGridLevel
+              ? admissionFraction
+              : 1;
+        }
+        // ROI-region chunks, before any frustum work: the dissection needs its
+        // regions completed even where the frustum does not reach them, so this
+        // must not sit inside a branch that has already narrowed to the visible
+        // chunks.
+        //
+        // Under the object partition this is EVERY contributing level, not one.
+        // Each level draws only the objects that are new at it, so a single
+        // level holds only a slice of the tracts on screen; completing one and
+        // folding it would judge the dissection on that slice and ghost
+        // everything else.
+        const roiScales = objectPartition
+          ? scales.filter((tsource) => {
+              const gridIndex = getSpatiallyIndexedSkeletonGridIndex(tsource);
+              return gridIndex !== undefined && gridIndex <= skeletonGridLevel;
+            })
+          : selectRoiBackgroundScales(scales, skeletonGridLevel);
+        for (const tsource of roiScales) {
+          const gridIndex = getSpatiallyIndexedSkeletonGridIndex(tsource);
+          if (gridIndex !== undefined) this.roiBackgroundLevels.add(gridIndex);
           this.requestRoiRegionChunks(
-            tsource as TransformedSource<
-              SpatiallyIndexedSkeletonRenderLayerBackend,
-              SpatiallyIndexedSkeletonSourceBackend
-            >,
+            tsource,
             priorityTier,
             basePriority,
+            currentGeneration,
+            is2dView
+              ? SpatiallyIndexedSkeletonChunkRequestOwner.VIEW_2D
+              : SpatiallyIndexedSkeletonChunkRequestOwner.VIEW_3D,
           );
         }
         if (
           !is2dView &&
+          // OBJECT focus draws ONE level everywhere and spends what is left on
+          // whole objects; per-cell arbitration would undo that by scattering
+          // levels across the view, so it is skipped outright in that mode.
+          this.skeletonDetailFocus.value === SpatialSkeletonDetailFocus.LOCAL &&
           scales.length > 1 &&
           scales.every(
             (scale) =>
@@ -1479,14 +1884,38 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
             }));
           if (orderedCandidates.length > 0) {
             const metersPerUnit = getMetersPerUnit(projectionParameters);
+            const levelSpacings = this.skeletonLevelSpacingsMeters.value;
+            // Prefer the LEVEL's published spacing over its chunk shape.
+            //
+            // This is what makes per-cell arbitration mean anything on an
+            // object-sparsity pyramid, where every level keeps the same
+            // chunk_shape and drops whole objects instead. Measured by chunk
+            // shape, every level reports an identical spacing, every
+            // |spacing - desired| comparison below ties, and the tie-break on
+            // `fallbackRank` hands every cell the selected level -- so the
+            // arbitration ran, cost its iteration, and reproduced exactly the
+            // single-level behaviour it exists to replace. The published
+            // spacing is the density-corrected one the resolution widget and
+            // the camera-driven target already use (mean spacing BETWEEN
+            // OBJECTS), so sparser levels really do read as coarser and a near
+            // cell can out-resolve a far one.
             const spacingMeters = (candidate: {
               tsource: TransformedSource<
                 SpatiallyIndexedSkeletonRenderLayerBackend,
                 SpatiallyIndexedSkeletonSourceBackend
               >;
-            }) =>
-              getChunkSpacing(candidate.tsource.chunkLayout.size) *
-              metersPerUnit;
+            }) => {
+              const gridIndex = getSpatiallyIndexedSkeletonGridIndex(
+                candidate.tsource,
+              );
+              const published =
+                gridIndex === undefined ? undefined : levelSpacings[gridIndex];
+              if (published !== undefined && published > 0) return published;
+              return (
+                getChunkSpacing(candidate.tsource.chunkLayout.size) *
+                metersPerUnit
+              );
+            };
             // Anchor the position-enumeration grid on whichever candidate's
             // spacing is CLOSEST to the desired resolution target, not
             // unconditionally the finest level: enumerating at the finest
@@ -1610,7 +2039,9 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
                   ) {
                     continue;
                   }
-                  const key = `${tempArbitrationCandidateChunkPos.join()}:${lodValue}`;
+                  const key =
+                    tempArbitrationCandidateChunkPos.join() +
+                    SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR;
                   const state = candidate.tsource.source.chunks.get(key)?.state;
                   // A failed candidate should not block fallback to the next
                   // ranked level, but loaded/system/queued candidates remain
@@ -1641,7 +2072,6 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
                 emitted.add(emitKey);
 
                 const source = selected.tsource.source;
-                source.currentLod = lodValue;
                 source.currentRequestGeneration = currentGeneration;
                 source.currentRequestOwner =
                   SpatiallyIndexedSkeletonChunkRequestOwner.VIEW_3D;
@@ -1692,34 +2122,76 @@ export class SpatiallyIndexedSkeletonRenderLayerBackend extends withChunkManager
             chunkSize[i] = 0;
             localCenter[i] = 0;
           }
-          source.currentLod = lodValue;
           source.currentRequestGeneration = currentGeneration;
           source.currentRequestOwner = is2dView
             ? SpatiallyIndexedSkeletonChunkRequestOwner.VIEW_2D
             : SpatiallyIndexedSkeletonChunkRequestOwner.VIEW_3D;
-          forEachVisibleVolumetricChunk(
-            projectionParameters,
-            this.localPosition.value,
-            tsource,
-            () => {
-              const chunk = source.getChunk(tsource.curPositionInChunks);
-              ++this.numVisibleChunksNeeded;
-              if (chunk.state === ChunkState.GPU_MEMORY) {
-                ++this.numVisibleChunksAvailable;
-              }
-              chunkManager.requestChunk(
-                chunk,
-                priorityTier,
-                getSpatiallyIndexedSkeletonRenderPriority(
-                  basePriority,
-                  scaleIndex,
-                  localCenter,
-                  chunkSize,
+          const request = (
+            positionInChunks: Float32Array,
+            priority: number,
+          ) => {
+            const chunk = source.getChunk(positionInChunks);
+            ++this.numVisibleChunksNeeded;
+            if (chunk.state === ChunkState.GPU_MEMORY) {
+              ++this.numVisibleChunksAvailable;
+            }
+            chunkManager.requestChunk(chunk, priorityTier, priority);
+          };
+          // The object PARTITION holds the WHOLE VOLUME, not the frustum.
+          //
+          // Its unit is a complete object, and an object spans the volume: tie
+          // its residency to the view and the parts outside the frustum are
+          // evicted as the camera turns, so what was loaded as a whole tract
+          // decays into whichever piece is currently on screen -- and the
+          // periphery visibly drops as you pan. The admission is sized against
+          // the entire level precisely so that every cell of it can stay
+          // resident at once, which makes a camera-independent request set both
+          // affordable and the only self-consistent one.
+          //
+          // Priority is flat for the same reason: a distance term would rank
+          // the far side of the brain last and let it lose the eviction
+          // comparison, reintroducing view dependence through the back door.
+          //
+          // Object focus WITHOUT the partition gets no such sizing: nothing has
+          // costed the objects, so the only affordable whole-volume level is
+          // whichever whole level fits the GPU budget -- and on a resolution
+          // pyramid whose coarse levels are heavily decimated (the MICrONS
+          // synapse store keeps ~1 point per cell at level 1) that trades the
+          // entire picture for volume coverage, leaving a view that draws
+          // essentially nothing. There it requests the frustum, like LOCAL, and
+          // what object focus still buys is a UNIFORM level across the view
+          // instead of per-cell arbitration.
+          const wholeVolume =
+            objectPartition &&
+            forEachSpatialSkeletonVolumeCell(
+              source.spec.lowerChunkBound,
+              source.spec.upperChunkBound,
+              (positionInChunks) => {
+                request(
+                  positionInChunks,
+                  basePriority + SCALE_PRIORITY_MULTIPLIER * scaleIndex,
+                );
+              },
+            ) >= 0;
+          if (!wholeVolume) {
+            forEachVisibleVolumetricChunk(
+              projectionParameters,
+              this.localPosition.value,
+              tsource,
+              () => {
+                request(
                   tsource.curPositionInChunks,
-                ),
-              );
-            },
-          );
+                  getSpatiallyIndexedSkeletonRenderPriority(
+                    basePriority,
+                    scaleIndex,
+                    localCenter,
+                    chunkSize,
+                    tsource.curPositionInChunks,
+                  ),
+                );
+              },
+            );
+          }
         }
       }
     }

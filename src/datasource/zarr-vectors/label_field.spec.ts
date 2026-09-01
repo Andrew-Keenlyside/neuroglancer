@@ -48,7 +48,24 @@ describe("makeLabelSampler round-trips a hand-built field", () => {
     data,
     dims,
     // Identity 4x4 (row-major).
-    modelToVoxel: Float32Array.of(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1),
+    modelToVoxel: Float32Array.of(
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+    ),
   };
   const sample = makeLabelSampler(field);
 
@@ -87,10 +104,22 @@ describe("buildModelToVoxelAffine", () => {
 
     // Row 0: [2, 0, 0, 10-1]; row 1: [0, 3, 0, 20-2]; row 2: [0, 0, 1, 30-3].
     expect(Array.from(m)).toEqual([
-      2, 0, 0, 9, //
-      0, 3, 0, 18, //
-      0, 0, 1, 27, //
-      0, 0, 0, 1,
+      2,
+      0,
+      0,
+      9, //
+      0,
+      3,
+      0,
+      18, //
+      0,
+      0,
+      1,
+      27, //
+      0,
+      0,
+      0,
+      1,
     ]);
 
     // The affine must map a model point to (rawVoxel - lo).
@@ -139,9 +168,7 @@ describe("buildModelToVoxelAffine", () => {
 
 describe("readParcellationLabels", () => {
   function makeLayer(
-    pre:
-      | InstanceType<typeof PreprocessedSegmentPropertyMap>
-      | undefined,
+    pre: InstanceType<typeof PreprocessedSegmentPropertyMap> | undefined,
   ): SegmentationUserLayer {
     return {
       displayState: { segmentPropertyMap: { value: pre } },
@@ -190,6 +217,8 @@ describe("readParcellationLabels", () => {
         inlineProperties: { ids: BigUint64Array.of(3n), properties: [] },
       }),
     );
-    expect(readParcellationLabels(makeLayer(pre))).toEqual([{ id: 3, name: "" }]);
+    expect(readParcellationLabels(makeLayer(pre))).toEqual([
+      { id: 3, name: "" },
+    ]);
   });
 });

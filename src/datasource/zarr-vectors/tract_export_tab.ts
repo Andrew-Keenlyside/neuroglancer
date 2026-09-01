@@ -653,18 +653,15 @@ export class TractExportTab extends Tab {
             "load, then export.",
         );
       }
-      // Minimal configs: the per-group fold only reads `rois` and (for the
-      // length filter) `lengthRange`; the other fields are required by the type
-      // but unused here. visible: true so the length-attribute lookup is built.
+      // Minimal configs: the per-group fold only reads `rois` and
+      // `attrFilters`; the other fields are required by the type but unused
+      // here. visible: true so the attribute lookups are built.
       const configs: RoiGroupConfig[] = selected.map((g) => ({
         rois: g.rois,
         colorPacked: 0,
         visible: true,
-        highDetail: false,
         colorBy: g.colorBy,
-        ...(g.lengthFilter !== undefined
-          ? { lengthRange: g.lengthFilter }
-          : {}),
+        ...(g.attrFilters.length !== 0 ? { attrFilters: g.attrFilters } : {}),
       }));
       const perGroupIds = await compute(configs);
       // uint64 ids as decimal strings so JSON keeps them exact past 2**53.
@@ -786,9 +783,8 @@ export class TractExportTab extends Tab {
       rois: g.rois,
       colorPacked: 0,
       visible: true,
-      highDetail: false,
       colorBy: g.colorBy,
-      ...(g.lengthFilter !== undefined ? { lengthRange: g.lengthFilter } : {}),
+      ...(g.attrFilters.length !== 0 ? { attrFilters: g.attrFilters } : {}),
     }));
     const perGroupIds = await compute(configs);
     const seen = new Set<bigint>();

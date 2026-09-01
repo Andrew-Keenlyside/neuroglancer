@@ -83,7 +83,6 @@ export interface RoiFilterChunkEntry {
 export interface RoiFilterResult {
   passing: Set<bigint>;
   colorById: Map<bigint, number>;
-  highDetail: Set<bigint>;
 }
 
 function shapeToJson(shape: RoiShape): any {
@@ -127,7 +126,6 @@ function groupToJson(group: RoiGroupConfig): any {
     rois: group.rois.map(roiToJson),
     colorPacked: group.colorPacked,
     visible: group.visible,
-    highDetail: group.highDetail,
   };
 }
 
@@ -239,13 +237,16 @@ function decodeResponse(buffer: ArrayBuffer): RoiFilterResult {
     );
   }
   const numPassing = view.getUint32(4, true);
+  // The high-detail id list still occupies its slot in the wire format (the
+  // service is shared with tooling that has not been rebuilt), but nothing
+  // consumes it: no group can ask for full detail any more, so it always
+  // arrives empty. Its length is read only to step over it.
   const numHighDetail = view.getUint32(8, true);
   const numColors = view.getUint32(12, true);
 
   let offset = RESPONSE_HEADER_BYTES;
   const passingRaw = new BigUint64Array(buffer, offset, numPassing);
   offset += numPassing * 8;
-  const highDetailRaw = new BigUint64Array(buffer, offset, numHighDetail);
   offset += numHighDetail * 8;
   const colorIds = new BigUint64Array(buffer, offset, numColors);
   offset += numColors * 8;
@@ -257,13 +258,11 @@ function decodeResponse(buffer: ArrayBuffer): RoiFilterResult {
 
   const passing = new Set<bigint>();
   for (const id of passingRaw) passing.add(id);
-  const highDetail = new Set<bigint>();
-  for (const id of highDetailRaw) highDetail.add(id);
   const colorById = new Map<bigint, number>();
   for (let i = 0; i < numColors; ++i) {
     colorById.set(colorIds[i], colorValues[i]);
   }
-  return { passing, colorById, highDetail };
+  return { passing, colorById };
 }
 
 /**

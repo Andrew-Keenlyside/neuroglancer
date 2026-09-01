@@ -20,8 +20,7 @@ import {
   buildSpatialSkeletonGridLevels,
   getDefaultSpatiallyIndexedSkeletonChunkSize,
   getSpatialSkeletonGridSpacing,
-  bytesPerObjectFromLevelCounts,
-  objectBudgetFromBytes,
+  targetSpacingForCellBudget,
   selectSpatialSkeletonGridLevelByBudget,
   sortSpatialSkeletonGridSizes,
   type SpatialSkeletonGridSize,
@@ -246,6 +245,74 @@ describe("selectSpatialSkeletonGridLevelByBudget", () => {
   });
 });
 
+describe("targetSpacingForCellBudget", () => {
+  // hcp1065: 210 cells at every level, coarsest-first spacings in metres and
+  // whole-level costs of 0.5 MB / 4.8 MB / 48 MB / 489 MB / 4.9 GB.
+  const spacings = [0.657, 0.312, 0.145, 0.067, 0.031];
+  const perCell = [0.5e6, 4.8e6, 48e6, 489e6, 4900e6].map((c) => c / 210);
+  const GB = 1e9;
+
+  it("spreads a whole-volume view thin", () => {
+    // All 210 cells in view: 4.8 MB each, so the 2.3 MB/cell level wins and the
+    // 23 MB/cell finest level does not.
+    expect(targetSpacingForCellBudget(spacings, perCell, 210, GB)).toBe(0.067);
+  });
+
+  it("affords the finest level once the view narrows", () => {
+    // The property that makes this LOCAL: fewer cells in view, more budget each.
+    expect(targetSpacingForCellBudget(spacings, perCell, 26, GB)).toBe(0.031);
+  });
+
+  it("moves monotonically finer as fewer cells are visible", () => {
+    let previous = Number.POSITIVE_INFINITY;
+    for (const cells of [210, 120, 60, 26, 8, 1]) {
+      const target = targetSpacingForCellBudget(spacings, perCell, cells, GB)!;
+      expect(target).toBeLessThanOrEqual(previous);
+      previous = target;
+    }
+  });
+
+  it("moves finer as the memory limit rises", () => {
+    // 210 cells of the finest level cost 23.3 MB each, so it needs ~4.9 GB to
+    // be affordable across a whole-volume view; 4 GB is not enough and 8 GB is.
+    expect(targetSpacingForCellBudget(spacings, perCell, 210, 4 * GB)).toBe(
+      0.067,
+    );
+    expect(targetSpacingForCellBudget(spacings, perCell, 210, 8 * GB)).toBe(
+      0.031,
+    );
+  });
+
+  it("falls back to the coarsest level rather than showing nothing", () => {
+    // Even one cell of the coarsest level overruns; sparse data beats none.
+    expect(targetSpacingForCellBudget(spacings, perCell, 210, 1)).toBe(0.657);
+  });
+
+  it("does not treat an unknown per-cell cost as affordable", () => {
+    const unknown = [
+      perCell[0],
+      Number.NaN,
+      perCell[2],
+      Number.NaN,
+      perCell[4],
+    ];
+    expect(targetSpacingForCellBudget(spacings, unknown, 210, GB)).toBe(0.145);
+  });
+
+  it("declines when the inputs cannot support an answer", () => {
+    expect(targetSpacingForCellBudget([], [], 210, GB)).toBeUndefined();
+    expect(
+      targetSpacingForCellBudget(spacings, perCell, 0, GB),
+    ).toBeUndefined();
+    expect(
+      targetSpacingForCellBudget(spacings, perCell, 210, 0),
+    ).toBeUndefined();
+    expect(
+      targetSpacingForCellBudget(spacings, [1, 2], 210, GB),
+    ).toBeUndefined();
+  });
+});
+
 describe("buildSpatialSkeletonGridLevels — object counts", () => {
   const sizes = [
     { x: 8, y: 8, z: 8 },
@@ -281,55 +348,5 @@ describe("buildSpatialSkeletonGridLevels — object counts", () => {
     expect(levels).toHaveLength(3);
     expect(levels.every((l) => l.objectCount === undefined)).toBe(true);
     expect(levels.map((l) => l.lod)).toEqual([0, 0.5, 1]);
-  });
-});
-
-describe("bytesPerObjectFromLevelCounts", () => {
-  it("scales vertices-per-object by the per-vertex cost", () => {
-    // 200 vertices per object at 40 bytes each.
-    expect(bytesPerObjectFromLevelCounts(103369, 503, 40)).toBeCloseTo(
-      (103369 / 503) * 40,
-    );
-  });
-
-  it("declines when the counts are equal", () => {
-    // A pyramid without per-level object counts substitutes the vertex counts,
-    // so the ratio degenerates to 1.0 vertex per object -- a budget wrong by two
-    // orders of magnitude on a tractogram. Better to decline than to fabricate.
-    expect(bytesPerObjectFromLevelCounts(5000, 5000, 40)).toBeUndefined();
-  });
-
-  it("declines on missing, zero or non-finite inputs", () => {
-    expect(bytesPerObjectFromLevelCounts(undefined, 10, 40)).toBeUndefined();
-    expect(bytesPerObjectFromLevelCounts(1000, undefined, 40)).toBeUndefined();
-    expect(bytesPerObjectFromLevelCounts(1000, 0, 40)).toBeUndefined();
-    expect(bytesPerObjectFromLevelCounts(0, 10, 40)).toBeUndefined();
-    expect(bytesPerObjectFromLevelCounts(1000, 10, 0)).toBeUndefined();
-    expect(bytesPerObjectFromLevelCounts(Number.NaN, 10, 40)).toBeUndefined();
-  });
-});
-
-describe("objectBudgetFromBytes", () => {
-  it("floors to whole objects", () => {
-    expect(objectBudgetFromBytes(1000, 300)).toBe(3);
-  });
-
-  it("is 0 when it cannot afford one", () => {
-    expect(objectBudgetFromBytes(100, 300)).toBe(0);
-  });
-
-  it("is 0 rather than negative or infinite on bad input", () => {
-    expect(objectBudgetFromBytes(-5, 300)).toBe(0);
-    expect(objectBudgetFromBytes(1000, 0)).toBe(0);
-    expect(objectBudgetFromBytes(Number.NaN, 300)).toBe(0);
-  });
-
-  it("converts a real half-share of a 1 GB pool", () => {
-    // 500 MB at ~8.1 kB per tract: a few tens of thousands of streamlines,
-    // which is the order the default manual budget assumed.
-    const perObject = bytesPerObjectFromLevelCounts(103369, 503, 40)!;
-    const budget = objectBudgetFromBytes(0.5e9, perObject);
-    expect(budget).toBeGreaterThan(10_000);
-    expect(budget).toBeLessThan(200_000);
   });
 });

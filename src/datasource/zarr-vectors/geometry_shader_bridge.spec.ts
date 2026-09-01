@@ -9,7 +9,8 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_STREAMLINE_FRAGMENT_MAIN,
   buildVertexAttributeMap,
-} from "#src/datasource/zarr-vectors/skeleton_shader_bridge.js";
+  zvPackedAttributeRange,
+} from "#src/datasource/zarr-vectors/geometry_shader_bridge.js";
 import { DataType } from "#src/util/data_type.js";
 
 describe("buildVertexAttributeMap — `prop_<name>()` shader bridge", () => {
@@ -23,6 +24,28 @@ describe("buildVertexAttributeMap — `prop_<name>()` shader bridge", () => {
     const tangent = map.get("tangent")!;
     expect(tangent.dataType).toBe(DataType.FLOAT32);
     expect(tangent.numComponents).toBe(3);
+  });
+
+  it("keys the map by the shader-facing id, not the on-disk name", () => {
+    // Store attribute names are unrestricted; the map keys become
+    // `prop_<key>()` GLSL macros, so the datasource supplies legal ids.
+    const map = buildVertexAttributeMap({
+      attributeNames: ["gene_H2-Q2"],
+      attributeDtypes: ["float32"],
+      attributePropertyIds: ["gene_H2_Q2"],
+      geometryKind: "streamline",
+    });
+    expect(Array.from(map.keys())).toEqual(["tangent", "gene_H2_Q2"]);
+    expect(map.get("gene_H2_Q2")!.dataType).toBe(DataType.FLOAT32);
+  });
+
+  it("falls back to the on-disk names when no ids are supplied", () => {
+    const map = buildVertexAttributeMap({
+      attributeNames: ["fa"],
+      attributeDtypes: ["float32"],
+      geometryKind: "streamline",
+    });
+    expect(Array.from(map.keys())).toEqual(["tangent", "fa"]);
   });
 
   it("prepends tangent for polyline geometry too", () => {
@@ -64,14 +87,18 @@ describe("buildVertexAttributeMap — `prop_<name>()` shader bridge", () => {
       numComponents: 1,
     });
     expect(map.get("label")).toEqual({
-      dataType: DataType.UINT16,
+      dataType: DataType.FLOAT32,
       numComponents: 1,
     });
   });
 
-  it("maps every zarr-vectors attribute dtype to a neuroglancer DataType", () => {
+  it("presents every on-disk dtype as float32", () => {
+    // The decoder converts everything (see `vertex_attribute_float.ts`), so
+    // the shader sees one type. That is what lets a shader written against a
+    // float gene column compile against an int32 section label -- integer
+    // attributes used to arrive as an `int32_t` struct needing `toRaw()`.
     const map = buildVertexAttributeMap({
-      attributeNames: ["a", "b", "c", "d", "e", "f", "g"],
+      attributeNames: ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
       attributeDtypes: [
         "float32",
         "uint8",
@@ -80,16 +107,15 @@ describe("buildVertexAttributeMap — `prop_<name>()` shader bridge", () => {
         "int8",
         "int16",
         "int32",
+        "float64",
+        "int64",
+        "uint64",
       ],
       geometryKind: "skeleton",
     });
-    expect(map.get("a")!.dataType).toBe(DataType.FLOAT32);
-    expect(map.get("b")!.dataType).toBe(DataType.UINT8);
-    expect(map.get("c")!.dataType).toBe(DataType.UINT16);
-    expect(map.get("d")!.dataType).toBe(DataType.UINT32);
-    expect(map.get("e")!.dataType).toBe(DataType.INT8);
-    expect(map.get("f")!.dataType).toBe(DataType.INT16);
-    expect(map.get("g")!.dataType).toBe(DataType.INT32);
+    for (const name of ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]) {
+      expect(map.get(name)!.dataType).toBe(DataType.FLOAT32);
+    }
   });
 
   it("ordering matches the backend's chunk.vertexAttributes packing convention", () => {
@@ -133,5 +159,42 @@ describe("DEFAULT_STREAMLINE_FRAGMENT_MAIN", () => {
 
   it("has a void-main GLSL entry point", () => {
     expect(DEFAULT_STREAMLINE_FRAGMENT_MAIN).toMatch(/^void main\(\) \{/);
+  });
+});
+
+describe("zvPackedAttributeRange", () => {
+  it("covers the store's attributes, after position", () => {
+    // A point cloud has no synthesised tangent: position, then the store's
+    // columns, then the synthesised segment column.
+    expect(
+      zvPackedAttributeRange({
+        attributeNames: ["gene_a", "gene_b", "brain_section_label"],
+        geometryKind: "point_cloud",
+      }),
+    ).toEqual({ start: 1, count: 3 });
+  });
+
+  it("steps over the synthesised tangent when the kind has one", () => {
+    expect(
+      zvPackedAttributeRange({
+        attributeNames: ["radius"],
+        geometryKind: "streamline",
+      }),
+    ).toEqual({ start: 2, count: 1 });
+  });
+
+  it("packs nothing when the store declares no attributes", () => {
+    expect(
+      zvPackedAttributeRange({ attributeNames: [], geometryKind: "skeleton" }),
+    ).toBeUndefined();
+  });
+
+  it("scales to a store far wider than the old texture-unit budget", () => {
+    // 1136 columns is what Zhuang-ABCA-1 has; the point of the packing is that
+    // the number stops mattering.
+    const attributeNames = Array.from({ length: 1136 }, (_, i) => `gene_${i}`);
+    expect(
+      zvPackedAttributeRange({ attributeNames, geometryKind: "point_cloud" }),
+    ).toEqual({ start: 1, count: 1136 });
   });
 });

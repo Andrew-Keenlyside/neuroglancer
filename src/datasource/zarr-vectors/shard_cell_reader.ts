@@ -47,7 +47,6 @@ import "#src/datasource/zarr/codec/bytes/resolve.js";
 import "#src/datasource/zarr/codec/bytes/decode.js";
 import "#src/datasource/zarr/codec/crc32c/resolve.js";
 import "#src/datasource/zarr/codec/crc32c/decode.js";
-import "#src/datasource/zarr/codec/sharding_indexed/decode.js";
 
 import type { ChunkManager } from "#src/chunk_manager/backend.js";
 import { parseCodecChainSpec } from "#src/datasource/zarr/codec/resolve.js";
@@ -68,7 +67,7 @@ import { RefCounted } from "#src/util/disposable.js";
 /**
  * Per-array chunk-grid geometry needed to map an absolute spatial chunk coord to
  * its physical (possibly sharded) on-disk cell. Read from the array's `zarr.json`
- * on the frontend (see `buildSkeletonMetadata`) and threaded via source params.
+ * on the frontend (see `buildGeometryMetadata`) and threaded via source params.
  */
 export interface ChunkGridDescriptor {
   /** `attributes.chunk_grid_origin` (absent ⇒ zeros). arrayIndex = C − origin. */

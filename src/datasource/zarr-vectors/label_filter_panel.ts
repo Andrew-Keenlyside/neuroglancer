@@ -344,8 +344,8 @@ export class LabelFilterPanel extends RefCounted {
       color: vec3.clone(PREVIEW_COLOR),
       visible: true,
       opacity: 1,
-      highDetail: false,
       colorBy: { kind: "group" },
+      attrFilters: [],
       rois,
     });
     // A staged selection is meant to be seen, so turn the filter on.

@@ -18,18 +18,27 @@
 
 import { decodeFragments } from "#src/datasource/zarr-vectors/fragment_index.js";
 import {
-  intraOffsets,
-  linksPath,
-} from "#src/datasource/zarr-vectors/links_paths.js";
-import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
-import {
-  buildSkeletonChunk,
+  buildGeometryChunk,
   type AttributeTypedArray,
   type GhostVertexRecord,
   type LinksConvention,
   type SkeletonChunk,
-  type SkeletonGeometryKind,
-} from "#src/datasource/zarr-vectors/skeleton_chunk.js";
+  type GeometryKind,
+} from "#src/datasource/zarr-vectors/geometry_chunk.js";
+import { KIND_CAPABILITIES } from "#src/datasource/zarr-vectors/geometry_kind.js";
+import {
+  intraOffsets,
+  linksPath,
+} from "#src/datasource/zarr-vectors/links_paths.js";
+import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
+import type { VertexAttributeDtype } from "#src/datasource/zarr-vectors/vertex_attribute_float.js";
+import {
+  ATTRIBUTE_ELEMENT_BYTES,
+  decodeAttributeExactInts,
+  decodeAttributeToFloat32,
+  isExactIntDtype,
+  zeroAttribute,
+} from "#src/datasource/zarr-vectors/vertex_attribute_float.js";
 import { readVlenBytesElement } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 
 /** Supported on-disk integer dtype for `links/0/<chunk>`. */
@@ -42,15 +51,12 @@ export type LinkDtype =
   | "int32"
   | "int64";
 
-/** Supported on-disk dtype for a per-vertex attribute. */
-export type AttributeDtype =
-  | "float32"
-  | "uint8"
-  | "uint16"
-  | "uint32"
-  | "int8"
-  | "int16"
-  | "int32";
+/**
+ * Supported on-disk dtype for a per-vertex attribute. Every one of them
+ * decodes to float32 before it leaves this module -- see
+ * `vertex_attribute_float.ts` for why.
+ */
+export type AttributeDtype = VertexAttributeDtype;
 
 /**
  * Inputs the orchestrator needs to download a chunk.
@@ -63,7 +69,7 @@ export type AttributeDtype =
  * presence) — the orchestrator interprets that as "no data here" and
  * returns an empty `SkeletonChunk` when even the vertex blob is absent.
  */
-export interface SkeletonChunkDownloadOptions {
+export interface GeometryChunkDownloadOptions {
   /** Spatial chunk key, e.g. `"3.0.2"`. */
   readonly chunkKey: string;
   /** Rank of the position vectors (== sid_ndim). */
@@ -81,7 +87,7 @@ export interface SkeletonChunkDownloadOptions {
   /** How vertex-to-vertex edges are encoded for this geometry type. */
   readonly linksConvention: LinksConvention;
   /** Geometry kind (drives whether per-vertex tangents are precomputed). */
-  readonly geometryKind: SkeletonGeometryKind;
+  readonly geometryKind: GeometryKind;
   /**
    * Whether `fragment_attributes/segment_id` chunks are present in this
    * level.  When false the fetch is skipped entirely (avoids 404 noise for
@@ -89,6 +95,21 @@ export interface SkeletonChunkDownloadOptions {
    * Defaults to true for backward-compatibility with callers that don't set it.
    */
   readonly hasFragmentSegmentIds?: boolean;
+  /**
+   * Name of a per-vertex attribute (one of {@link attributeNames}) carrying a
+   * meaningful integer id for each vertex -- a cell label, a particle id.  Used
+   * only by kinds without the discrete-object model (`point_cloud`), where it
+   * is the one way to get ids that mean something and stay stable across
+   * pyramid levels.  Absent: ids are synthesised from the chunk key and the
+   * vertex's index within the chunk.
+   */
+  readonly vertexIdAttribute?: string;
+  /**
+   * The links family's declared `link_width`. 2 for edges; >= 3 for surface
+   * faces (3 = triangles, 4 = quads). Defaults to 2, which is every non-mesh
+   * geometry.
+   */
+  readonly linkWidth?: number;
   /**
    * Reads one per-chunk array cell, given the array's relative path (e.g.
    * `"vertices"`, `"vertex_fragments"`, `"links/0/<offsets>"`) and the ABSOLUTE
@@ -102,18 +123,25 @@ export interface SkeletonChunkDownloadOptions {
 
 /** Number of bytes per element of an attribute / link dtype. */
 const BYTES_PER_ELEMENT: Record<LinkDtype | AttributeDtype, number> = {
-  float32: 4,
-  uint8: 1,
-  uint16: 2,
-  uint32: 4,
-  int8: 1,
-  int16: 2,
-  int32: 4,
-  int64: 8,
+  ...ATTRIBUTE_ELEMENT_BYTES,
 };
 
+/**
+ * Dtypes a typed-array view can reinterpret in place. The 64-bit attribute
+ * dtypes are absent by construction: they are downcast to float32 on decode
+ * rather than viewed, and links handle `int64` separately.
+ */
+type ViewableDtype =
+  | "float32"
+  | "uint8"
+  | "uint16"
+  | "uint32"
+  | "int8"
+  | "int16"
+  | "int32";
+
 const ATTRIBUTE_CTORS: Record<
-  AttributeDtype,
+  ViewableDtype,
   | Float32ArrayConstructor
   | Uint8ArrayConstructor
   | Uint16ArrayConstructor
@@ -139,7 +167,7 @@ const ATTRIBUTE_CTORS: Record<
  */
 function reinterpretBytes(
   bytes: Uint8Array,
-  dtype: AttributeDtype,
+  dtype: ViewableDtype,
   expectedElements: number,
 ): AttributeTypedArray {
   const elementSize = BYTES_PER_ELEMENT[dtype];
@@ -227,7 +255,7 @@ function reinterpretLinkBytes(
  * represents "no data here" for a populated grid cell.
  */
 async function readChunkBlob(
-  cellRead: SkeletonChunkDownloadOptions["cellRead"],
+  cellRead: GeometryChunkDownloadOptions["cellRead"],
   arrayPath: string,
   chunkKey: string,
   signal: AbortSignal,
@@ -244,8 +272,136 @@ async function readChunkBlob(
   }
 }
 
-export async function downloadSkeletonChunk(
-  options: SkeletonChunkDownloadOptions,
+/**
+ * Pack a spatial chunk key (`"3.0.2"`, components may be negative) into the
+ * high word of a synthesised vertex id, so ids stay distinct across chunks.
+ *
+ * Each component is offset into `[0, 1024)` and packed into 10 bits, which
+ * covers grid coordinates in `[-512, 511]` for ranks up to 3 -- comfortably
+ * more than any store's chunk grid. Anything outside that (or rank > 3) falls
+ * back to an FNV-1a hash of the key: still deterministic, with a vanishing
+ * chance that two chunks share an id space.
+ */
+export function packChunkKeyToIdWord(chunkKey: string): number {
+  const parts = chunkKey.split(".");
+  if (parts.length <= 3) {
+    let packed = 0;
+    let exact = true;
+    for (let i = 0; i < parts.length; ++i) {
+      const c = Number(parts[i]);
+      if (!Number.isInteger(c) || c < -512 || c > 511) {
+        exact = false;
+        break;
+      }
+      packed = (packed << 10) | (c + 512);
+    }
+    if (exact) return packed >>> 0;
+  }
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < chunkKey.length; ++i) {
+    hash ^= chunkKey.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Resolve the per-vertex id column named by `vertexIdAttribute`, or `undefined`
+ * when there is none to use.
+ *
+ * Decoded from the raw blob rather than from the float32 column the render
+ * layer gets, because these values become picking ids and must be exact.
+ * That also rules out the dtypes float32 cannot hold exactly: `float32`
+ * itself, and the 64-bit dtypes, whose float32 form loses exactness above
+ * 2^24 -- a MICrONS `synapse_id` silently truncated is worse than a
+ * synthesised id that never claimed to mean anything.
+ */
+function resolveVertexIdColumn(options: {
+  vertexIdAttribute: string | undefined;
+  attributeNames: readonly string[];
+  attributeDtypes: readonly AttributeDtype[];
+  attributeBlobs: readonly (Uint8Array | undefined)[];
+  numVertices: number;
+}): ArrayLike<number> | undefined {
+  const {
+    vertexIdAttribute,
+    attributeNames,
+    attributeDtypes,
+    attributeBlobs,
+    numVertices,
+  } = options;
+  if (vertexIdAttribute === undefined) return undefined;
+  const i = attributeNames.indexOf(vertexIdAttribute);
+  if (i < 0) {
+    warnOnceDownload(
+      `vertex-id-missing-${vertexIdAttribute}`,
+      `zarr-vectors: vertex_id_attribute ${JSON.stringify(vertexIdAttribute)} ` +
+        "is not one of this level's vertex attributes; synthesising point ids " +
+        "from the chunk key instead.",
+    );
+    return undefined;
+  }
+  const dtype = attributeDtypes[i];
+  if (!isExactIntDtype(dtype)) {
+    warnOnceDownload(
+      `vertex-id-inexact-${vertexIdAttribute}`,
+      `zarr-vectors: vertex_id_attribute ${JSON.stringify(vertexIdAttribute)} ` +
+        `is ${dtype}; ids must be exact integers of at most 32 bits, so ` +
+        "synthesising point ids from the chunk key instead.",
+    );
+    return undefined;
+  }
+  const bytes = attributeBlobs[i];
+  if (bytes === undefined) return undefined;
+  return decodeAttributeExactInts(bytes, dtype, numVertices);
+}
+
+/**
+ * Fill the interleaved `[lo, hi]` segment column with one id per vertex.
+ *
+ * With a declared id column the id is that column's value, so it means
+ * something to the user and is stable across pyramid levels.  Otherwise it is
+ * `[vertex index within chunk, packed chunk key]`, which is unique within a
+ * level but NOT stable across levels -- coarser levels replace points with
+ * bin-centroid metanodes, so there is no vertex for an id to follow.
+ */
+function fillPerVertexSegmentIds(
+  segmentIds: Uint32Array,
+  numVertices: number,
+  chunkKey: string,
+  idColumnOptions: {
+    vertexIdAttribute: string | undefined;
+    attributeNames: readonly string[];
+    attributeDtypes: readonly AttributeDtype[];
+    attributeBlobs: readonly (Uint8Array | undefined)[];
+    numVertices: number;
+  },
+): void {
+  const idValues = resolveVertexIdColumn(idColumnOptions);
+  if (idValues !== undefined) {
+    for (let v = 0; v < numVertices; ++v) {
+      segmentIds[v * 2] = idValues[v] >>> 0;
+      segmentIds[v * 2 + 1] = 0;
+    }
+    return;
+  }
+  const chunkWord = packChunkKeyToIdWord(chunkKey);
+  for (let v = 0; v < numVertices; ++v) {
+    segmentIds[v * 2] = v >>> 0;
+    segmentIds[v * 2 + 1] = chunkWord;
+  }
+}
+
+/** Keys already warned about, so one diagnostic does not repeat per chunk. */
+const warnedDownloadKeys = new Set<string>();
+function warnOnceDownload(key: string, message: string): void {
+  if (warnedDownloadKeys.has(key)) return;
+  warnedDownloadKeys.add(key);
+  console.warn(message);
+}
+
+export async function downloadGeometryChunk(
+  options: GeometryChunkDownloadOptions,
   signal: AbortSignal,
 ): Promise<SkeletonChunk | undefined> {
   const {
@@ -256,22 +412,81 @@ export async function downloadSkeletonChunk(
     attributeDtypes,
     linksConvention,
     geometryKind,
+    vertexIdAttribute,
+    linkWidth = 2,
     cellRead,
   } = options;
   if (attributeNames.length !== attributeDtypes.length) {
     throw new Error(
-      `downloadSkeletonChunk: attributeNames (${attributeNames.length}) ` +
+      `downloadGeometryChunk: attributeNames (${attributeNames.length}) ` +
         `and attributeDtypes (${attributeDtypes.length}) length mismatch`,
     );
   }
 
-  // 1. Vertices — required.
-  const vertexBytes = await readChunkBlob(
+  // Every per-chunk blob this function needs is requested HERE, in one wave.
+  //
+  // These reads used to be awaited in the order they are consumed -- vertices,
+  // then vertex_fragments, then links, then the attribute fan-out -- which put
+  // three serial round trips in front of a chunk that needs one. Nothing
+  // downstream feeds a later read's ADDRESS: every blob is keyed by the same
+  // `chunkKey`, and the only thing the vertex blob contributes is
+  // `numVertices`, which is needed to DECODE the attributes, not to ask for
+  // them. So the ordering bought nothing and cost 3x the latency on every
+  // chunk scrolled into view -- multiplied, for a wide store, by the ~4800
+  // chunks a whole-brain point cloud spans.
+  //
+  // An absent chunk still costs nothing extra: `cellRead` answers from the
+  // cached shard index without a request when the cell is empty, and every
+  // array of a level shares that grid, so the early return below discards
+  // resolved `undefined`s rather than cancelling in-flight fetches.
+  const vertexBytesPromise = readChunkBlob(
     cellRead,
     "vertices",
     chunkKey,
     signal,
   );
+  const fragmentBytesPromise = readChunkBlob(
+    cellRead,
+    "vertex_fragments",
+    chunkKey,
+    signal,
+  );
+  const intraLinksArray = linksPath(0, intraOffsets(rank, linkWidth));
+  const needsExplicitLinks =
+    linksConvention === "explicit" ||
+    linksConvention === "implicit_sequential_with_branches";
+  const linkBytesPromise = needsExplicitLinks
+    ? readChunkBlob(cellRead, intraLinksArray, chunkKey, signal)
+    : undefined;
+  const attributeBlobsPromise = Promise.all(
+    attributeNames.map((name) =>
+      readChunkBlob(cellRead, `vertex_attributes/${name}`, chunkKey, signal),
+    ),
+  );
+  const segFragBytesPromise: Promise<Uint8Array | undefined> =
+    (options.hasFragmentSegmentIds ?? true)
+      ? readChunkBlob(
+          cellRead,
+          "fragment_attributes/segment_id",
+          chunkKey,
+          signal,
+        )
+      : Promise.resolve(undefined);
+  // Mark the companions handled so an early return (absent chunk) or a throw
+  // on an earlier await cannot surface one of them as an unhandled rejection.
+  // Attaching a no-op catch creates a NEW derived promise; the originals still
+  // reject, and the awaits below still see it.
+  for (const p of [
+    fragmentBytesPromise,
+    linkBytesPromise,
+    attributeBlobsPromise,
+    segFragBytesPromise,
+  ]) {
+    p?.catch(() => {});
+  }
+
+  // 1. Vertices — required.
+  const vertexBytes = await vertexBytesPromise;
   if (vertexBytes === undefined || vertexBytes.byteLength === 0) {
     return undefined;
   }
@@ -290,12 +505,7 @@ export async function downloadSkeletonChunk(
   ) as Float32Array;
 
   // 2. Fragment index — required.
-  const fragmentBytes = await readChunkBlob(
-    cellRead,
-    "vertex_fragments",
-    chunkKey,
-    signal,
-  );
+  const fragmentBytes = await fragmentBytesPromise;
   if (fragmentBytes === undefined) {
     throw new Error(
       `zarr-vectors chunk ${chunkKey} has vertices but vertex_fragments is missing`,
@@ -312,35 +522,36 @@ export async function downloadSkeletonChunk(
   // the backend's links reader. This intra array's cell is a flat int64 pair
   // list (the `delta==0 && is_intra` "flat" encoding), which reinterpretLinkBytes
   // reads directly.
-  const intraLinksArray = linksPath(0, intraOffsets(rank, 2));
-  let explicitEdges: Uint32Array | undefined;
-  if (
-    linksConvention === "explicit" ||
-    linksConvention === "implicit_sequential_with_branches"
-  ) {
-    const linkBytes = await readChunkBlob(
-      cellRead,
-      intraLinksArray,
-      chunkKey,
-      signal,
-    );
+  let intraLinkRecords: Uint32Array | undefined;
+  if (linkBytesPromise !== undefined) {
+    const linkBytes = await linkBytesPromise;
     if (linkBytes === undefined || linkBytes.byteLength === 0) {
       // implicit_sequential_with_branches with no explicit branches in
-      // this chunk is legitimate (a leaf-only sub-skeleton).
-      explicitEdges = new Uint32Array(0);
+      // this chunk is legitimate (a leaf-only sub-skeleton), and so is a Draco
+      // mesh chunk, whose intra-chunk faces live in the bitstream rather than
+      // here (spec: geometry_types/mesh.md, "Face storage and Draco").
+      intraLinkRecords = new Uint32Array(0);
     } else {
       const elementSize = BYTES_PER_ELEMENT[linkDtype];
       const totalElements = linkBytes.byteLength / elementSize;
-      if (totalElements % 2 !== 0) {
+      if (totalElements % linkWidth !== 0) {
         throw new Error(
           `zarr-vectors ${intraLinksArray}/${chunkKey}: ${totalElements} ` +
-            `elements is not a multiple of link_width=2`,
+            `elements is not a multiple of link_width=${linkWidth}`,
         );
       }
-      const numEdges = totalElements / 2;
-      explicitEdges = reinterpretLinkBytes(linkBytes, linkDtype, numEdges, 2);
+      intraLinkRecords = reinterpretLinkBytes(
+        linkBytes,
+        linkDtype,
+        totalElements / linkWidth,
+        linkWidth,
+      );
     }
   }
+  // A record of arity 2 is an edge; anything wider bounds a face.
+  const isSurface = linkWidth > 2;
+  const explicitEdges = isSurface ? undefined : intraLinkRecords;
+  const faces = isSurface ? intraLinkRecords : undefined;
 
   // 4. Per-vertex attributes — one fetch per declared attribute name.
   // A missing per-chunk attribute blob is tolerated and degrades to a
@@ -359,44 +570,25 @@ export async function downloadSkeletonChunk(
   // the spatially-indexed skeleton shader handles "this segment has no
   // value" elsewhere and avoids cascading layer failures from a
   // single missing optional blob.
-  // Fetched concurrently with `fragment_attributes/segment_id` below (5):
-  // both are independent per-chunk reads, and awaiting them sequentially
-  // would tack a full extra round trip onto every chunk's download — this
-  // sits directly on the critical path for how quickly a chunk newly
-  // scrolled into view becomes pickable, which visibly stalled continuous
-  // multi-segment drag-selection once `hasFragmentSegmentIds` (5) became
-  // true for every pyramid level instead of only some.
+  // Requested in the opening wave alongside the vertices, the fragment index
+  // and the links, so a chunk costs ONE round trip however many attribute
+  // columns the source exposes -- the fan-out is still one blob per column,
+  // and on a MERFISH panel that fan-out is the whole download.
   const numFragments = fragmentIndex.numFragments;
-  const segFragBytesPromise: Promise<Uint8Array | undefined> =
-    (options.hasFragmentSegmentIds ?? true)
-      ? readChunkBlob(
-          cellRead,
-          "fragment_attributes/segment_id",
-          chunkKey,
-          signal,
-        )
-      : Promise.resolve(undefined);
-  const [vertexAttributes, segFragBytes] = await Promise.all([
-    Promise.all(
-      attributeNames.map(async (name, i) => {
-        const bytes = await readChunkBlob(
-          cellRead,
-          `vertex_attributes/${name}`,
-          chunkKey,
-          signal,
-        );
-        if (bytes === undefined) {
-          return reinterpretBytes(
-            new Uint8Array(numVertices * BYTES_PER_ELEMENT[attributeDtypes[i]]),
-            attributeDtypes[i],
-            numVertices,
-          );
-        }
-        return reinterpretBytes(bytes, attributeDtypes[i], numVertices);
-      }),
-    ),
+  const [attributeBlobs, segFragBytes] = await Promise.all([
+    attributeBlobsPromise,
     segFragBytesPromise,
   ]);
+  // Every attribute decodes to float32, whatever it is on disk: that is the
+  // one representation the render layer packs into a single texture, and it is
+  // what lets an int64 category code or a float64 score be colourable at all.
+  // The raw blobs stay in scope just below, for the id column's exact decode.
+  const vertexAttributes: AttributeTypedArray[] = attributeBlobs.map(
+    (bytes, i) =>
+      bytes === undefined
+        ? zeroAttribute(numVertices)
+        : decodeAttributeToFloat32(bytes, attributeDtypes[i], numVertices),
+  );
 
   // 5. Per-fragment segment_id → synthesised per-vertex "segment" column.
   // The writer stores one uint64 flywire id per fragment under
@@ -423,28 +615,59 @@ export async function downloadSkeletonChunk(
       ),
     );
   }
+  // The declared per-vertex id column, decoded for EVERY geometry kind rather
+  // than only for point clouds. A point cloud spends it as the vertex's segment
+  // id (each point is its own object); everything else needs it as node
+  // identity, which is what the editing UI picks by.
+  const idColumn = resolveVertexIdColumn({
+    vertexIdAttribute,
+    attributeNames,
+    attributeDtypes,
+    attributeBlobs,
+    numVertices,
+  });
+  let nodeIds: Int32Array | undefined;
+  if (idColumn !== undefined) {
+    nodeIds = new Int32Array(numVertices);
+    for (let v = 0; v < numVertices; ++v) nodeIds[v] = idColumn[v];
+  }
+
   // Two uint32 per vertex: [lo, hi].
   const segmentIds = new Uint32Array(numVertices * 2);
-  for (let f = 0; f < numFragments; ++f) {
-    let lo: number;
-    let hi: number;
-    if (fragSegIds !== undefined) {
-      const id = fragSegIds[f];
-      lo = Number(id & 0xffffffffn) >>> 0;
-      hi = Number((id >> 32n) & 0xffffffffn) >>> 0;
-    } else {
-      lo = f;
-      hi = 0;
-    }
-    const idxs = fragmentIndex.indices(f);
-    for (let k = 0; k < idxs.length; ++k) {
-      const v = idxs[k];
-      segmentIds[v * 2] = lo;
-      segmentIds[v * 2 + 1] = hi;
+  if (!KIND_CAPABILITIES[geometryKind].hasObjectModel) {
+    // No discrete-object model (point_cloud): the "segment" a vertex belongs to
+    // is the vertex itself, so picking selects one point rather than a whole
+    // spatial bin.  A fragment here IS a bin holding many unrelated points, so
+    // the per-fragment path below would lump them together.
+    fillPerVertexSegmentIds(segmentIds, numVertices, chunkKey, {
+      vertexIdAttribute,
+      attributeNames,
+      attributeDtypes,
+      attributeBlobs,
+      numVertices,
+    });
+  } else {
+    for (let f = 0; f < numFragments; ++f) {
+      let lo: number;
+      let hi: number;
+      if (fragSegIds !== undefined) {
+        const id = fragSegIds[f];
+        lo = Number(id & 0xffffffffn) >>> 0;
+        hi = Number((id >> 32n) & 0xffffffffn) >>> 0;
+      } else {
+        lo = f;
+        hi = 0;
+      }
+      const idxs = fragmentIndex.indices(f);
+      for (let k = 0; k < idxs.length; ++k) {
+        const v = idxs[k];
+        segmentIds[v * 2] = lo;
+        segmentIds[v * 2 + 1] = hi;
+      }
     }
   }
 
-  return buildSkeletonChunk({
+  return buildGeometryChunk({
     rank,
     positions,
     fragmentIndex,
@@ -453,6 +676,15 @@ export async function downloadSkeletonChunk(
     geometryKind,
     vertexAttributes,
     segmentIds,
+    // Global only when real per-fragment ids were read AND this kind has a
+    // discrete-object model; the point-cloud path above assigns one id per
+    // VERTEX, which is an identity for a point, not for an object.
+    segmentIdsAreGlobal:
+      fragSegIds !== undefined &&
+      KIND_CAPABILITIES[geometryKind].hasObjectModel,
+    nodeIds,
+    faces,
+    faceArity: linkWidth,
   });
 }
 
@@ -515,7 +747,7 @@ function sliceAttributeFromBytes(
   if (vertexIndex < 0 || offset + elementSize > bytes.byteLength) {
     return undefined;
   }
-  return reinterpretBytes(
+  return decodeAttributeToFloat32(
     bytes.subarray(offset, offset + elementSize),
     dtype,
     1,
@@ -542,7 +774,7 @@ export async function fetchGhostVertices(
     readonly rank: number;
     readonly attributeNames: readonly string[];
     readonly attributeDtypes: readonly AttributeDtype[];
-    readonly cellRead: SkeletonChunkDownloadOptions["cellRead"];
+    readonly cellRead: GeometryChunkDownloadOptions["cellRead"];
   },
   signal: AbortSignal,
 ): Promise<GhostVertexRecord[]> {
@@ -576,7 +808,8 @@ export async function fetchGhostVertices(
   // positions blob is absent (sparse chunk) or whose vertex index is
   // out of range — these would otherwise create dangling bridge edges.
   const out: GhostVertexRecord[] = [];
-  for (const req of requests) {
+  for (let requestIndex = 0; requestIndex < requests.length; ++requestIndex) {
+    const req = requests[requestIndex];
     const blobs = byKey.get(req.neighborChunkKey);
     if (blobs === undefined || blobs.positions === undefined) continue;
     const position = sliceVertexFromBytes(
@@ -597,16 +830,10 @@ export async function fetchGhostVertices(
               attributeDtypes[i],
             );
       if (sliced === undefined) {
-        // Zero-fill missing attribute — mirrors `downloadSkeletonChunk`
+        // Zero-fill missing attribute — mirrors `downloadGeometryChunk`
         // behavior for chunk-local attributes (pyramid levels without
         // `vertex_attributes/<name>/`).
-        attributes.push(
-          reinterpretBytes(
-            new Uint8Array(BYTES_PER_ELEMENT[attributeDtypes[i]]),
-            attributeDtypes[i],
-            1,
-          ),
-        );
+        attributes.push(zeroAttribute(1));
       } else {
         attributes.push(sliced);
       }
@@ -616,6 +843,7 @@ export async function fetchGhostVertices(
       attributes,
       bridgeFromLocalVertex: req.hostLocalVertex,
       isGhostPredecessor: req.isGhostPredecessor ?? false,
+      requestIndex,
     });
   }
   return out;

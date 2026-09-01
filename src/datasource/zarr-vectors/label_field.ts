@@ -219,7 +219,8 @@ export async function buildRoiLabelField(
     for (let d = 0; d < 3; ++d) {
       n *= Math.max(
         0,
-        Math.ceil(spec.upperVoxelBound[d]) - Math.floor(spec.lowerVoxelBound[d]),
+        Math.ceil(spec.upperVoxelBound[d]) -
+          Math.floor(spec.lowerVoxelBound[d]),
       );
     }
     return n;

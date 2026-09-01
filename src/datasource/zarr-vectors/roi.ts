@@ -54,6 +54,42 @@ export interface RoiLengthFilter {
 }
 
 /**
+ * Where an attribute predicate reads its value.
+ *
+ * - `"object"`: one value per OBJECT, from the store's `object_attributes/`
+ *   (surfaced as the layer's segment-property map and shipped to the worker as
+ *   a {@link RoiObjectAttrColumn}). Complete: every object has a value whether
+ *   or not its geometry is resident.
+ * - `"vertex"`: one value per VERTEX, from `vertex_attributes/`, read off the
+ *   resident chunk. This is the only tier a `point_cloud` has -- that kind
+ *   carries no object model at all -- and for it "one vertex" IS "one object".
+ *   On an object geometry a vertex-scope predicate passes an object when ANY of
+ *   its resident vertices satisfies it, matching how a geometric ROI is folded.
+ *   WYSIWYG over resident chunks and over the attributes the source actually
+ *   loaded (`#attributes=`), for the same reason the geometric fold is.
+ */
+export type RoiAttrScope = "object" | "vertex";
+
+/**
+ * A closed range `[min, max]` on one named attribute, used to define group
+ * membership by DATA rather than by geometry.
+ *
+ * Booleans have no separate spelling: a boolean column reaches the reader as
+ * 0/1 (every per-vertex attribute is decoded to float32), so "is true" is the
+ * range `[0.5, +inf)` and "is false" is `(-inf, 0.5]`. The UI decides which
+ * control to draw from the attribute's dtype and observed values; the predicate
+ * itself stays one shape, which is what keeps the fold, the JSON and the Python
+ * wire format from growing a second case.
+ */
+export interface RoiAttrFilter {
+  readonly name: string;
+  readonly min: number;
+  readonly max: number;
+  /** Absent means `"object"` -- the tier the legacy `lengthFilter` read. */
+  readonly scope?: RoiAttrScope;
+}
+
+/**
  * Resolved background (whole-tractogram) shader uniforms for the per-object
  * value tier: the length-filter discard range and the flat colour-by-attribute
  * mode, both already normalised to [0,1] against the active attribute's bounds
@@ -187,8 +223,6 @@ export interface RoiGroupConfig {
   /** Packed RGBA: rgb = group colour, a = group opacity (colour-by-group + per-group opacity ride this one value). */
   readonly colorPacked: number;
   readonly visible: boolean;
-  /** Load this group's passing tracts at full detail (object-keyed pass 2). */
-  readonly highDetail: boolean;
   /**
    * How this group's passing streamlines are coloured. Absent is treated as the
    * legacy `{kind:"group"}` (flat group colour). `"objectAttr"` recolours each
@@ -198,12 +232,20 @@ export interface RoiGroupConfig {
    */
   readonly colorBy?: RoiColorSpec;
   /**
-   * Restrict this group to streamlines whose value on the named per-object
-   * attribute lies in `[min, max]`. Applied ON TOP of the ROI fold (an empty
-   * ROI list still contributes nothing — the background length filter covers
-   * the whole-tractogram case).
+   * Attribute predicates restricting this group, ANDed together (see
+   * {@link RoiAttrFilter}).
+   *
+   * Unlike the ROI fold these are not geometry, so they are the one way to
+   * define a group for a store that has no geometry to draw regions around --
+   * "the cells expressing this gene", "the objects flagged high-quality".
+   *
+   * Composition: a group with ROIs *and* predicates keeps the objects passing
+   * BOTH. A group with predicates and NO ROIs is a pure attribute group and its
+   * members are everything satisfying the predicates (this is what makes an
+   * attribute group possible at all -- an empty ROI list used to mean "select
+   * nothing"). A group with neither still contributes nothing.
    */
-  readonly lengthRange?: RoiLengthFilter;
+  readonly attrFilters?: readonly RoiAttrFilter[];
 }
 
 /**

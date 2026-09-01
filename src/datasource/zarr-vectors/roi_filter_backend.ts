@@ -32,12 +32,14 @@ import type { FragmentIndex } from "#src/datasource/zarr-vectors/fragment_index.
 import type {
   LabelSampler,
   Roi,
+  RoiAttrFilter,
   RoiGroupConfig,
   RoiObjectAttrColumn,
   StreamlineRef,
 } from "#src/datasource/zarr-vectors/roi.js";
 import {
   combineRoiVerdicts,
+  RoiPredicate,
   streamlinePassesRoi,
 } from "#src/datasource/zarr-vectors/roi.js";
 import { packColor } from "#src/util/color.js";
@@ -75,7 +77,9 @@ function buildAttrLookups(
   const need = new Set<string>();
   for (const g of groups) {
     if (!g.visible) continue;
-    if (g.lengthRange !== undefined) need.add(g.lengthRange.name);
+    for (const f of g.attrFilters ?? []) {
+      if (f.scope !== "vertex") need.add(f.name);
+    }
     if (g.colorBy?.kind === "objectAttr") need.add(g.colorBy.name);
   }
   for (const name of need) {
@@ -111,6 +115,36 @@ export interface RoiFilterableChunk {
   /** Per-vertex `uvec2` segment column: `[lo, hi]` per vertex (uint64 split). */
   readonly segmentIds?: Uint32Array;
   readonly fragmentIndex: FragmentIndex;
+  /**
+   * Whether one VERTEX is one object, rather than one fragment being one
+   * object's slice.
+   *
+   * True for the kinds with no object model (`point_cloud`), where the segment
+   * column holds a distinct id per vertex. It is not an optimisation but a
+   * correctness switch: a point-cloud fragment is a spatial BIN of unrelated
+   * points, so the per-fragment fold below -- which reads the id of a
+   * fragment's first vertex and attributes the whole fragment to it -- would
+   * put a whole bin in whatever region one of its points happened to land in.
+   */
+  readonly perVertexObjects?: boolean;
+  /**
+   * Whether this chunk's vertices bound a SURFACE rather than tracing a curve.
+   *
+   * A fragment's vertices are then a triangle soup in arbitrary order, so the
+   * polyline-shaped predicates do not describe anything real: consecutive
+   * vertices are not joined, and there is no "first"/"last" vertex to be an
+   * endpoint. Every predicate is evaluated as {@link RoiPredicate.ANY_VERTEX}
+   * for such a chunk.
+   */
+  readonly surfaceVertices?: boolean;
+  /**
+   * Per-vertex attribute values by on-disk attribute name, each of length
+   * {@link numVertices}, retained for vertex-scope attribute predicates (see
+   * `RoiAttrFilter`). Present only where there is no per-OBJECT tier to read
+   * instead; absent everywhere else, so no store pays the retention for a
+   * feature it does not use.
+   */
+  readonly vertexAttributes?: ReadonlyMap<string, Float32Array>;
 }
 
 /** Read the uint64 segment id of vertex `v` from the `uvec2` segment column. */
@@ -118,6 +152,18 @@ function segmentIdOf(segmentIds: Uint32Array, v: number): bigint {
   const lo = BigInt(segmentIds[v * 2] >>> 0);
   const hi = BigInt(segmentIds[v * 2 + 1] >>> 0);
   return (hi << 32n) | lo;
+}
+
+/**
+ * The predicate to actually evaluate for a chunk: a surface's vertices are not
+ * a walk, so every predicate collapses to "any vertex inside" there. See
+ * {@link RoiFilterableChunk.surfaceVertices}.
+ */
+function effectivePredicate(
+  chunk: RoiFilterableChunk,
+  predicate: RoiPredicate,
+): RoiPredicate {
+  return chunk.surfaceVertices === true ? RoiPredicate.ANY_VERTEX : predicate;
 }
 
 /**
@@ -132,6 +178,10 @@ function segmentIdOf(segmentIds: Uint32Array, v: number): bigint {
  * A range fragment references `chunk.positions` directly; an explicit
  * (non-contiguous) fragment is gathered into a reused scratch buffer first,
  * since {@link StreamlineRef} assumes a contiguous vertex run.
+ *
+ * A chunk whose objects are VERTICES ({@link RoiFilterableChunk.perVertexObjects})
+ * skips the fragment index entirely and tests each vertex on its own -- see that
+ * flag for why folding a point-cloud fragment would be wrong.
  */
 export function computeChunkCrossings(
   chunk: RoiFilterableChunk,
@@ -141,6 +191,36 @@ export function computeChunkCrossings(
   const result = new Map<bigint, boolean[]>();
   const { segmentIds, fragmentIndex, positions, rank } = chunk;
   if (rois.length === 0 || segmentIds === undefined) return result;
+
+  if (chunk.perVertexObjects === true) {
+    // One vertex, one object: a `count: 1` run. Every predicate degrades to
+    // "is this point inside" on it (`streamlinePassesRoi` falls back to the
+    // vertex test for a single-vertex run), so the ROI's own predicate needs no
+    // special-casing.
+    for (let v = 0; v < chunk.numVertices; ++v) {
+      const id = segmentIdOf(segmentIds, v);
+      let crossed = result.get(id);
+      if (crossed === undefined) {
+        crossed = new Array<boolean>(rois.length).fill(false);
+        result.set(id, crossed);
+      }
+      const ref: StreamlineRef = { positions, start: v, count: 1, rank };
+      for (let i = 0; i < rois.length; ++i) {
+        if (crossed[i]) continue;
+        if (
+          streamlinePassesRoi(
+            ref,
+            rois[i].shape,
+            rois[i].predicate,
+            sampleLabel,
+          )
+        ) {
+          crossed[i] = true;
+        }
+      }
+    }
+    return result;
+  }
 
   let scratch = new Float32Array(0);
   const numFragments = fragmentIndex.numFragments;
@@ -177,7 +257,12 @@ export function computeChunkCrossings(
     for (let i = 0; i < rois.length; ++i) {
       if (crossed[i]) continue; // already crossed by an earlier fragment
       if (
-        streamlinePassesRoi(ref, rois[i].shape, rois[i].predicate, sampleLabel)
+        streamlinePassesRoi(
+          ref,
+          rois[i].shape,
+          effectivePredicate(chunk, rois[i].predicate),
+          sampleLabel,
+        )
       ) {
         crossed[i] = true;
       }
@@ -310,6 +395,149 @@ export function diffPassingSet(
 }
 
 /**
+ * The object ids whose resident geometry satisfies every VERTEX-scope filter.
+ *
+ * An object qualifies when ANY of its resident vertices passes all of them at
+ * once -- the same "any part of it is in there" rule the geometric fold uses,
+ * and for a point cloud (one vertex, one object) simply the point's own test.
+ * Note the "at once": two filters are satisfied by one vertex, not by two
+ * different vertices of the same object, so `gene_A > 1 AND gene_B > 1` means
+ * co-expression in one cell rather than in one tract.
+ *
+ * A chunk missing one of the named columns contributes nothing rather than
+ * everything: the predicate cannot be evaluated there, and silently passing the
+ * whole chunk would turn a filter on an unloaded attribute into "select all".
+ * The picker only offers loaded attributes, so this is reachable only from a
+ * restored state whose `#attributes=` no longer names the column.
+ */
+export function computeVertexAttrPassingSet(
+  chunks: Iterable<RoiFilterableChunk>,
+  filters: readonly RoiAttrFilter[],
+): Set<bigint> {
+  const passing = new Set<bigint>();
+  if (filters.length === 0) return passing;
+  for (const chunk of chunks) {
+    const { segmentIds, vertexAttributes, numVertices } = chunk;
+    if (segmentIds === undefined || vertexAttributes === undefined) continue;
+    const columns: Float32Array[] = [];
+    let complete = true;
+    for (const f of filters) {
+      const column = vertexAttributes.get(f.name);
+      if (column === undefined) {
+        complete = false;
+        break;
+      }
+      columns.push(column);
+    }
+    if (!complete) continue;
+    for (let v = 0; v < numVertices; ++v) {
+      let ok = true;
+      for (let i = 0; i < filters.length; ++i) {
+        const value = columns[i][v];
+        if (!(value >= filters[i].min && value <= filters[i].max)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) passing.add(segmentIdOf(segmentIds, v));
+    }
+  }
+  return passing;
+}
+
+/**
+ * Every object id whose per-OBJECT values satisfy `filters`, enumerated from
+ * the columns themselves rather than from resident geometry.
+ *
+ * This is how an attribute-only group can select objects that are not on screen
+ * at all: the column has a value for every object in the store. Returns
+ * `undefined` when the leading column has not been loaded yet, which the caller
+ * treats as "nothing to seed from" (the group shows empty until it arrives)
+ * rather than as "everything".
+ */
+function objectAttrPassingSet(
+  filters: readonly RoiAttrFilter[],
+  lookups: ReadonlyMap<string, AttrLookup>,
+): Set<bigint> | undefined {
+  const seed = lookups.get(filters[0].name);
+  if (seed === undefined) return undefined;
+  const passing = new Set<bigint>();
+  for (const [id, value] of seed.map) {
+    if (!(value >= filters[0].min && value <= filters[0].max)) continue;
+    passing.add(id);
+  }
+  narrowByObjectAttrs(passing, filters.slice(1), lookups);
+  return passing;
+}
+
+/**
+ * Drop from `ids` those whose per-object value is out of range, in place.
+ *
+ * A missing value (attribute not yet loaded, or an object absent from the
+ * column) is left IN rather than dropped, so a group never blinks out while its
+ * per-object values are still arriving -- the same rule the single length
+ * filter this generalises always applied.
+ */
+function narrowByObjectAttrs(
+  ids: Set<bigint>,
+  filters: readonly RoiAttrFilter[],
+  lookups: ReadonlyMap<string, AttrLookup>,
+): void {
+  for (const f of filters) {
+    const lookup = lookups.get(f.name);
+    if (lookup === undefined) continue;
+    for (const id of ids) {
+      const value = lookup.map.get(id);
+      if (value !== undefined && !(value >= f.min && value <= f.max)) {
+        ids.delete(id);
+      }
+    }
+  }
+}
+
+/**
+ * One group's members over `chunks`: the ROI fold narrowed by the group's
+ * attribute predicates, or -- with no ROIs -- the predicates alone.
+ *
+ * The three seeds are ordered by how much they can enumerate: ROIs when the
+ * group has any, else the vertex-scope predicates over resident geometry, else
+ * the object-scope predicates over the whole column. A group with neither ROIs
+ * nor predicates selects nothing (an empty ROI list has always meant "not a
+ * dissection", and that is what keeps a freshly added, still-empty group from
+ * claiming the entire store).
+ */
+function groupPassingSet(
+  chunks: readonly RoiFilterableChunk[],
+  group: RoiGroupConfig,
+  lookups: ReadonlyMap<string, AttrLookup>,
+  sampleLabel?: LabelSampler,
+): Set<bigint> {
+  const filters = group.attrFilters ?? [];
+  const vertexFilters = filters.filter((f) => f.scope === "vertex");
+  const objectFilters = filters.filter((f) => f.scope !== "vertex");
+  const hasRois = group.rois.length !== 0;
+  if (!hasRois && filters.length === 0) return new Set<bigint>();
+
+  let ids: Set<bigint>;
+  if (hasRois) {
+    ids = computePassingSet(chunks, group.rois, sampleLabel);
+    if (vertexFilters.length !== 0) {
+      const byAttr = computeVertexAttrPassingSet(chunks, vertexFilters);
+      for (const id of ids) {
+        if (!byAttr.has(id)) ids.delete(id);
+      }
+    }
+  } else if (vertexFilters.length !== 0) {
+    ids = computeVertexAttrPassingSet(chunks, vertexFilters);
+  } else {
+    ids = objectAttrPassingSet(objectFilters, lookups) ?? new Set<bigint>();
+    return ids; // objectAttrPassingSet already applied every object filter
+  }
+  narrowByObjectAttrs(ids, objectFilters, lookups);
+  return ids;
+}
+
+/**
  * Evaluate several ROI groups against one batch of chunks. Each visible group
  * is an independent dissection (its own include/or/exclude fold), so groups are
  * computed separately — flattening them into one fold would wrongly let one
@@ -323,25 +551,20 @@ export function diffPassingSet(
 export function computeGroupedPassingSet(
   chunks: Iterable<RoiFilterableChunk>,
   groups: readonly RoiGroupConfig[],
-  highDetailBudget?: number,
   attrColumns?: ReadonlyMap<string, RoiObjectAttrColumn>,
   sampleLabel?: LabelSampler,
 ): {
   passing: Set<bigint>;
   colorById: Map<bigint, number>;
-  highDetail: Set<bigint>;
 } {
   const passing = new Set<bigint>();
   const colorById = new Map<bigint, number>();
-  // Union of the passing tracts of visible groups marked `highDetail`; the
-  // render layer loads exactly these via the object-keyed pass-2 source.
-  const highDetail = new Set<bigint>();
   // The chunk iterable may be single-use (a generator); materialise it once so
   // every group sees the same batch.
   const chunkArray = Array.isArray(chunks) ? chunks : [...chunks];
   const lookups = buildAttrLookups(groups, attrColumns);
   for (const group of groups) {
-    if (!group.visible || group.rois.length === 0) continue;
+    if (!group.visible) continue;
     const colorBy = group.colorBy ?? { kind: "group" };
     // Per-vertex colouring (direction/position/vertex attribute) varies along
     // the tract, so the group writes NO colour override and the shader colours
@@ -355,20 +578,9 @@ export function computeGroupedPassingSet(
     // Group opacity rides the packed colour's alpha byte; reuse it for the
     // object-attribute colourmap so the two colouring modes share one opacity.
     const alpha255 = (group.colorPacked >>> 24) & 0xff;
-    const range = group.lengthRange;
-    const rangeLookup =
-      range !== undefined ? lookups.get(range.name) : undefined;
-    for (const id of computePassingSet(chunkArray, group.rois, sampleLabel)) {
-      // Length filter narrows the ROI passing set. A missing value (attribute
-      // not yet loaded) is left in rather than dropped, so a group never blinks
-      // out while its per-object values are still arriving.
-      if (range !== undefined && rangeLookup !== undefined) {
-        const v = rangeLookup.map.get(id);
-        if (v !== undefined && (v < range.min || v > range.max)) continue;
-      }
+    for (const id of groupPassingSet(chunkArray, group, lookups, sampleLabel)) {
       const firstClaim = !passing.has(id);
       passing.add(id);
-      if (group.highDetail) highDetail.add(id);
       // First group in list order owns the colour (topmost, deterministic).
       if (!firstClaim || perVertex) continue;
       if (colorLookup !== undefined) {
@@ -385,11 +597,7 @@ export function computeGroupedPassingSet(
       colorById.set(id, group.colorPacked);
     }
   }
-  return {
-    passing,
-    colorById,
-    highDetail: selectHighDetail(passing, highDetail, highDetailBudget),
-  };
+  return { passing, colorById };
 }
 
 /**
@@ -406,8 +614,8 @@ export function computeGroupedPassingSet(
  *
  * Unlike {@link computeGroupedPassingSet} this does NOT skip invisible groups:
  * the caller passes exactly the groups it wants evaluated (the export selection),
- * and visibility is a rendering concern, not an export one. Groups with no ROIs
- * yield an empty set.
+ * and visibility is a rendering concern, not an export one. Groups with neither
+ * ROIs nor attribute predicates yield an empty set.
  */
 export function computePerGroupPassingSets(
   chunks: Iterable<RoiFilterableChunk>,
@@ -419,74 +627,7 @@ export function computePerGroupPassingSets(
   // single-use generator).
   const chunkArray = Array.isArray(chunks) ? chunks : [...chunks];
   const lookups = buildAttrLookups(groups, attrColumns);
-  return groups.map((group) => {
-    const out = new Set<bigint>();
-    if (group.rois.length === 0) return out;
-    const range = group.lengthRange;
-    const rangeLookup =
-      range !== undefined ? lookups.get(range.name) : undefined;
-    for (const id of computePassingSet(chunkArray, group.rois, sampleLabel)) {
-      // Length filter narrows the ROI passing set, exactly as the union path
-      // does. A missing value (attribute not yet loaded) is left in rather than
-      // dropped, matching computeGroupedPassingSet.
-      if (range !== undefined && rangeLookup !== undefined) {
-        const v = rangeLookup.map.get(id);
-        if (v !== undefined && (v < range.min || v > range.max)) continue;
-      }
-      out.add(id);
-    }
-    return out;
-  });
-}
-
-/**
- * Choose which streamlines to load at full resolution, within a budget counted
- * in STREAMLINES.
- *
- * A count, not a byte figure: pass 2 fetches whole objects, so a tract that
- * merely clips the view brings its entire length. Budgeting by bytes-in-view
- * would systematically understate it.
- *
- * Two tiers, both filled in ascending id order:
- *
- *  1. `preferred` -- the passing tracts of groups flagged `highDetail`. An
- *     explicit request keeps priority over the general fill.
- *  2. the rest of `passing`, until the budget runs out.
- *
- * Tier 2 is what makes the pyramid mix at the OBJECT level. The dissection is
- * evaluated at the finest level whose ROI-region chunks are resident, so
- * `passing` can name tracts that exist only at levels far finer than the one
- * being drawn -- and a tract absent from the drawn level has no chunk geometry
- * at all, so pass 2 is the only thing that can show it. Filling from `passing`
- * therefore spends the budget on real additional streamlines rather than
- * re-rendering ones the chunk pass already covers.
- *
- * Ascending id, not proximity: the result is diffed against the resident set on
- * every recompute, so an order that shifted with the camera would evict and
- * refetch whole tracts on each pan. Stability is what keeps the budget spent on
- * loading rather than churn.
- */
-export function selectHighDetail(
-  passing: ReadonlySet<bigint>,
-  preferred: ReadonlySet<bigint>,
-  budget: number | undefined,
-): Set<bigint> {
-  const ascending = (a: bigint, b: bigint) => (a < b ? -1 : a > b ? 1 : 0);
-  if (budget === undefined || !Number.isFinite(budget)) {
-    // No budget: honour exactly the explicit request, as before. Filling from
-    // `passing` unbounded could try to fetch every tract in the dissection.
-    return new Set(preferred);
-  }
-  const kept = new Set<bigint>();
-  if (budget <= 0) return kept;
-  for (const id of [...preferred].sort(ascending)) {
-    kept.add(id);
-    if (kept.size >= budget) return kept;
-  }
-  for (const id of [...passing].sort(ascending)) {
-    if (kept.has(id)) continue;
-    kept.add(id);
-    if (kept.size >= budget) break;
-  }
-  return kept;
+  return groups.map((group) =>
+    groupPassingSet(chunkArray, group, lookups, sampleLabel),
+  );
 }

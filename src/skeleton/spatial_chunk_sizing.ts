@@ -110,6 +110,83 @@ export function buildSpatialSkeletonGridLevels(
  * sparsest available data beats showing none. A caller with no budget
  * information should not call this at all.
  */
+/**
+ * Where a spatially-indexed pyramid's spare memory goes.
+ *
+ * `LOCAL` is the standard neuroglancer answer: spend it near the camera, so
+ * detail tracks where the user is looking. Right when a level's chunks are
+ * independently meaningful — an image tile, a mesh fragment — because a chunk
+ * that arrives is a finished picture of its own cell.
+ *
+ * `OBJECT` is the answer a tractogram needs. Its objects are long: one
+ * streamline crosses many cells, so a spatially-local subset of chunks yields
+ * streamlines chopped off at the boundary of whatever did not fit — the shape
+ * of the fibre, which is the whole point, is exactly what gets lost. This mode
+ * spends the same memory on WHOLE objects instead, admitting a chosen subset of
+ * them across the entire volume; see `zarr-vectors/object_admission.ts`.
+ */
+export enum SpatialSkeletonDetailFocus {
+  LOCAL = 0,
+  OBJECT = 1,
+}
+
+/**
+ * The grid spacing a per-cell memory budget can sustain, or `undefined` when it
+ * cannot be determined.
+ *
+ * This is what LOCAL detail focus should aim at, and it is deliberately NOT a
+ * screen-resolution quantity. Detail-per-pixel self-limits for an image pyramid
+ * — one texel per pixel and you are done — but the levels of an object-sparsity
+ * pyramid differ in how many whole objects they hold, and more objects are
+ * always more useful. A pixel-derived target therefore asks for the finest level
+ * at every zoom, and the level stops responding to the camera entirely.
+ *
+ * What does vary usefully with zoom is **how many cells are in view**: a
+ * whole-volume view must spread the budget over every cell and can afford only a
+ * sparse level in each, while a view of one region divides the same budget among
+ * a handful and can afford the finest. So the budget is divided by the visible
+ * cell count and the finest level whose per-cell cost fits is chosen.
+ *
+ * Both `levelSpacingsMeters` and `perCellCostBytes` are **coarsest-first**, so a
+ * larger index is finer. Returns the coarsest level's spacing when nothing fits
+ * — sparse beats blank — and `undefined` when the inputs cannot support an
+ * answer, which leaves the caller on its previous behaviour.
+ */
+export function targetSpacingForCellBudget(
+  levelSpacingsMeters: readonly number[],
+  perCellCostBytes: readonly number[],
+  visibleCells: number,
+  budgetBytes: number,
+): number | undefined {
+  const n = levelSpacingsMeters.length;
+  if (
+    n === 0 ||
+    perCellCostBytes.length !== n ||
+    !Number.isFinite(budgetBytes) ||
+    budgetBytes <= 0 ||
+    !Number.isFinite(visibleCells) ||
+    visibleCells <= 0
+  ) {
+    return undefined;
+  }
+  const perCellBudget = budgetBytes / visibleCells;
+  let best = -1;
+  for (let k = 0; k < n; ++k) {
+    const cost = perCellCostBytes[k];
+    // An unknown cost is not evidence that the level fits.
+    if (!Number.isFinite(cost) || cost <= 0) continue;
+    if (cost <= perCellBudget) best = k;
+  }
+  if (best >= 0) return levelSpacingsMeters[best];
+  // Nothing fits; fall back to the coarsest level that has a cost at all.
+  for (let k = 0; k < n; ++k) {
+    if (Number.isFinite(perCellCostBytes[k]) && perCellCostBytes[k] > 0) {
+      return levelSpacingsMeters[k];
+    }
+  }
+  return undefined;
+}
+
 export function selectSpatialSkeletonGridLevelByBudget(
   costsBytes: readonly number[],
   budgetBytes: number,
@@ -214,61 +291,4 @@ export function getDefaultSpatiallyIndexedSkeletonChunkSize(
   }
 
   return extents.map(() => low);
-}
-
-/**
- * Bytes one full-resolution object costs on the GPU, or `undefined` when the
- * inputs cannot support the answer.
- *
- * This is the conversion that turns a memory budget into an OBJECT budget, which
- * is the meaningful unit wherever whole objects are fetched: one clipping the
- * view costs its entire extent, so any per-chunk or in-view estimate understates
- * it systematically.
- *
- * Declines when `objectCount` equals `vertexCount`. That is not a coincidence to
- * be papered over: a pyramid whose per-level object counts are unavailable
- * substitutes the vertex counts, and taking the ratio then yields exactly 1.0
- * vertex per object — a budget wrong by however many vertices a real object has,
- * two orders of magnitude on a tractogram. Returning `undefined` lets the caller
- * keep a manual figure rather than act on a fabricated one.
- */
-export function bytesPerObjectFromLevelCounts(
-  vertexCount: number | undefined,
-  objectCount: number | undefined,
-  bytesPerVertex: number,
-): number | undefined {
-  if (
-    vertexCount === undefined ||
-    objectCount === undefined ||
-    !Number.isFinite(vertexCount) ||
-    !Number.isFinite(objectCount) ||
-    !Number.isFinite(bytesPerVertex) ||
-    vertexCount <= 0 ||
-    objectCount <= 0 ||
-    bytesPerVertex <= 0 ||
-    vertexCount === objectCount
-  ) {
-    return undefined;
-  }
-  return (vertexCount / objectCount) * bytesPerVertex;
-}
-
-/**
- * How many objects a byte budget affords, given the per-object cost.
- *
- * Floored, and never negative: a budget that cannot afford a single object is 0
- * rather than a fraction the caller would have to round itself.
- */
-export function objectBudgetFromBytes(
-  budgetBytes: number,
-  bytesPerObject: number,
-): number {
-  if (
-    !Number.isFinite(budgetBytes) ||
-    !Number.isFinite(bytesPerObject) ||
-    bytesPerObject <= 0
-  ) {
-    return 0;
-  }
-  return Math.max(0, Math.floor(budgetBytes / bytesPerObject));
 }

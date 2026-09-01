@@ -47,7 +47,7 @@ export type LinksConvention =
  * (streamlines/polylines: walk-order; graphs: edge-adjacency;
  * skeletons: none).
  */
-export type SkeletonGeometryKind = ZarrVectorsGeometryKind;
+export type GeometryKind = ZarrVectorsGeometryKind;
 
 /** Backing array for per-vertex attribute data (matches zarr-vectors dtypes). */
 export type AttributeTypedArray =
@@ -76,7 +76,7 @@ export type AttributeTypedArray =
  *   pick surfaces the global id.  Derived from the per-fragment
  *   `fragment_attributes/segment_id` column when present, else the
  *   fragment's index within the chunk (`[f, 0]`) — see
- *   `downloadSkeletonChunk`.  Absent for chunks that don't synthesise it
+ *   `downloadGeometryChunk`.  Absent for chunks that don't synthesise it
  *   (e.g. empty chunks).
  * - `fragmentIndex` is retained so pass 2 can extract just the fragments
  *   named by a per-object manifest entry without re-decoding bytes.
@@ -87,9 +87,48 @@ export interface SkeletonChunk {
   readonly positions: Float32Array;
   readonly numEdges: number;
   readonly edges: Uint32Array;
+  /**
+   * Surface faces as a flat TRIANGLE list, `(numFaces, 3)` chunk-local vertex
+   * indices. Present only for `mesh` geometry.
+   *
+   * Always triangles, whatever the store's `link_width`: a face of arity N is
+   * fanned into N-2 triangles when the chunk is built, so the GPU path has one
+   * primitive to draw and a picked primitive is always a triangle. The original
+   * arity is a property of the store's links family, not of a chunk, so it is
+   * not carried here.
+   */
+  readonly faces?: Uint32Array;
+  readonly numFaces?: number;
   readonly tangents?: Float32Array;
   readonly vertexAttributes: AttributeTypedArray[];
   readonly segmentIds?: Uint32Array;
+  /**
+   * Whether {@link segmentIds} holds the store's GLOBAL object ids, as opposed
+   * to a per-chunk stand-in.
+   *
+   * `segmentIds` is always populated for a geometry kind with an object model,
+   * but when `fragment_attributes/segment_id` is missing or short the decoder
+   * substitutes the fragment's index WITHIN THE CHUNK (`[f, 0]`) — distinct per
+   * fragment, deliberately not unified across chunks. That is fine for
+   * colouring and picking, and catastrophic for anything that must agree about
+   * an object across chunk boundaries: the same tract would carry a different
+   * id in every cell it passes through. Anything reasoning about object
+   * IDENTITY must check this first.
+   */
+  readonly segmentIdsAreGlobal?: boolean;
+  /**
+   * Stable per-vertex identity, from the column named by the store's
+   * `zarr_vectors.vertex_id_attribute`. Absent when the store declares none.
+   *
+   * This is what lets the viewer pick a NODE rather than only the object a
+   * vertex belongs to: `resolveNodePickFromChunk` needs `chunk.nodeIds`, and
+   * without it the edit UI can see a tract but never a point on it.
+   *
+   * Deliberately dropped, not extended, by any transform that appends vertices
+   * without knowing their identity (ghosts, boundary faces). A misaligned id
+   * array is worse than none: it would name the wrong node under the cursor.
+   */
+  readonly nodeIds?: Int32Array;
   readonly fragmentIndex: FragmentIndex;
 }
 
@@ -399,7 +438,59 @@ export function computeTangentsFromEdges(
  * function is the pure decode / shape-assembly step that the unit tests
  * can drive without HTTP machinery.
  */
-export function buildSkeletonChunk(args: {
+/**
+ * Keys already warned about, so a malformed store logs one diagnostic rather
+ * than one per chunk per level.
+ */
+const warnedChunkKeys = new Set<string>();
+function warnOnceChunk(key: string, message: string): void {
+  if (warnedChunkKeys.has(key)) return;
+  warnedChunkKeys.add(key);
+  console.warn(message);
+}
+
+/**
+ * Fan a face list of arity `arity` into a flat triangle list.
+ *
+ * ZVF face records are `link_width`-wide and the spec allows more than 3 (quads
+ * are called out explicitly). A convex-fan triangulation -- `(v0, vi, vi+1)` --
+ * is correct for the convex faces meshes are built from and preserves the
+ * winding the producer wrote, which is the only orientation information ZVF
+ * keeps. `arity === 3` returns the input unchanged.
+ */
+export function triangulateFaces(
+  faces: Uint32Array | undefined,
+  arity: number,
+): Uint32Array {
+  if (faces === undefined || faces.length === 0) return new Uint32Array(0);
+  if (!Number.isInteger(arity) || arity < 3) {
+    throw new Error(
+      `buildGeometryChunk: link_width=${arity} cannot describe a face`,
+    );
+  }
+  if (faces.length % arity !== 0) {
+    throw new Error(
+      `buildGeometryChunk: ${faces.length} face indices is not a multiple ` +
+        `of link_width=${arity}`,
+    );
+  }
+  if (arity === 3) return faces;
+  const numFaces = faces.length / arity;
+  const trianglesPerFace = arity - 2;
+  const out = new Uint32Array(numFaces * trianglesPerFace * 3);
+  let cursor = 0;
+  for (let f = 0; f < numFaces; ++f) {
+    const base = f * arity;
+    for (let i = 1; i < arity - 1; ++i) {
+      out[cursor++] = faces[base];
+      out[cursor++] = faces[base + i];
+      out[cursor++] = faces[base + i + 1];
+    }
+  }
+  return out;
+}
+
+export function buildGeometryChunk(args: {
   rank: number;
   positions: Float32Array;
   fragmentIndex: FragmentIndex;
@@ -408,10 +499,20 @@ export function buildSkeletonChunk(args: {
    *  `implicit_sequential` stores. */
   explicitEdges?: Uint32Array;
   linksConvention: LinksConvention;
-  geometryKind: SkeletonGeometryKind;
+  geometryKind: GeometryKind;
   vertexAttributes: AttributeTypedArray[];
   /** Synthesised per-vertex uint32 segment column (see {@link SkeletonChunk.segmentIds}). */
   segmentIds?: Uint32Array;
+  /** See {@link SkeletonChunk.segmentIdsAreGlobal}. */
+  segmentIdsAreGlobal?: boolean;
+  /** See {@link SkeletonChunk.nodeIds}. */
+  nodeIds?: Int32Array;
+  /**
+   * Face records read from the links family, flat and chunk-local, for surface
+   * geometry. `faceArity` is the store's declared `link_width`.
+   */
+  faces?: Uint32Array;
+  faceArity?: number;
 }): SkeletonChunk {
   const {
     rank,
@@ -422,62 +523,74 @@ export function buildSkeletonChunk(args: {
     geometryKind,
     vertexAttributes,
     segmentIds,
+    segmentIdsAreGlobal,
+    nodeIds,
+    faces,
+    faceArity,
   } = args;
 
   const numVertices = positions.length / rank;
   if (!Number.isInteger(numVertices)) {
     throw new Error(
-      `buildSkeletonChunk: positions.length=${positions.length} is not a multiple of rank=${rank}`,
+      `buildGeometryChunk: positions.length=${positions.length} is not a multiple of rank=${rank}`,
     );
   }
 
+  const caps = KIND_CAPABILITIES[geometryKind];
+
+  if (caps.primitive === "triangles") {
+    // A surface's links are faces. There is no edge list to synthesise: the
+    // fragment order of a mesh chunk says nothing about connectivity, and the
+    // face records are the connectivity.
+    const triangles = triangulateFaces(faces, faceArity ?? 3);
+    return {
+      rank,
+      numVertices,
+      positions,
+      numEdges: 0,
+      edges: new Uint32Array(0),
+      faces: triangles,
+      numFaces: triangles.length / 3,
+      tangents: undefined,
+      vertexAttributes,
+      segmentIds,
+      segmentIdsAreGlobal,
+      nodeIds,
+      fragmentIndex,
+    };
+  }
+
   let edges: Uint32Array;
-  switch (linksConvention) {
-    case "implicit_sequential":
-      // Polyline / streamline: edges come purely from fragment ranges.
-      edges = synthesizeSequentialEdges(fragmentIndex);
-      if (explicitEdges && explicitEdges.length > 0) {
-        throw new Error(
-          "buildSkeletonChunk: implicit_sequential convention got " +
-            "explicit edges; the writer should not emit links/0/<chunk> " +
-            "in this mode",
-        );
-      }
-      break;
-    case "implicit_sequential_with_branches":
-      // Skeleton: implicit sequential edges plus optional explicit
-      // branch edges read from links/0/<chunk>.
-      edges = mergeEdges(
-        synthesizeSequentialEdges(fragmentIndex),
-        explicitEdges ?? new Uint32Array(0),
+  if (caps.edgeSource === "none") {
+    // Point clouds have no connectivity, and their fragments are spatial BINS
+    // holding many unrelated points -- so the implicit-sequential rule below
+    // would wire every bin into a spaghetti polyline rather than drawing
+    // nothing.  The kind wins over the store's `links_convention`, which the
+    // spec says a point cloud need not even declare.
+    edges = new Uint32Array(0);
+    if (explicitEdges !== undefined && explicitEdges.length > 0) {
+      warnOnceChunk(
+        `edges-ignored-${geometryKind}`,
+        `zarr-vectors: ignoring ${explicitEdges.length >> 1} link record(s) on ` +
+          `a ${geometryKind} chunk -- the geometry has no connectivity.`,
       );
-      break;
-    case "explicit":
-      // General graph: every edge is explicit.
-      if (explicitEdges === undefined) {
-        throw new Error(
-          "buildSkeletonChunk: explicit links_convention requires explicitEdges",
-        );
-      }
-      edges = explicitEdges;
-      break;
-    default: {
-      const _exhaustive: never = linksConvention;
-      throw new Error(`Unhandled links_convention: ${_exhaustive}`);
     }
+  } else {
+    edges = synthesizeEdgesForConvention(
+      linksConvention,
+      fragmentIndex,
+      explicitEdges,
+    );
   }
 
   // Per-vertex tangent synthesis is driven by the capability table:
-  //   - `hasWalkOrderTangent` (streamline / polyline): central
+  //   - `hasWalkOrderTangent` (line / streamline / polyline): central
   //     differences along the fragment walk; sign is consistent across
   //     bridges because every fragment has a well-defined direction.
-  //   - `hasEdgeAdjacencyTangent` (graph): central differences along
-  //     edge adjacency; tangents are well-defined for degree-2 vertices
+  //   - `hasEdgeAdjacencyTangent` (graph / skeleton): central differences
+  //     along edge adjacency; tangents are well-defined for degree-2 vertices
   //     and a sensible non-zero direction at branch points.
-  //   - Neither (skeleton): no tangent (branch points have no canonical
-  //     direction, and we preserve prior "no tangents for skeletons"
-  //     behaviour).
-  const caps = KIND_CAPABILITIES[geometryKind];
+  //   - Neither (point_cloud): no tangent -- there is no direction to have.
   let tangents: Float32Array | undefined;
   if (caps.hasWalkOrderTangent) {
     tangents = computeTangents(positions, rank, fragmentIndex);
@@ -494,8 +607,53 @@ export function buildSkeletonChunk(args: {
     tangents,
     vertexAttributes,
     segmentIds,
+    segmentIdsAreGlobal,
+    nodeIds,
     fragmentIndex,
   };
+}
+
+/**
+ * Edges for a kind that HAS connectivity, following the store's declared
+ * `links_convention`.  Split out of {@link buildGeometryChunk} so the
+ * no-connectivity case reads as the separate decision it is.
+ */
+function synthesizeEdgesForConvention(
+  linksConvention: LinksConvention,
+  fragmentIndex: FragmentIndex,
+  explicitEdges: Uint32Array | undefined,
+): Uint32Array {
+  switch (linksConvention) {
+    case "implicit_sequential":
+      // Line / polyline / streamline: edges come purely from fragment ranges.
+      if (explicitEdges && explicitEdges.length > 0) {
+        throw new Error(
+          "buildGeometryChunk: implicit_sequential convention got " +
+            "explicit edges; the writer should not emit links/0/<chunk> " +
+            "in this mode",
+        );
+      }
+      return synthesizeSequentialEdges(fragmentIndex);
+    case "implicit_sequential_with_branches":
+      // Skeleton: implicit sequential edges plus optional explicit
+      // branch edges read from links/0/<chunk>.
+      return mergeEdges(
+        synthesizeSequentialEdges(fragmentIndex),
+        explicitEdges ?? new Uint32Array(0),
+      );
+    case "explicit":
+      // General graph: every edge is explicit.
+      if (explicitEdges === undefined) {
+        throw new Error(
+          "buildGeometryChunk: explicit links_convention requires explicitEdges",
+        );
+      }
+      return explicitEdges;
+    default: {
+      const _exhaustive: never = linksConvention;
+      throw new Error(`Unhandled links_convention: ${_exhaustive}`);
+    }
+  }
 }
 
 /**
@@ -636,7 +794,7 @@ export function appendIntraChunkEdges(
  *   vertex.  When the neighbor lacks an attribute file (e.g. pyramid
  *   levels without `vertex_attributes/<name>/`), the caller may emit a
  *   zero-filled typed-array of length 1 — matches the existing
- *   per-chunk zero-fill rule in `downloadSkeletonChunk`.
+ *   per-chunk zero-fill rule in `downloadGeometryChunk`.
  * - `bridgeFromLocalVertex`: chunk-local index of the host endpoint
  *   that should be connected to this ghost.  Out-of-range indices are
  *   rejected by `appendGhostVertices`.
@@ -645,6 +803,16 @@ export interface GhostVertexRecord {
   readonly position: Float32Array;
   readonly attributes: AttributeTypedArray[];
   readonly bridgeFromLocalVertex: number;
+  /**
+   * Index of the request this record answers.
+   *
+   * The fetch drops requests whose neighbour data is missing, so the returned
+   * array is not positionally aligned with the requests. The line path does not
+   * care -- each ghost carries its own host vertex -- but a boundary FACE has to
+   * put three specific endpoints back together, so it needs to know which
+   * request each surviving ghost came from.
+   */
+  readonly requestIndex?: number;
   /**
    * True when this ghost represents the **predecessor** of the host in
    * the streamline's walk order (i.e. it sits "before" the host along
@@ -689,6 +857,129 @@ export interface GhostVertexRecord {
  *
  * Returns the input chunk unchanged when `ghosts.length === 0`.
  */
+/**
+ * Turn face templates into a flat triangle list once the ghosts have landed,
+ * dropping any face whose ghost was not fetched. Faces of arity > 3 are
+ * fanned, matching {@link triangulateFaces} for the intra-chunk path.
+ */
+export function resolveBoundaryFaces(
+  faceTemplates: readonly Int32Array[],
+  ghosts: readonly GhostVertexRecord[],
+  baseGhostIndex: number,
+): Uint32Array {
+  const ghostIndexByRequest = new Map<number, number>();
+  for (let g = 0; g < ghosts.length; ++g) {
+    const requestIndex = ghosts[g].requestIndex;
+    if (requestIndex !== undefined) {
+      ghostIndexByRequest.set(requestIndex, baseGhostIndex + g);
+    }
+  }
+  const out: number[] = [];
+  for (const template of faceTemplates) {
+    const corners = new Array<number>(template.length);
+    let resolved = true;
+    for (let i = 0; i < template.length; ++i) {
+      const ref = template[i];
+      if (ref >= 0) {
+        corners[i] = ref;
+        continue;
+      }
+      const ghostIndex = ghostIndexByRequest.get(-ref - 1);
+      if (ghostIndex === undefined) {
+        resolved = false;
+        break;
+      }
+      corners[i] = ghostIndex;
+    }
+    if (!resolved) continue;
+    for (let i = 1; i < corners.length - 1; ++i) {
+      out.push(corners[0], corners[i], corners[i + 1]);
+    }
+  }
+  return Uint32Array.from(out);
+}
+
+/**
+ * Append boundary-face ghosts to a surface chunk, then the faces that use them.
+ *
+ * Distinct from {@link appendGhostVertices}, which exists for line geometry: it
+ * appends one bridge EDGE per ghost and synthesises a walk-direction tangent.
+ * A boundary face needs neither -- its ghosts are corners of triangles the
+ * caller has already resolved, and a surface has no tangent -- so the two
+ * cannot share an implementation without one of them lying about the geometry.
+ *
+ * `extraFaces` is a flat triangle list in the POST-append index space: local
+ * vertices keep their index, and ghost `g` is at `chunk.numVertices + g`.
+ */
+export function appendBoundaryFaces(
+  chunk: SkeletonChunk,
+  ghosts: readonly GhostVertexRecord[],
+  extraFaces: Uint32Array,
+): SkeletonChunk {
+  if (ghosts.length === 0 && extraFaces.length === 0) return chunk;
+  const { rank, numVertices, positions, vertexAttributes, segmentIds } = chunk;
+  const numGhosts = ghosts.length;
+  const newNumVertices = numVertices + numGhosts;
+
+  const newPositions = new Float32Array(newNumVertices * rank);
+  newPositions.set(positions, 0);
+  for (let g = 0; g < numGhosts; ++g) {
+    newPositions.set(ghosts[g].position, (numVertices + g) * rank);
+  }
+
+  const newVertexAttributes: AttributeTypedArray[] = [];
+  for (let a = 0; a < vertexAttributes.length; ++a) {
+    const src = vertexAttributes[a];
+    const Ctor = src.constructor as new (n: number) => AttributeTypedArray;
+    const dst = new Ctor(newNumVertices);
+    (dst as unknown as { set: (a: ArrayLike<number>, o: number) => void }).set(
+      src as unknown as ArrayLike<number>,
+      0,
+    );
+    for (let g = 0; g < numGhosts; ++g) {
+      const ghostAttr = ghosts[g].attributes[a];
+      (dst as unknown as { [k: number]: number })[numVertices + g] = (
+        ghostAttr as unknown as { [k: number]: number }
+      )[0];
+    }
+    newVertexAttributes.push(dst);
+  }
+
+  // A boundary face joins one surface, so the ghost belongs to the same object
+  // as the local corner that pulled it in -- inherit that corner's id, exactly
+  // as the line path does across a bridge.
+  let newSegmentIds: Uint32Array | undefined;
+  if (segmentIds !== undefined) {
+    newSegmentIds = new Uint32Array(newNumVertices * 2);
+    newSegmentIds.set(segmentIds, 0);
+    for (let g = 0; g < numGhosts; ++g) {
+      const host = ghosts[g].bridgeFromLocalVertex;
+      newSegmentIds[(numVertices + g) * 2] = segmentIds[host * 2];
+      newSegmentIds[(numVertices + g) * 2 + 1] = segmentIds[host * 2 + 1];
+    }
+  }
+
+  const existingFaces = chunk.faces ?? new Uint32Array(0);
+  const newFaces = new Uint32Array(existingFaces.length + extraFaces.length);
+  newFaces.set(existingFaces, 0);
+  newFaces.set(extraFaces, existingFaces.length);
+
+  return {
+    ...chunk,
+    numVertices: newNumVertices,
+    positions: newPositions,
+    vertexAttributes: newVertexAttributes,
+    segmentIds: newSegmentIds,
+    segmentIdsAreGlobal: chunk.segmentIdsAreGlobal,
+    // The appended corners come from neighbouring chunks and carry no id of
+    // their own; keeping the old array would misname every vertex past the
+    // original count. See {@link SkeletonChunk.nodeIds}.
+    nodeIds: undefined,
+    faces: newFaces,
+    numFaces: newFaces.length / 3,
+  };
+}
+
 export function appendGhostVertices(
   chunk: SkeletonChunk,
   ghosts: readonly GhostVertexRecord[],
@@ -844,6 +1135,7 @@ export function appendGhostVertices(
     tangents: newTangents,
     vertexAttributes: newVertexAttributes,
     segmentIds: newSegmentIds,
+    segmentIdsAreGlobal: chunk.segmentIdsAreGlobal,
     fragmentIndex: chunk.fragmentIndex,
   };
 }

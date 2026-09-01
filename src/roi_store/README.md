@@ -184,32 +184,50 @@ gcloud storage buckets update gs://my-roi-groups --cors-file=cors.json
 
 ## Deploying
 
-`.firebaserc` already maps the `ng-pyodide` hosting target to a site named
-`ng-pyodide` under project `em-270621`. That site does not exist yet — create it
-once, then deploy:
+Both zarr-vectors targets live in their **own** Firebase project,
+`zarr-vectors-test` — deliberately not the shared `em-270621` EM project, which
+now keeps only the unrelated `ng-wizard-demo` target. `.firebaserc` maps them to
+sites that already exist:
+
+| Target            | Build          | Site                   | URL                                    |
+| ----------------- | -------------- | ---------------------- | -------------------------------------- |
+| `ng-zarr-vectors` | `dist/client`  | `zarr-vectors-viewer`  | https://zarr-vectors-viewer.web.app    |
+| `ng-pyodide`      | `dist/pyodide` | `zarr-vectors-pyodide` | https://zarr-vectors-pyodide.web.app   |
+
+The target *names* are unchanged, so only the `--project` flag differs from
+before. Data still comes from `gs://hip_ct_zarr_vector_03987646472fethdsvdvdfg`,
+which is in neither project: its CORS policy is `*` for `GET` with `Range`, so
+any deploy origin can read it with no bucket-side change.
+
+`dist/client` already carries the ROI store config from `rspack.config.ts`:
 
 ```sh
-# One-time: create the hosting site the target maps to.
-firebase hosting:sites:create ng-pyodide --project em-270621
-
-# Stop any dev_server holding dist/pyodide as its CWD first (it makes the
-# build's clean step fail with EBUSY on Windows).
-
-# Build the pyodide bundle with the ROI store define and the zarr-vectors
-# packages bundled in, then publish.
-NEUROGLANCER_PYODIDE_PACKAGES="/path/to/zarr-vectors-py/zarr_vectors,/path/to/zarr-vectors-tools/zarr_vectors_tools" \
-  node build_tools/build_pyodide.ts \
-    --define 'ROI_STORE={"bucket":"hip_ct_zarr_vector_03987646472fethdsvdvdfg","provider":"middleauth","authServer":"https://global.daf-apis.com"}'
-firebase deploy --only hosting:ng-pyodide --project em-270621
+npm run build
+firebase deploy --only hosting:ng-zarr-vectors --project zarr-vectors-test
 ```
 
-The `dist/client` build (target `ng-zarr-vectors`) already carries the ROI store
-config from `rspack.config.ts`, so it deploys with `npm run build && firebase
-deploy --only hosting:ng-zarr-vectors --project em-270621`.
+`dist/pyodide` needs the zarr-vectors packages bundled in. Stop any dev_server
+holding `dist/pyodide` as its CWD first (it makes the build's clean step fail
+with EBUSY on Windows):
 
-Note the middleauth constraints above: browse/load work anonymously on both
-targets; save works only in `dist/client` and only once `endpoint` points at a
-middleauth-fronted store.
+```sh
+NEUROGLANCER_PYODIDE_PACKAGES="/path/to/zarr-vectors-py/zarr_vectors,/path/to/zarr-vectors-tools/zarr_vectors_tools" \
+  node build_tools/build_pyodide.ts
+firebase deploy --only hosting:ng-pyodide --project zarr-vectors-test
+```
+
+The pyodide build defaults the ROI store bucket and provider from the
+environment (`roiStoreDefineFromEnv`), so no `--define` is needed; set
+`NEUROGLANCER_ROI_STORE_CLIENT_ID` to configure saving. Browse/load work
+anonymously on both targets regardless.
+
+> `.firebaserc` still has `"default": "neuroglancer-demo"` (upstream's project),
+> so a bare `firebase deploy` resolves to the wrong place — always pass
+> `--project zarr-vectors-test`.
+>
+> An older `ng-zarr-vectors` site remains under `em-270621`. Firebase site IDs
+> are globally unique, which is why the new sites took different names; delete
+> the stale site when its URL is no longer being shared.
 
 `firebase.json` gives `ng-pyodide` a `** → /index.html` rewrite so that
 share/continue links — which live under the `/v/pyodide/` path the app assigns

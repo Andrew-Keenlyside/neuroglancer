@@ -9,16 +9,28 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_STREAMLINE_FRAGMENT_MAIN,
   KIND_CAPABILITIES,
+  hasObjectModel,
   hasSynthesisedTangent,
+  isPointGeometry,
+  isSurfaceGeometry,
   type ZarrVectorsGeometryKind,
 } from "#src/datasource/zarr-vectors/geometry_kind.js";
 
 const ALL_KINDS: readonly ZarrVectorsGeometryKind[] = [
+  "point_cloud",
+  "line",
   "streamline",
   "polyline",
   "skeleton",
   "graph",
+  "mesh",
 ];
+
+/** Every kind except the one with no connectivity. */
+const CONNECTED_KINDS = ALL_KINDS.filter((k) => k !== "point_cloud");
+
+/** Kinds whose links are vertex pairs drawn as line segments. */
+const LINE_KINDS = CONNECTED_KINDS.filter((k) => k !== "mesh");
 
 describe("KIND_CAPABILITIES table invariants", () => {
   it("has an entry for every declared kind", () => {
@@ -37,16 +49,67 @@ describe("KIND_CAPABILITIES table invariants", () => {
     }
   });
 
-  it("every tangent-bearing kind auto-applies the RGB-by-tangent default shader", () => {
-    // All four current kinds synthesise a tangent, so all four nominate the
-    // direction default -- matching the segmentation layer's "direction"
-    // background colour-by default, so a tract layer renders colour-by-direction
-    // on load rather than the generic per-object hash colour.
-    for (const kind of ALL_KINDS) {
+  it("every line kind synthesises a tangent, so prop_tangent() is always available", () => {
+    for (const kind of LINE_KINDS) {
       expect(hasSynthesisedTangent(kind)).toBe(true);
+    }
+  });
+
+  it("auto-applies the RGB-by-tangent default only where direction is meaningful", () => {
+    // Nominating the direction default is not free: it is
+    // `emitRGB(abs(prop_tangent()))`, which computes the colour outright and
+    // therefore consults neither the fixed segment colour nor the per-object
+    // colour hash. A kind that nominates it renders colour-by-direction on
+    // load and makes every colour control inert until the user edits the
+    // shader. That is the right trade only where the tangent actually means
+    // something.
+    //
+    // Walk-order kinds are directional curves -- the tangent follows the walk
+    // and is consistent along it -- so tractography's colour-by-direction is
+    // the expected default.
+    for (const kind of ["line", "streamline", "polyline"] as const) {
+      expect(KIND_CAPABILITIES[kind].hasWalkOrderTangent).toBe(true);
       expect(KIND_CAPABILITIES[kind].defaultFragmentMain).toBe(
         DEFAULT_STREAMLINE_FRAGMENT_MAIN,
       );
+    }
+
+    // `skeleton` is a branching tree, not a curve. Its tangents come from edge
+    // adjacency, whose sign is arbitrary per vertex and which degree-0
+    // vertices lack entirely, and its stores carry `object_attributes` the
+    // user wants to colour by. It keeps the generic per-object default so the
+    // colour controls work; "Direction" stays available as a preset.
+    expect(KIND_CAPABILITIES.skeleton.hasEdgeAdjacencyTangent).toBe(true);
+    expect(KIND_CAPABILITIES.skeleton.defaultFragmentMain).toBeUndefined();
+  });
+
+  it("point clouds nominate no default shader, having no tangent to read", () => {
+    // `prop_tangent()` does not exist for a point cloud, so the
+    // colour-by-direction default would not compile.
+    expect(hasSynthesisedTangent("point_cloud")).toBe(false);
+    expect(KIND_CAPABILITIES.point_cloud.defaultFragmentMain).toBeUndefined();
+  });
+
+  it("a surface has no direction, so no tangent and no direction default", () => {
+    expect(hasSynthesisedTangent("mesh")).toBe(false);
+    expect(KIND_CAPABILITIES.mesh.defaultFragmentMain).toBeUndefined();
+    expect(isSurfaceGeometry("mesh")).toBe(true);
+    for (const kind of LINE_KINDS) expect(isSurfaceGeometry(kind)).toBe(false);
+    expect(isSurfaceGeometry("point_cloud")).toBe(false);
+  });
+
+  it("only point_cloud is drawn as points, and only it lacks the object model", () => {
+    for (const kind of ALL_KINDS) {
+      const isPoints = kind === "point_cloud";
+      expect(isPointGeometry(kind)).toBe(isPoints);
+      expect(hasObjectModel(kind)).toBe(!isPoints);
+    }
+  });
+
+  it("only the no-connectivity kind suppresses edges", () => {
+    expect(KIND_CAPABILITIES.point_cloud.edgeSource).toBe("none");
+    for (const kind of CONNECTED_KINDS) {
+      expect(KIND_CAPABILITIES[kind].edgeSource).not.toBe("none");
     }
   });
 

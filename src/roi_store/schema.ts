@@ -71,7 +71,11 @@ export interface RoiGroupDocument {
   schemaVersion: number;
   /** Stable, unguessable document id; also the object name stem. */
   id: string;
-  /** Verbatim `groupToJson` output: name, color, rois, visible?, opacity?, highDetail?. */
+  /**
+   * Verbatim `groupToJson` output: name, color, rois, visible?, opacity?,
+   * colorBy?, attrFilters? (the group's attribute predicates — a saved group
+   * can select by data as well as by geometry).
+   */
   group: any;
   source: RoiGroupSource;
   /**

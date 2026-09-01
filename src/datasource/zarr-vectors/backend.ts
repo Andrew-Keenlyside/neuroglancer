@@ -19,7 +19,7 @@
 // run when the worker loads this module.  Without this import the new
 // backends would never appear in the RPC registry and the frontend
 // would fail to instantiate matching chunk sources.
-import "#src/datasource/zarr-vectors/skeleton_backend.js";
+import "#src/datasource/zarr-vectors/geometry_backend.js";
 
 import type { AnnotationGeometryChunk } from "#src/annotation/backend.js";
 import {
@@ -36,11 +36,11 @@ import {
 import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
 import { requestAsyncComputation } from "#src/async_computation/request.js";
 import { WithParameters } from "#src/chunk_manager/backend.js";
-import type { ZarrVectorsAttributeDtype } from "#src/datasource/zarr-vectors/base.js";
 import {
   ZarrVectorsAnnotationSourceParameters,
   ZarrVectorsAnnotationSpatialIndexSourceParameters,
 } from "#src/datasource/zarr-vectors/base.js";
+import { decodeAttributeToFloat32 } from "#src/datasource/zarr-vectors/vertex_attribute_float.js";
 import { readVlenBytesElement } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import { WithSharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
 import { joinBaseUrlAndPath } from "#src/kvstore/url.js";
@@ -103,66 +103,6 @@ function unwrapChunkCell(
     if (e instanceof RangeError) return undefined;
     throw e;
   }
-}
-
-const TYPED_ARRAY_CTORS: Record<
-  ZarrVectorsAttributeDtype,
-  | Float32ArrayConstructor
-  | Uint8ArrayConstructor
-  | Uint16ArrayConstructor
-  | Uint32ArrayConstructor
-  | Int8ArrayConstructor
-  | Int16ArrayConstructor
-  | Int32ArrayConstructor
-> = {
-  float32: Float32Array,
-  uint8: Uint8Array,
-  uint16: Uint16Array,
-  uint32: Uint32Array,
-  int8: Int8Array,
-  int16: Int16Array,
-  int32: Int32Array,
-};
-
-const BYTES_PER_ELEMENT: Record<ZarrVectorsAttributeDtype, number> = {
-  float32: 4,
-  uint8: 1,
-  uint16: 2,
-  uint32: 4,
-  int8: 1,
-  int16: 2,
-  int32: 4,
-};
-
-function reinterpretBytes(
-  bytes: Uint8Array,
-  dtype: ZarrVectorsAttributeDtype,
-  expectedLength: number,
-):
-  | Float32Array
-  | Uint8Array
-  | Uint16Array
-  | Uint32Array
-  | Int8Array
-  | Int16Array
-  | Int32Array {
-  const elementSize = BYTES_PER_ELEMENT[dtype];
-  if (bytes.byteLength !== expectedLength * elementSize) {
-    throw new Error(
-      `zarr-vectors attribute byte length ${bytes.byteLength} does not match ` +
-        `expected ${expectedLength * elementSize} (${expectedLength} ${dtype} values)`,
-    );
-  }
-  const Ctor = TYPED_ARRAY_CTORS[dtype];
-  // The fetched buffer may not be aligned for non-uint8 typed arrays;
-  // copy when necessary.
-  const offsetAligned = bytes.byteOffset % elementSize === 0;
-  if (offsetAligned) {
-    return new (Ctor as any)(bytes.buffer, bytes.byteOffset, expectedLength);
-  }
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  return new (Ctor as any)(copy.buffer, 0, expectedLength);
 }
 
 function emptyGeometryData(): AnnotationGeometryData {
@@ -299,11 +239,11 @@ export class ZarrVectorsAnnotationSpatialIndexSourceBackend extends WithParamete
       );
     }
     const numPoints = vertexBytes.byteLength / bytesPerPoint;
-    const positions = reinterpretBytes(
+    const positions = decodeAttributeToFloat32(
       vertexBytes,
       "float32",
       numPoints * rank,
-    ) as Float32Array;
+    );
 
     const propertyValuesPerPoint = await Promise.all(
       attributeNames.map(async (name, i) => {
@@ -330,7 +270,7 @@ export class ZarrVectorsAnnotationSpatialIndexSourceBackend extends WithParamete
             `zarr-vectors: chunk ${chunkKey} has vertices but property ${JSON.stringify(name)} is empty`,
           );
         }
-        return reinterpretBytes(bytes, attributeDtypes[i], numPoints);
+        return decodeAttributeToFloat32(bytes, attributeDtypes[i], numPoints);
       }),
     );
 

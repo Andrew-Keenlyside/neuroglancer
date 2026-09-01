@@ -26,10 +26,10 @@ import {
 } from "#src/datasource/zarr-vectors/roi.js";
 import {
   computeChunkCrossings,
-  selectHighDetail,
   computeGroupedPassingSet,
   computePassingSet,
   computePerGroupPassingSets,
+  computeVertexAttrPassingSet,
   diffPassingSet,
   RoiFilterAccumulator,
   type RoiFilterableChunk,
@@ -95,6 +95,28 @@ const roi = (shape: RoiShape, operator: RoiOperator): Roi => ({
   operator,
   predicate: RoiPredicate.ANY_SEGMENT,
 });
+
+/**
+ * A point-cloud chunk: one spatial BIN holding unrelated points, each its own
+ * object, optionally carrying per-vertex attribute columns.
+ */
+function pointChunk(
+  points: [number, number, number][],
+  ids: bigint[],
+  vertexAttributes?: Map<string, Float32Array>,
+): RoiFilterableChunk {
+  return {
+    rank: 3,
+    numVertices: points.length,
+    positions: Float32Array.from(points.flat()),
+    segmentIds: segColumn(ids),
+    // One fragment for the whole bin, which is exactly the shape that makes the
+    // per-fragment fold wrong for this kind.
+    fragmentIndex: rangeIndex([[0, points.length]]),
+    perVertexObjects: true,
+    ...(vertexAttributes === undefined ? {} : { vertexAttributes }),
+  };
+}
 
 describe("computeChunkCrossings", () => {
   it("marks an object whose fragment crosses the ROI", () => {
@@ -332,13 +354,11 @@ describe("computeGroupedPassingSet", () => {
     rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
     colorPacked: RED,
     visible: true,
-    highDetail: false,
   };
   const groupB: RoiGroupConfig = {
     rois: [roi(sphere(10, 0, 0, 1), RoiOperator.AND)],
     colorPacked: BLUE,
     visible: true,
-    highDetail: false,
   };
 
   it("unions passing objects across groups and colours by group", () => {
@@ -370,7 +390,6 @@ describe("computeGroupedPassingSet", () => {
       ],
       colorPacked: RED,
       visible: true,
-      highDetail: false,
     };
     const { passing } = computeGroupedPassingSet([chunk], [a, groupB]);
     expect([...passing].sort()).toEqual([1n, 2n]);
@@ -382,7 +401,6 @@ describe("computeGroupedPassingSet", () => {
       rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
       colorPacked: BLUE,
       visible: true,
-      highDetail: false,
     };
     const { colorById } = computeGroupedPassingSet(
       [chunk],
@@ -395,25 +413,6 @@ describe("computeGroupedPassingSet", () => {
     const { passing, colorById } = computeGroupedPassingSet([chunk], []);
     expect(passing.size).toBe(0);
     expect(colorById.size).toBe(0);
-  });
-
-  it("unions only visible high-detail groups' passing ids into highDetail", () => {
-    const { highDetail } = computeGroupedPassingSet(
-      [chunk],
-      [
-        { ...groupA, highDetail: true }, // object 1
-        groupB, // object 2, not high-detail
-      ],
-    );
-    expect([...highDetail]).toEqual([1n]);
-  });
-
-  it("excludes an invisible high-detail group from highDetail", () => {
-    const { highDetail } = computeGroupedPassingSet(
-      [chunk],
-      [{ ...groupA, highDetail: true, visible: false }],
-    );
-    expect(highDetail.size).toBe(0);
   });
 
   // Per-object attribute values, keyed by attribute name, as shipped to the
@@ -431,21 +430,19 @@ describe("computeGroupedPassingSet", () => {
       ],
     ]);
 
-  it("narrows a group's passing set by a length range", () => {
+  it("narrows a group's passing set by an object attribute range", () => {
     const cols = lengthColumns({ 1: 50, 2: 10, 3: 999 });
     // Object 1 (origin, length 50) is inside [40, 60] -> kept.
     const kept = computeGroupedPassingSet(
       [chunk],
-      [{ ...groupA, lengthRange: { name: "length", min: 40, max: 60 } }],
-      undefined,
+      [{ ...groupA, attrFilters: [{ name: "length", min: 40, max: 60 }] }],
       cols,
     );
     expect([...kept.passing]).toEqual([1n]);
     // Outside [60, 100] -> dropped, even though its ROI matches.
     const dropped = computeGroupedPassingSet(
       [chunk],
-      [{ ...groupA, lengthRange: { name: "length", min: 60, max: 100 } }],
-      undefined,
+      [{ ...groupA, attrFilters: [{ name: "length", min: 60, max: 100 }] }],
       cols,
     );
     expect(dropped.passing.size).toBe(0);
@@ -455,7 +452,6 @@ describe("computeGroupedPassingSet", () => {
     const { colorById } = computeGroupedPassingSet(
       [chunk],
       [{ ...groupA, colorBy: { kind: "objectAttr", name: "length" } }],
-      undefined,
       lengthColumns({ 1: 50 }),
     );
     const c = colorById.get(1n);
@@ -486,10 +482,9 @@ describe("computeGroupedPassingSet", () => {
         {
           ...groupA,
           colorBy: { kind: "objectAttr", name: "length" },
-          lengthRange: { name: "length", min: 40, max: 60 },
+          attrFilters: [{ name: "length", min: 40, max: 60 }],
         },
       ],
-      undefined,
       new Map(), // no columns loaded yet
     );
     expect([...passing]).toEqual([1n]); // not dropped despite the range
@@ -516,13 +511,11 @@ describe("computePerGroupPassingSets", () => {
     rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
     colorPacked: 0,
     visible: true,
-    highDetail: false,
   };
   const groupB: RoiGroupConfig = {
     rois: [roi(sphere(10, 0, 0, 1), RoiOperator.AND)],
     colorPacked: 0,
     visible: true,
-    highDetail: false,
   };
 
   it("returns each group's passing set separately, positionally", () => {
@@ -574,7 +567,7 @@ describe("computePerGroupPassingSets", () => {
     expect([...sets[1]]).toEqual([2n]);
   });
 
-  it("narrows a group's set by a length range", () => {
+  it("narrows a group's set by an object attribute range", () => {
     const cols = new Map([
       [
         "length",
@@ -588,13 +581,13 @@ describe("computePerGroupPassingSets", () => {
     ]);
     const kept = computePerGroupPassingSets(
       [chunk],
-      [{ ...groupA, lengthRange: { name: "length", min: 40, max: 60 } }],
+      [{ ...groupA, attrFilters: [{ name: "length", min: 40, max: 60 }] }],
       cols,
     );
     expect([...kept[0]]).toEqual([1n]);
     const dropped = computePerGroupPassingSets(
       [chunk],
-      [{ ...groupA, lengthRange: { name: "length", min: 60, max: 100 } }],
+      [{ ...groupA, attrFilters: [{ name: "length", min: 60, max: 100 }] }],
       cols,
     );
     expect(dropped[0].size).toBe(0);
@@ -602,6 +595,218 @@ describe("computePerGroupPassingSets", () => {
 
   it("returns an empty array for no groups", () => {
     expect(computePerGroupPassingSets([chunk], [])).toEqual([]);
+  });
+});
+
+describe("computeChunkCrossings for geometry without an object model", () => {
+  it("tests each point on its own rather than folding the bin it sits in", () => {
+    // Three unrelated cells in ONE fragment. Only the one at the origin is in
+    // the sphere; folding per fragment would have put all three in it.
+    const chunk = pointChunk(
+      [
+        [0, 0, 0],
+        [50, 0, 0],
+        [100, 0, 0],
+      ],
+      [1n, 2n, 3n],
+    );
+    const crossings = computeChunkCrossings(chunk, [
+      roi(sphere(0, 0, 0, 1), RoiOperator.AND),
+    ]);
+    expect(crossings.get(1n)).toEqual([true]);
+    expect(crossings.get(2n)).toEqual([false]);
+    expect(crossings.get(3n)).toEqual([false]);
+  });
+
+  it("does not join consecutive points into a segment", () => {
+    // The sphere sits BETWEEN two points. A polyline through them would cross
+    // it; two independent points do not.
+    const chunk = pointChunk(
+      [
+        [-5, 0, 0],
+        [5, 0, 0],
+      ],
+      [1n, 2n],
+    );
+    const crossings = computeChunkCrossings(chunk, [
+      roi(sphere(0, 0, 0, 1), RoiOperator.AND),
+    ]);
+    expect(crossings.get(1n)).toEqual([false]);
+    expect(crossings.get(2n)).toEqual([false]);
+  });
+
+  it("evaluates a surface's vertices, not the walk through them", () => {
+    // Same geometry as a tract fragment, but flagged as a face soup: the ROI
+    // between the two vertices is not crossed by anything real.
+    const chunk: RoiFilterableChunk = {
+      rank: 3,
+      numVertices: 2,
+      positions: Float32Array.from([-5, 0, 0, 5, 0, 0]),
+      segmentIds: segColumn([42n, 42n]),
+      fragmentIndex: rangeIndex([[0, 2]]),
+      surfaceVertices: true,
+    };
+    const rois = [roi(sphere(0, 0, 0, 1), RoiOperator.AND)];
+    expect(computeChunkCrossings(chunk, rois).get(42n)).toEqual([false]);
+    // A vertex actually inside it still counts.
+    const inside: RoiFilterableChunk = {
+      ...chunk,
+      positions: Float32Array.from([0.5, 0, 0, 5, 0, 0]),
+    };
+    expect(computeChunkCrossings(inside, rois).get(42n)).toEqual([true]);
+  });
+});
+
+describe("computeVertexAttrPassingSet", () => {
+  const chunk = () =>
+    pointChunk(
+      [
+        [0, 0, 0],
+        [1, 0, 0],
+        [2, 0, 0],
+      ],
+      [1n, 2n, 3n],
+      new Map([
+        ["gene_a", Float32Array.from([0.1, 5, 9])],
+        ["flag", Float32Array.from([1, 0, 1])],
+      ]),
+    );
+
+  it("selects the vertices whose value is in range", () => {
+    const passing = computeVertexAttrPassingSet(
+      [chunk()],
+      [{ name: "gene_a", min: 1, max: 10, scope: "vertex" }],
+    );
+    expect([...passing].sort()).toEqual([2n, 3n]);
+  });
+
+  it("requires ONE vertex to satisfy every predicate at once", () => {
+    // Vertex 3 has the high gene value; vertex 1 has the flag. Neither vertex
+    // has both, so nothing passes -- co-expression, not either-or.
+    const passing = computeVertexAttrPassingSet(
+      [chunk()],
+      [
+        { name: "gene_a", min: 8, max: 10, scope: "vertex" },
+        { name: "flag", min: 0.5, max: 1, scope: "vertex" },
+      ],
+    );
+    expect([...passing]).toEqual([3n]);
+    const none = computeVertexAttrPassingSet(
+      [chunk()],
+      [
+        { name: "gene_a", min: 4, max: 6, scope: "vertex" },
+        { name: "flag", min: 0.5, max: 1, scope: "vertex" },
+      ],
+    );
+    expect(none.size).toBe(0);
+  });
+
+  it("selects nothing from a chunk missing the column", () => {
+    // A filter naming an unloaded attribute must not read as "select all".
+    const passing = computeVertexAttrPassingSet(
+      [chunk()],
+      [{ name: "gene_absent", min: 0, max: 1, scope: "vertex" }],
+    );
+    expect(passing.size).toBe(0);
+  });
+});
+
+describe("attribute-only and mixed groups", () => {
+  const attrChunk = () =>
+    pointChunk(
+      [
+        [0, 0, 0],
+        [50, 0, 0],
+      ],
+      [1n, 2n],
+      new Map([["gene_a", Float32Array.from([9, 9])]]),
+    );
+  const group = (config: Partial<RoiGroupConfig>): RoiGroupConfig => ({
+    rois: [],
+    colorPacked: 0xff0000ff,
+    visible: true,
+    ...config,
+  });
+
+  it("selects by attribute alone, with no ROI drawn at all", () => {
+    const { passing } = computeGroupedPassingSet(
+      [attrChunk()],
+      [
+        group({
+          attrFilters: [{ name: "gene_a", min: 5, max: 10, scope: "vertex" }],
+        }),
+      ],
+    );
+    expect([...passing].sort()).toEqual([1n, 2n]);
+  });
+
+  it("intersects an attribute predicate with the ROI fold", () => {
+    // Both cells express the gene; only the one at the origin is in the sphere.
+    const { passing } = computeGroupedPassingSet(
+      [attrChunk()],
+      [
+        group({
+          rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
+          attrFilters: [{ name: "gene_a", min: 5, max: 10, scope: "vertex" }],
+        }),
+      ],
+    );
+    expect([...passing]).toEqual([1n]);
+    // Narrowing the range past the data empties the group even though the ROI
+    // still matches.
+    const { passing: none } = computeGroupedPassingSet(
+      [attrChunk()],
+      [
+        group({
+          rois: [roi(sphere(0, 0, 0, 1), RoiOperator.AND)],
+          attrFilters: [{ name: "gene_a", min: 0, max: 1, scope: "vertex" }],
+        }),
+      ],
+    );
+    expect(none.size).toBe(0);
+  });
+
+  it("selects objects the view has not loaded from an object-scope column", () => {
+    // No geometry at all: the column alone decides. This is what lets a group
+    // be "every object with FA > 0.5" rather than "every loaded one".
+    const columns = new Map([
+      [
+        "fa",
+        {
+          ids: BigUint64Array.from([10n, 11n, 12n]),
+          values: Float32Array.from([0.2, 0.6, 0.9]),
+          min: 0,
+          max: 1,
+        },
+      ],
+    ]);
+    const { passing } = computeGroupedPassingSet(
+      [],
+      [group({ attrFilters: [{ name: "fa", min: 0.5, max: 1 }] })],
+      columns,
+    );
+    expect([...passing].sort()).toEqual([11n, 12n]);
+  });
+
+  it("still selects nothing for a group with neither ROIs nor predicates", () => {
+    const { passing } = computeGroupedPassingSet([attrChunk()], [group({})]);
+    expect(passing.size).toBe(0);
+  });
+
+  it("reports attribute-only groups per group for the export path too", () => {
+    const sets = computePerGroupPassingSets(
+      [attrChunk()],
+      [
+        group({
+          attrFilters: [{ name: "gene_a", min: 5, max: 10, scope: "vertex" }],
+        }),
+        group({
+          attrFilters: [{ name: "gene_a", min: 0, max: 1, scope: "vertex" }],
+        }),
+      ],
+    );
+    expect([...sets[0]].sort()).toEqual([1n, 2n]);
+    expect(sets[1].size).toBe(0);
   });
 });
 
@@ -625,55 +830,5 @@ describe("diffPassingSet", () => {
     expect(diffPassingSet(new Set(), new Set([1n, 2n])).removed.sort()).toEqual(
       [1n, 2n],
     );
-  });
-});
-
-describe("selectHighDetail", () => {
-  const ids = (...xs: number[]) => new Set(xs.map((x) => BigInt(x)));
-  const nums = (s: Set<bigint>) => [...s].map(Number).sort((a, b) => a - b);
-  const none = new Set<bigint>();
-
-  it("honours only the explicit request when no budget is set", () => {
-    // Filling from `passing` unbounded could try to fetch the whole dissection.
-    expect(nums(selectHighDetail(ids(1, 2, 3, 4), ids(2), undefined))).toEqual([
-      2,
-    ]);
-  });
-
-  it("a budget of 0 disables full detail entirely", () => {
-    expect(selectHighDetail(ids(1, 2, 3), ids(1), 0).size).toBe(0);
-  });
-
-  it("fills from the passing set once the preferred tier is exhausted", () => {
-    // The mixed-level case: `passing` names tracts that exist only at levels
-    // finer than the one drawn, and pass 2 is the only thing that can show them.
-    expect(nums(selectHighDetail(ids(1, 2, 3, 4, 5), ids(4), 3))).toEqual([
-      1, 2, 4,
-    ]);
-  });
-
-  it("spends the whole budget on preferred when it alone exceeds it", () => {
-    expect(nums(selectHighDetail(ids(1, 2, 3), ids(7, 8, 9), 2))).toEqual([
-      7, 8,
-    ]);
-  });
-
-  it("never duplicates an id present in both tiers", () => {
-    const got = selectHighDetail(ids(1, 2, 3), ids(2), 3);
-    expect(got.size).toBe(3);
-    expect(nums(got)).toEqual([1, 2, 3]);
-  });
-
-  it("caps at the budget even when everything passes", () => {
-    expect(selectHighDetail(ids(1, 2, 3, 4, 5, 6), none, 2).size).toBe(2);
-  });
-
-  it("is stable: the result does not depend on iteration order", () => {
-    // Diffed against the resident set each recompute, so a shifting order would
-    // evict and refetch whole tracts on every pan.
-    const a = selectHighDetail(ids(9, 4, 7, 1), none, 2);
-    const b = selectHighDetail(ids(1, 7, 4, 9), none, 2);
-    expect(nums(a)).toEqual(nums(b));
-    expect(nums(a)).toEqual([1, 4]);
   });
 });

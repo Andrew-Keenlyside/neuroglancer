@@ -18,11 +18,27 @@ import type {
   AnnotationPropertySpec,
   AnnotationType,
 } from "#src/annotation/index.js";
+import type { ZarrVectorsGeometryKind } from "#src/datasource/zarr-vectors/geometry_kind.js";
+
+export type { ZarrVectorsGeometryKind } from "#src/datasource/zarr-vectors/geometry_kind.js";
 
 /**
  * Numpy-style dtype string for a per-vertex attribute as written by
- * zarr-vectors.  Subset that maps directly onto neuroglancer
- * annotation property serializer types.
+ * zarr-vectors.
+ *
+ * Every one of these decodes to `float32` before it reaches the GPU (see
+ * `decodeAttributeToFloat32`), which is what lets an arbitrary number of
+ * attributes share one texture and what makes `prop_<name>()` return a plain
+ * `float` for all of them. The 64-bit members are downcast: a MERFISH store's
+ * obs columns are float64 scores and int64 category codes, and dropping them
+ * for want of a 32-bit spelling left the store with nothing to colour by but
+ * whichever genes sorted first alphabetically. The same downcast is already
+ * how per-OBJECT attributes are handled (`reinterpretWideToFloat32`).
+ *
+ * Precision: values above 2^24 are no longer exact. That is immaterial for
+ * scores, coordinates and category codes, and id-shaped columns are excluded
+ * from the one place exactness matters -- `resolveVertexIdColumn` refuses
+ * them rather than truncating ids silently.
  */
 export type ZarrVectorsAttributeDtype =
   | "float32"
@@ -31,7 +47,17 @@ export type ZarrVectorsAttributeDtype =
   | "uint32"
   | "int8"
   | "int16"
-  | "int32";
+  | "int32"
+  | "float64"
+  | "int64"
+  | "uint64";
+
+/** The 64-bit members of {@link ZarrVectorsAttributeDtype}, downcast on decode. */
+export const WIDE_ATTRIBUTE_DTYPES = new Set<ZarrVectorsAttributeDtype>([
+  "float64",
+  "int64",
+  "uint64",
+]);
 
 /**
  * How the annotation renderer should combine spatial-index levels of a
@@ -86,25 +112,6 @@ export type ZarrVectorsLinksConvention =
   | "explicit";
 
 /**
- * Geometry kind for a zarr-vectors store that routes through the
- * spatially-indexed skeleton render path (streamlines, polylines,
- * skeletons, graphs).  Drives chunk-decoder behaviour (tangent
- * synthesis algorithm) and frontend defaults (shader text).  See
- * {@link KIND_CAPABILITIES} in `geometry_kind.ts` for the per-kind
- * capability table that downstream code should consult instead of
- * spreading `geometryKind === "..."` checks.
- *
- * Aliases the canonical {@link ZarrVectorsGeometryKind} declared in
- * `geometry_kind.ts` — the legacy name is retained because the
- * parameter-class field names propagate through the RPC layer.
- */
-export type ZarrVectorsSkeletonGeometryKind =
-  | "streamline"
-  | "polyline"
-  | "skeleton"
-  | "graph";
-
-/**
  * Integer dtype for ``links/0/<chunk>``.  Writers pick the narrowest
  * width that covers ``n_vertices_in_chunk`` (see spec §7.5); the
  * reader honours whatever was declared in ``.zattrs.dtype``.  Unused
@@ -120,6 +127,14 @@ export type ZarrVectorsLinkDtype =
   | "int64";
 
 /**
+ * Request/response RPC: one object's geometry as a node list, for the
+ * spatial-skeleton editing UI. Named here so both sides of the worker boundary
+ * agree without the frontend importing the backend module.
+ */
+export const ZARR_VECTORS_GET_OBJECT_NODES_RPC_ID =
+  "zarr-vectors/getObjectNodes";
+
+/**
  * Parameters for the spatially-indexed skeleton chunk source (pass 1).
  * Mirrors :class:`SpatiallyIndexedSkeletonSourceBackend` semantics: the
  * source enumerates chunks visible to the camera and downloads each one
@@ -129,16 +144,25 @@ export type ZarrVectorsLinkDtype =
  * ``baseUrl`` ends with ``/`` and points at the level directory (e.g.
  * ``".../store.zvr/0/"``).
  */
-export class ZarrVectorsSpatiallyIndexedSkeletonSourceParameters {
+export class ZarrVectorsSpatialGeometrySourceParameters {
   baseUrl!: string;
   rank!: number;
   /** Parallel arrays describing per-vertex attribute discovery. */
   attributeNames!: string[];
   attributeDtypes!: ZarrVectorsAttributeDtype[];
+  /**
+   * Shader-facing name for each attribute, parallel to `attributeNames`.
+   * Store attribute names are unrestricted (`gene_H2-Q2`), but the render
+   * layer turns these into `prop_<id>()` GLSL macros, so the datasource maps
+   * each on-disk name to a legal identifier (see
+   * `zarr-vectors/property_id.ts`) and passes it here.  `attributeNames` stays
+   * the directory to read.  Absent → fall back to `attributeNames`.
+   */
+  attributePropertyIds?: string[];
   /** From the store's ``zarr_vectors.links_convention``. */
   linksConvention!: ZarrVectorsLinksConvention;
   /** Drives tangent precomputation for streamline/polyline shaders. */
-  geometryKind!: ZarrVectorsSkeletonGeometryKind;
+  geometryKind!: ZarrVectorsGeometryKind;
   /**
    * Declared ``links/0/.zattrs.dtype``.  Unused when
    * ``linksConvention === "implicit_sequential"`` — keep ``"int64"`` as
@@ -156,6 +180,29 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceParameters {
   /** Whether `fragment_attributes/segment_id` exists for this level. */
   hasFragmentSegmentIds!: boolean;
   /**
+   * Name of a per-vertex attribute carrying a meaningful integer id per vertex
+   * (from the store's `zarr_vectors.vertex_id_attribute`).  Only consulted for
+   * kinds without the discrete-object model, where each vertex is its own
+   * segment; see `skeleton_chunk_download.fillPerVertexSegmentIds`.
+   */
+  vertexIdAttribute?: string;
+  /**
+   * Base URL of a loopback edit service, from the source URL's `#edit=`
+   * fragment, and the store name to hand it. Present only when the layer was
+   * opened for editing; the source reports `readonly` unless both are set.
+   *
+   * Editing cannot go through the kvstore -- it is read-only by construction
+   * (`src/kvstore/index.ts`) -- so the write happens out of band and the layer
+   * re-reads afterwards.
+   */
+  editServiceUrl?: string;
+  editStore?: string;
+  /**
+   * The links family's declared `link_width`: 2 for edges, >= 3 for the faces
+   * of a surface. Absent means 2, which is every non-mesh geometry.
+   */
+  linkWidth?: number;
+  /**
    * Per-chunk-array grid geometry from `<level>/vertices/zarr.json` (v0.9.0
    * single-array format).  `chunkGridOrigin` is `attributes.chunk_grid_origin`
    * (the on-disk 0-based cell index of absolute chunk coord `C` is
@@ -168,6 +215,38 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceParameters {
   sharded!: boolean;
   shardChunkShape!: number[];
   cellSeparator!: string;
+  /**
+   * Which objects the NEXT COARSER level holds, as a bitset over the shared
+   * object-id space (bit `id` set = present). Empty for the coarsest level.
+   *
+   * This is the "backbone" half of the object-admission test: an object that
+   * also survives into a coarser level is drawn unconditionally, so the picture
+   * never loses a tract that a coarser level would have shown. Everything new
+   * at this level is rationed instead, by `objectRank` against a fraction
+   * supplied at request time. See `object_admission.ts`.
+   *
+   * A bitset because this crosses to the worker: 503k objects is 63 KB packed
+   * against 2 MB as counts. Absent for a store with no per-level membership
+   * data, which disables per-object admission and keeps whole-level selection.
+   */
+  coarserMembership?: Uint8Array;
+  /**
+   * Whether this store's levels PARTITION the objects between them, so that
+   * drawing several levels at once draws each object exactly once.
+   *
+   * True exactly when {@link coarserMembership} is populated, and carried
+   * separately only because the generic skeleton layer -- which decides whether
+   * to draw the union of levels -- must be able to ask the question without
+   * knowing about zarr-vectors bitsets. See
+   * `getSpatiallyIndexedSkeletonPartitionsObjects` in
+   * `skeleton/source_selection.ts`.
+   *
+   * False for a plain RESOLUTION pyramid (`object_sparsity` 1.0 at every
+   * level: mesh and point-cloud stores, and any skeleton store without
+   * `object_attributes/vertex_count`), where every level holds every object
+   * and the union would superimpose decimated copies of the same geometry.
+   */
+  partitionsObjects?: boolean;
   static RPC_ID = "zarr-vectors/SpatiallyIndexedSkeletonSource";
 }
 
@@ -185,19 +264,28 @@ export class ZarrVectorsSpatiallyIndexedSkeletonSourceParameters {
  * multiscale path; pass 2 always renders the highlighted objects at
  * full fidelity.
  */
-export class ZarrVectorsObjectKeyedSkeletonSourceParameters {
+export class ZarrVectorsObjectKeyedGeometrySourceParameters {
   baseUrl!: string;
   rank!: number;
   attributeNames!: string[];
   attributeDtypes!: ZarrVectorsAttributeDtype[];
+  /**
+   * Shader-facing name for each attribute, parallel to `attributeNames`.
+   * Store attribute names are unrestricted (`gene_H2-Q2`), but the render
+   * layer turns these into `prop_<id>()` GLSL macros, so the datasource maps
+   * each on-disk name to a legal identifier (see
+   * `zarr-vectors/property_id.ts`) and passes it here.  `attributeNames` stays
+   * the directory to read.  Absent → fall back to `attributeNames`.
+   */
+  attributePropertyIds?: string[];
   linksConvention!: ZarrVectorsLinksConvention;
-  geometryKind!: ZarrVectorsSkeletonGeometryKind;
+  geometryKind!: ZarrVectorsGeometryKind;
   linkDtype!: ZarrVectorsLinkDtype;
   /** Whether `fragment_attributes/segment_id` exists at level 0. */
   hasFragmentSegmentIds!: boolean;
   /**
    * Per-chunk-array grid geometry from level 0's `vertices/zarr.json`; see the
-   * matching fields on {@link ZarrVectorsSpatiallyIndexedSkeletonSourceParameters}.
+   * matching fields on {@link ZarrVectorsSpatialGeometrySourceParameters}.
    */
   chunkGridOrigin!: number[];
   sharded!: boolean;

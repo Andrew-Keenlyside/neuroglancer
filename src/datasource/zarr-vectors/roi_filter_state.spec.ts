@@ -149,7 +149,6 @@ describe("RoiFilterState serialization", () => {
       color: vec3.fromValues(1, 0, 0),
       visible: false,
       opacity: 0.4,
-      highDetail: true,
     });
     s.addRoi(g, ellipsoid);
     s.addRoi(g, box);
@@ -165,7 +164,6 @@ describe("RoiFilterState serialization", () => {
     expect(json.groups[0].color).toBe("#ff0000");
     expect(json.groups[0].visible).toBe(false);
     expect(json.groups[0].opacity).toBe(0.4);
-    expect(json.groups[0].highDetail).toBe(true);
     expect(json.active).toBe(true);
     expect(json.ghostAlpha).toBe(0.25);
     expect(json.colorByGroup).toBe(false);
@@ -176,7 +174,6 @@ describe("RoiFilterState serialization", () => {
     expect(Array.from(restored.groups[0].color)).toEqual([1, 0, 0]);
     expect(restored.groups[0].visible).toBe(false);
     expect(restored.groups[0].opacity).toBe(0.4);
-    expect(restored.groups[0].highDetail).toBe(true);
     expect(restored.groups[0].rois).toHaveLength(2);
     expect(restored.active).toBe(true);
     expect(restored.ghostAlpha).toBe(0.25);
@@ -184,14 +181,23 @@ describe("RoiFilterState serialization", () => {
     expect(restored.hideOverlays2d).toBe(true);
   });
 
-  it("defaults new-group opacity to 1 and highDetail to false, omitted from JSON", () => {
+  it("defaults new-group opacity to 1, omitted from JSON", () => {
     const s = new RoiFilterState();
     s.addGroup();
     expect(s.groups[0].opacity).toBe(1);
-    expect(s.groups[0].highDetail).toBe(false);
     const json = s.toJSON();
     expect("opacity" in json.groups[0]).toBe(false);
-    expect("highDetail" in json.groups[0]).toBe(false);
+  });
+
+  it("ignores a legacy `highDetail` key rather than failing to restore", () => {
+    // Groups could once be marked for full-detail loading. The key survives in
+    // saved states and stored groups; it now has no effect and no successor.
+    const s = new RoiFilterState();
+    s.restoreState({
+      groups: [{ name: "Motor", color: "#ff0000", rois: [], highDetail: true }],
+    });
+    expect(s.groups).toHaveLength(1);
+    expect("highDetail" in (s.toJSON().groups[0] as object)).toBe(false);
   });
 
   it("round-trips ROI names, omitting the key when unnamed", () => {
@@ -346,12 +352,12 @@ describe("insertGroup", () => {
     expect(new Set(target.groups.map((g) => g.id)).size).toBe(2);
   });
 
-  it("carries colorBy + lengthFilter across states and JSON", () => {
+  it("carries colorBy + attrFilters across states and JSON", () => {
     const source = new RoiFilterState();
     const id = source.addGroup();
     source.updateGroup(id, {
       colorBy: { kind: "objectAttr", name: "length" },
-      lengthFilter: { name: "length", min: 10, max: 50 },
+      attrFilters: [{ name: "length", min: 10, max: 50 }],
     });
 
     // Direct carry.
@@ -361,11 +367,9 @@ describe("insertGroup", () => {
       kind: "objectAttr",
       name: "length",
     });
-    expect(target.groups[0].lengthFilter).toEqual({
-      name: "length",
-      min: 10,
-      max: 50,
-    });
+    expect(target.groups[0].attrFilters).toEqual([
+      { name: "length", min: 10, max: 50 },
+    ]);
 
     // JSON round trip.
     const restored = new RoiFilterState();
@@ -374,11 +378,9 @@ describe("insertGroup", () => {
       kind: "objectAttr",
       name: "length",
     });
-    expect(restored.groups[0].lengthFilter).toEqual({
-      name: "length",
-      min: 10,
-      max: 50,
-    });
+    expect(restored.groups[0].attrFilters).toEqual([
+      { name: "length", min: 10, max: 50 },
+    ]);
   });
 });
 
@@ -438,14 +440,14 @@ describe("RoiFilterState colour-by + length filter", () => {
     });
   });
 
-  it("updateGroup with lengthFilter: undefined clears the filter", () => {
+  it("updateGroup with an empty attrFilters list clears the predicates", () => {
     const s = new RoiFilterState();
     const g = s.addGroup();
-    s.updateGroup(g, { lengthFilter: { name: "length", min: 1, max: 2 } });
-    expect(s.groups[0].lengthFilter).toBeDefined();
-    s.updateGroup(g, { lengthFilter: undefined });
-    expect(s.groups[0].lengthFilter).toBeUndefined();
-    expect("lengthFilter" in s.toJSON().groups[0]).toBe(false);
+    s.updateGroup(g, { attrFilters: [{ name: "length", min: 1, max: 2 }] });
+    expect(s.groups[0].attrFilters).toHaveLength(1);
+    s.updateGroup(g, { attrFilters: [] });
+    expect(s.groups[0].attrFilters).toEqual([]);
+    expect("attrFilters" in s.toJSON().groups[0]).toBe(false);
   });
 
   it("migrates a legacy colorByGroup:false to per-group direction colour", () => {
@@ -496,13 +498,85 @@ describe("RoiFilterState colour-by + length filter", () => {
   });
 });
 
+describe("RoiFilterState attribute predicates", () => {
+  it("round-trips a predicate list through JSON, scope and all", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    s.updateGroup(g, {
+      attrFilters: [
+        { name: "length", min: 10, max: 50 },
+        { name: "gene_Acta2", min: 1, max: 9, scope: "vertex" },
+      ],
+    });
+    const restored = new RoiFilterState();
+    restored.restoreState(s.toJSON());
+    expect(restored.groups[0].attrFilters).toEqual([
+      { name: "length", min: 10, max: 50 },
+      { name: "gene_Acta2", min: 1, max: 9, scope: "vertex" },
+    ]);
+    // The default scope stays implicit, so an object-scope predicate written by
+    // this version is byte-identical to the legacy spelling's meaning.
+    expect(s.toJSON().groups[0].attrFilters[0]).toStrictEqual({
+      name: "length",
+      min: 10,
+      max: 50,
+    });
+  });
+
+  it("migrates a legacy single lengthFilter into the predicate list", () => {
+    const s = new RoiFilterState();
+    s.restoreState({
+      groups: [
+        {
+          name: "Group 1",
+          color: "#ff3b30",
+          rois: [],
+          lengthFilter: { name: "length", min: 5, max: 25 },
+        },
+      ],
+    });
+    expect(s.groups[0].attrFilters).toEqual([
+      { name: "length", min: 5, max: 25 },
+    ]);
+  });
+
+  it("treats an attribute-only group as a dissection the filter can act on", () => {
+    const s = new RoiFilterState();
+    const g = s.addGroup();
+    expect(s.hasVisibleRois()).toBe(false); // an empty group selects nothing
+    s.updateGroup(g, {
+      attrFilters: [{ name: "flag", min: 0.5, max: 1, scope: "vertex" }],
+    });
+    expect(s.hasVisibleRois()).toBe(true);
+  });
+
+  it("commits an attribute-only preview (no ROIs) to a real group", () => {
+    const s = new RoiFilterState();
+    s.setPreviewGroup({
+      name: "Attribute selection",
+      color: vec3.fromValues(1, 1, 1),
+      visible: true,
+      opacity: 1,
+      colorBy: { kind: "group" },
+      attrFilters: [{ name: "flag", min: 0.5, max: 1, scope: "vertex" }],
+      rois: [],
+    });
+    expect(s.hasVisibleRois()).toBe(true);
+    const id = s.commitPreviewGroup("High quality");
+    expect(id).toBeDefined();
+    expect(s.groups[0].name).toBe("High quality");
+    expect(s.groups[0].attrFilters).toHaveLength(1);
+    expect(s.previewGroup).toBeUndefined();
+  });
+});
+
 describe("RoiFilterState label-selection preview", () => {
   const previewGroup = (labels: number[]) => ({
+    attrFilters: [],
     name: "Label selection",
     color: vec3.fromValues(1, 1, 1),
     visible: true,
     opacity: 1,
-    highDetail: false,
     colorBy: { kind: "group" as const },
     rois: labels.map((id) => ({
       shape: { kind: "labelMask" as const, labels: [id] },

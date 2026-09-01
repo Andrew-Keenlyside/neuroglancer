@@ -293,6 +293,35 @@ export function computeTextureFormat(
   );
 }
 
+/**
+ * View `data`'s bytes as `arrayConstructor`, which is how a texture upload
+ * reinterprets a raw byte blob as the texel type its format expects.
+ *
+ * A view into a packed buffer need not start on an element boundary: skeleton
+ * vertex attributes are stored back-to-back, so a float32 attribute that
+ * follows a `uint8` one begins at an arbitrary byte. Typed-array construction
+ * rejects an unaligned `byteOffset` outright, so copy to a fresh buffer in that
+ * case; the common aligned path still just wraps the existing memory.
+ */
+function reinterpretAsTextureArray(
+  data: TypedArray,
+  arrayConstructor: TypedNumberArrayConstructor,
+): TypedNumberArray {
+  if (data.constructor === arrayConstructor) return data as TypedNumberArray;
+  const bytesPerElement = arrayConstructor.BYTES_PER_ELEMENT;
+  const numTargetElements = data.byteLength / bytesPerElement;
+  if (data.byteOffset % bytesPerElement === 0) {
+    return new arrayConstructor(
+      data.buffer,
+      data.byteOffset,
+      numTargetElements,
+    );
+  }
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  return new arrayConstructor(copy.buffer, 0, numTargetElements);
+}
+
 export function setOneDimensionalTextureData(
   gl: GL,
   format: TextureFormat,
@@ -324,13 +353,7 @@ export function setOneDimensionalTextureData(
   const textureWidth = (1 << textureXBits) * texelsPerElement;
   const textureHeight = Math.ceil(numElements / (1 << textureXBits));
   const requiredSize = textureWidth * textureHeight * arrayElementsPerTexel;
-  if (data.constructor !== arrayConstructor) {
-    data = new arrayConstructor(
-      data.buffer,
-      data.byteOffset,
-      data.byteLength / arrayConstructor.BYTES_PER_ELEMENT,
-    );
-  }
+  data = reinterpretAsTextureArray(data, arrayConstructor);
   const padded = maybePadArray(data, requiredSize);
   gl.pixelStorei(WebGL2RenderingContext.UNPACK_ALIGNMENT, 1);
   setRawTextureParameters(gl);
@@ -365,13 +388,7 @@ export function updateOneDimensionalTextureElement(
   }
   const { arrayConstructor, texelsPerElement, textureFormat, texelType } =
     format;
-  if (data.constructor !== arrayConstructor) {
-    data = new arrayConstructor(
-      data.buffer,
-      data.byteOffset,
-      data.byteLength / arrayConstructor.BYTES_PER_ELEMENT,
-    );
-  }
+  data = reinterpretAsTextureArray(data, arrayConstructor);
   const elementsPerRow = getOneDimensionalTextureRowCapacity(gl, numElements);
   const x = (elementIndex % elementsPerRow) * texelsPerElement;
   const y = Math.floor(elementIndex / elementsPerRow);
@@ -404,13 +421,7 @@ export function setTwoDimensionalTextureData(
     textureFormat,
     texelsPerElement,
   } = format;
-  if (data.constructor !== arrayConstructor) {
-    data = new arrayConstructor(
-      data.buffer,
-      data.byteOffset,
-      data.byteLength / arrayConstructor.BYTES_PER_ELEMENT,
-    );
-  }
+  data = reinterpretAsTextureArray(data, arrayConstructor);
   gl.pixelStorei(WebGL2RenderingContext.UNPACK_ALIGNMENT, 1);
   setRawTextureParameters(gl);
   gl.texImage2D(
@@ -440,13 +451,7 @@ export function setThreeDimensionalTextureData(
     textureFormat,
     texelsPerElement,
   } = format;
-  if (data.constructor !== arrayConstructor) {
-    data = new arrayConstructor(
-      data.buffer,
-      data.byteOffset,
-      data.byteLength / arrayConstructor.BYTES_PER_ELEMENT,
-    );
-  }
+  data = reinterpretAsTextureArray(data, arrayConstructor);
   gl.pixelStorei(WebGL2RenderingContext.UNPACK_ALIGNMENT, 1);
   setRawTexture3DParameters(gl);
   gl.texImage3D(

@@ -27,6 +27,19 @@
 import "#src/datasource/zarr-vectors/streamline_filter_tab.css";
 
 import {
+  attrKey,
+  AttrStatsCache,
+  filterScope,
+  flagFilter,
+  fullRangeFilter,
+  hasApproximateValues,
+  isFlagAttr,
+  listAttrChoices,
+} from "#src/datasource/zarr-vectors/attribute_catalog.js";
+import { AttributeFilterPanel } from "#src/datasource/zarr-vectors/attribute_filter_panel.js";
+import { makeAttrFilterControl } from "#src/datasource/zarr-vectors/attribute_filter_widgets.js";
+import {
+  fieldWatchable,
   labelled,
   makeSelect,
   makeStringSelect,
@@ -37,6 +50,8 @@ import {
   RoiOperator,
   RoiPredicate,
   type Roi,
+  type RoiAttrFilter,
+  type RoiAttrScope,
   type RoiShape,
 } from "#src/datasource/zarr-vectors/roi.js";
 import {
@@ -67,7 +82,6 @@ import {
 } from "#src/roi_store/schema.js";
 import { StatusMessage } from "#src/status.js";
 import { TrackableBooleanCheckbox } from "#src/trackable_boolean.js";
-import type { WatchableValueInterface } from "#src/trackable_value.js";
 import type { Uint64Set } from "#src/uint64_set.js";
 import { serializeColor } from "#src/util/color.js";
 import { RefCounted } from "#src/util/disposable.js";
@@ -77,29 +91,21 @@ import { makeIcon } from "#src/widget/icon.js";
 import { RangeWidget } from "#src/widget/range.js";
 import { Tab } from "#src/widget/tab_view.js";
 
+/**
+ * What one passing object is called, per geometry primitive. Points are the
+ * odd one out: a point cloud has no object model, so one id is one VERTEX --
+ * one cell in a MERFISH panel -- rather than a whole traced object.
+ */
+const OBJECT_NOUN: Record<"points" | "lines" | "triangles", string> = {
+  points: "point",
+  lines: "streamline",
+  triangles: "surface",
+};
+
 /** Default sphere radius / box half-extent (model units) for a new ROI. */
 const DEFAULT_ROI_RADIUS = 10;
 /** Default plane thickness (model units). */
 const DEFAULT_PLANE_THICKNESS = 1;
-
-/** Adapt a scalar getter/setter to the `WatchableValueInterface` the range/
- * checkbox widgets expect. `changed` over-fires (any state change), which is
- * harmless — the widget just re-reads `value`. */
-function fieldWatchable<T>(
-  changed: RoiFilterState["changed"],
-  get: () => T,
-  set: (v: T) => void,
-): WatchableValueInterface<T> {
-  return {
-    get value() {
-      return get();
-    },
-    set value(v: T) {
-      set(v);
-    },
-    changed,
-  };
-}
 
 const ROLE_OPTIONS: { value: RoiOperator; label: string }[] = [
   { value: RoiOperator.AND, label: "Include" },
@@ -200,6 +206,19 @@ export class StreamlineFilterTab extends Tab {
    * from the pre-build state (else the "+ New group" button never renders).
    */
   private structuralSig: string | undefined = undefined;
+  /**
+   * Measured ranges for the attributes any predicate names, filled on demand.
+   * Owned by the tab (not by a group) because the same attribute is commonly
+   * used by several groups and by the staging panel, and measuring a per-vertex
+   * column means an RPC round trip over every resident chunk.
+   */
+  private attrStats: AttrStatsCache;
+  /**
+   * A one-line note under ONE group's attribute picker, and which group it
+   * belongs to -- a note about a column that could not be measured for group 2
+   * must not appear under group 1's picker as well.
+   */
+  private attrStatus: { groupId: number; text: string } | undefined;
   private bodyEl: HTMLElement;
   /** Disposers for the widgets in the current body build. */
   private bodyContext = new RefCounted();
@@ -213,6 +232,7 @@ export class StreamlineFilterTab extends Tab {
     super();
     this.roiFilter = layer.displayState.roiFilter;
     this.passingSegments = layer.displayState.roiPassingSegments;
+    this.attrStats = this.registerDisposer(new AttrStatsCache(layer));
     const { element } = this;
     element.classList.add("neuroglancer-streamline-filter-tab");
 
@@ -240,6 +260,14 @@ export class StreamlineFilterTab extends Tab {
     const labelPanel = this.registerDisposer(new LabelFilterPanel(this.layer));
     element.appendChild(labelPanel.element);
 
+    // "By attribute" panel: the same staging model over the store's own data
+    // columns rather than over a parcellation. Shares this tab's stats cache so
+    // an attribute measured here is not measured again there.
+    const attrPanel = this.registerDisposer(
+      new AttributeFilterPanel(this.layer, this.attrStats),
+    );
+    element.appendChild(attrPanel.element);
+
     this.bodyEl = document.createElement("div");
     this.bodyEl.classList.add("neuroglancer-streamline-filter-body");
     element.appendChild(this.bodyEl);
@@ -257,16 +285,13 @@ export class StreamlineFilterTab extends Tab {
         this.onChanged(),
       ),
     );
+    // A measurement landing swaps a predicate's "measuring…" placeholder for its
+    // real control, which is a structural change.
+    this.registerDisposer(this.attrStats.changed.add(() => this.onChanged()));
     if (this.passingSegments !== undefined) {
       this.registerDisposer(
         this.passingSegments.changed.add(() => this.updateCount()),
       );
-    }
-    // The two sets change independently -- the budget can be re-spent without
-    // the dissection changing -- so the label needs both signals.
-    const highDetail = this.layer.displayState.roiHighDetailSegments;
-    if (highDetail !== undefined) {
-      this.registerDisposer(highDetail.changed.add(() => this.updateCount()));
     }
     // Open with the last group expanded so its ROIs are immediately visible
     // (others start collapsed; each has a caret to expand/collapse on demand).
@@ -334,19 +359,34 @@ export class StreamlineFilterTab extends Tab {
     // commits). The available object-attribute names are included so the
     // "Colour by" options + length sliders appear once the store's attributes
     // load.
-    const attrSig = this.numericObjectAttrs()
-      .map((a) => a.name)
-      .join("|");
+    // Length + endpoints rather than every name: this runs on EVERY state
+    // change, a slider drag included, and a MERFISH panel has a thousand
+    // attributes. The set only ever changes by a reload or by the object
+    // attributes arriving, both of which move the count or the ends.
+    const choices = listAttrChoices(this.layer);
+    const attrSig =
+      choices.length === 0
+        ? ""
+        : `${choices.length}:${choices[0].name}:${
+            choices[choices.length - 1].name
+          }`;
     return (
       `${attrSig}#` +
       this.roiFilter.groups
         .map(
           (g) =>
             `${g.id}${this.expandedGroupIds.has(g.id) ? "+" : "-"}` +
-            // The filter-attribute NAME (not its min/max) is structural: picking
-            // an attribute must rebuild the row to show/hide the sliders, but
-            // dragging them must not.
-            `f${g.lengthFilter?.name ?? ""}:` +
+            // The predicate LIST (names, scopes, and whether each has been
+            // measured) is structural: adding, removing or measuring one must
+            // rebuild the row to swap in the right control, but dragging its
+            // sliders must not.
+            `f${g.attrFilters
+              .map(
+                (f) =>
+                  `${filterScope(f)[0]}${f.name}` +
+                  `${this.attrStats.get(f.name, filterScope(f)) === undefined ? "?" : "!"}`,
+              )
+              .join("+")}:` +
             g.rois.map((r) => r.shape.kind[0]).join(""),
         )
         .join(",")
@@ -835,8 +875,14 @@ export class StreamlineFilterTab extends Tab {
       }),
     );
 
-    // Per-group render controls (a sub-row): the group's "on" opacity and a
-    // high-detail toggle (loads this group's passing tracts at full detail).
+    // Per-group render controls (a sub-row): opacity, colouring and the
+    // attribute filter. Nothing here changes what is LOADED -- a group is a
+    // selection within the geometry the layer already draws, so its cost is
+    // independent of how many groups exist. Wanting a dissection at finer
+    // resolution is a per-layer decision (raise the layer's grid level, or give
+    // the group its own layer), which is why the old per-group "high detail"
+    // toggle -- it quietly pulled full-resolution tracts through the
+    // object-keyed pass -- is gone.
     const controls = document.createElement("div");
     controls.classList.add("neuroglancer-streamline-filter-group-controls");
     const opacity = this.bodyContext.registerDisposer(
@@ -862,18 +908,9 @@ export class StreamlineFilterTab extends Tab {
       labelled("Colour by", this.makeColorBySelect(group.id)),
     );
 
-    // Per-group "Filter by" attribute (min/max hides tracts outside the range).
-    // Absent when the store carries no per-object numeric attribute yet.
-    this.appendAttributeFilterControls(controls, group.id);
-
-    const highDetail = document.createElement("input");
-    highDetail.type = "checkbox";
-    highDetail.checked = group.highDetail;
-    highDetail.title = "Load this group's tracts at full detail (slower)";
-    highDetail.addEventListener("change", () =>
-      this.roiFilter.updateGroup(group.id, { highDetail: highDetail.checked }),
-    );
-    controls.appendChild(labelled("High detail", highDetail));
+    // Per-group attribute predicates (flags and ranges), ANDed with the ROIs.
+    // Absent only when the store exposes no filterable attribute at all.
+    this.appendAttrFilterControls(controls, group.id);
 
     const wrapper = document.createElement("div");
     wrapper.classList.add("neuroglancer-streamline-filter-group-header");
@@ -931,82 +968,175 @@ export class StreamlineFilterTab extends Tab {
   }
 
   /**
-   * A "Filter by" attribute picker plus, once an attribute is chosen, a min/max
-   * pair that hides the group's tracts whose value on that attribute is outside
-   * the range. The attribute is any per-object numeric column (length, FA,
-   * vertex count, image intensity, …); "None" clears the filter. The chosen
-   * attribute is part of the tab's structural signature, so picking one rebuilds
-   * the row to reveal the sliders (dragging the sliders does not rebuild).
+   * The group's attribute predicates: one row each, plus a picker that adds
+   * another.
+   *
+   * Predicates are ANDed with each other and with the group's ROIs, and a group
+   * that has ONLY predicates is a perfectly good group -- that is what makes
+   * "the cells expressing this gene" expressible for a store with no regions
+   * drawn in it at all (see {@link AttributeFilterPanel} for authoring one from
+   * scratch).
+   *
+   * Which attributes are on offer depends on what the store carries: per-object
+   * columns for a geometry with an object model, per-vertex columns for a point
+   * cloud (where one vertex IS one object). Both tiers appear in one list --
+   * the distinction is labelled, not enforced on the user.
+   *
+   * The predicate LIST (names, scopes, and whether each has been measured yet)
+   * is part of the tab's structural signature, so adding or removing one
+   * rebuilds the row while dragging a slider does not.
    */
-  private appendAttributeFilterControls(
+  private appendAttrFilterControls(
     controls: HTMLElement,
     groupId: number,
   ): void {
-    const attrs = this.numericObjectAttrs();
-    if (attrs.length === 0) return;
-    const filter = this.currentGroup(groupId)?.lengthFilter;
-    const options = [
-      { value: "", label: "None" },
-      ...attrs.map((a) => ({ value: a.name, label: a.name })),
-    ];
-    const select = makeStringSelect(options, filter?.name ?? "", (name) => {
-      if (name === "") {
-        this.roiFilter.updateGroup(groupId, { lengthFilter: undefined });
-        return;
-      }
-      const a = attrs.find((x) => x.name === name);
-      if (a === undefined) return;
-      // Seed at the attribute's full range: the selection persists (so the
-      // sliders show) and is a no-op until narrowed. Keep an existing range when
-      // the same attribute is re-picked.
-      const keep = filter?.name === name ? filter : undefined;
-      this.roiFilter.updateGroup(groupId, {
-        lengthFilter: {
-          name,
-          min: keep?.min ?? a.min,
-          max: keep?.max ?? a.max,
-        },
-      });
-    });
-    controls.appendChild(labelled("Filter by", select));
+    const filters = this.currentGroup(groupId)?.attrFilters ?? [];
+    const choices = listAttrChoices(this.layer);
+    if (choices.length === 0 && filters.length === 0) return;
 
-    const a =
-      filter !== undefined
-        ? attrs.find((x) => x.name === filter.name)
-        : undefined;
-    if (a === undefined) return;
-    const span = a.max - a.min;
-    const step = span > 0 ? Math.max(span / 200, 1e-6) : 1;
-    const current = () => {
-      const f = this.currentGroup(groupId)?.lengthFilter;
-      return f !== undefined && f.name === a.name ? f : undefined;
-    };
-    const set = (min: number, max: number) =>
-      this.roiFilter.updateGroup(groupId, {
-        lengthFilter: { name: a.name, min, max },
-      });
-    const lo = this.bodyContext.registerDisposer(
-      new RangeWidget(
-        fieldWatchable(
-          this.roiFilter.changed,
-          () => current()?.min ?? a.min,
-          (v) => set(v, current()?.max ?? a.max),
-        ),
-        { min: a.min, max: a.max, step },
+    for (let i = 0; i < filters.length; ++i) {
+      controls.appendChild(this.makeAttrFilterRow(groupId, filters[i], i));
+    }
+
+    const taken = new Set(filters.map((f) => attrKey(f.name, filterScope(f))));
+    const available = choices.filter(
+      (c) => !taken.has(attrKey(c.name, c.scope)),
+    );
+    if (available.length === 0) return;
+    const options = [
+      {
+        value: "",
+        label: filters.length === 0 ? "Filter by attribute…" : "Add another…",
+      },
+      ...available.map((c) => ({
+        value: attrKey(c.name, c.scope),
+        label: c.scope === "object" ? `${c.name} (per object)` : c.name,
+      })),
+    ];
+    controls.appendChild(
+      labelled(
+        filters.length === 0 ? "Attribute" : "And",
+        makeStringSelect(options, "", (value) => {
+          const choice = available.find(
+            (c) => attrKey(c.name, c.scope) === value,
+          );
+          if (choice !== undefined) {
+            void this.addAttrFilter(groupId, choice.name, choice.scope);
+          }
+        }),
       ),
     );
-    const hi = this.bodyContext.registerDisposer(
-      new RangeWidget(
-        fieldWatchable(
-          this.roiFilter.changed,
-          () => current()?.max ?? a.max,
-          (v) => set(current()?.min ?? a.min, v),
-        ),
-        { min: a.min, max: a.max, step },
-      ),
-    );
-    controls.appendChild(labelled(`${a.name} ≥`, lo.element));
-    controls.appendChild(labelled(`${a.name} ≤`, hi.element));
+    const status = this.attrStatus;
+    if (status !== undefined && status.groupId === groupId) {
+      const note = document.createElement("div");
+      note.classList.add("neuroglancer-streamline-filter-note");
+      note.textContent = status.text;
+      controls.appendChild(note);
+    }
+  }
+
+  /**
+   * Add one predicate, seeded so that it selects everything the attribute has:
+   * a flag starts at "true", a measurement at its full observed range. Seeding
+   * at the full range (rather than at an arbitrary narrow one) means adding a
+   * predicate never silently empties the group -- the user then narrows it and
+   * watches the selection shrink.
+   *
+   * Async because a per-vertex range has to be measured in the worker first.
+   */
+  private async addAttrFilter(
+    groupId: number,
+    name: string,
+    scope: RoiAttrScope,
+  ): Promise<void> {
+    const stats = await this.attrStats.request(name, scope);
+    const group = this.currentGroup(groupId);
+    if (group === undefined) return;
+    if (stats === undefined || stats.count === 0) {
+      // Nothing to measure: the column is not loaded here. Say so instead of
+      // adding a predicate whose empty range would ghost the whole group.
+      this.attrStatus = {
+        groupId,
+        text:
+          scope === "vertex"
+            ? `${name} has no values in the loaded chunks — pan or zoom to ` +
+              "load geometry, then try again."
+            : `${name} has no values yet — wait for the object attributes to load.`,
+      };
+      this.rebuildBody();
+      return;
+    }
+    // See the same note in the staging panel: a downcast 64-bit column cannot
+    // be compared exactly past 2**24.
+    this.attrStatus = hasApproximateValues(stats)
+      ? {
+          groupId,
+          text:
+            `${name} is ${stats.dtype} and is read as float32, so values ` +
+            "above 16,777,216 are approximate — exact for scores and codes, " +
+            "not for ids.",
+        }
+      : undefined;
+    if (
+      group.attrFilters.some((f) => f.name === name && filterScope(f) === scope)
+    ) {
+      return;
+    }
+    this.roiFilter.updateGroup(groupId, {
+      attrFilters: [
+        ...group.attrFilters,
+        isFlagAttr(stats) ? flagFilter(stats, true) : fullRangeFilter(stats),
+      ],
+    });
+  }
+
+  /** Replace the predicate at `index`, keeping the rest of the list in order. */
+  private setAttrFilter(
+    groupId: number,
+    index: number,
+    filter: RoiAttrFilter,
+  ): void {
+    const group = this.currentGroup(groupId);
+    if (group === undefined || index >= group.attrFilters.length) return;
+    const next = group.attrFilters.slice();
+    next[index] = filter;
+    this.roiFilter.updateGroup(groupId, { attrFilters: next });
+  }
+
+  /**
+   * One predicate's editor: a checkbox for a flag, a min/max pair for a
+   * measurement, and a delete button for either.
+   *
+   * An unmeasured attribute shows "measuring…" and asks for its stats; the
+   * answer fires the cache's `changed`, which rebuilds this row with the real
+   * control. That indirection is what keeps a thousand-column MERFISH store
+   * usable: only the attributes actually used are ever measured.
+   */
+  private makeAttrFilterRow(
+    groupId: number,
+    filter: RoiAttrFilter,
+    index: number,
+  ): HTMLElement {
+    const scope = filterScope(filter);
+    return makeAttrFilterControl({
+      filter,
+      stats: this.attrStats.get(filter.name, scope),
+      context: this.bodyContext,
+      changed: this.roiFilter.changed,
+      // Live lookup by index, like every other per-group widget here: the group
+      // is replaced wholesale on each edit, so a captured `filter` would go
+      // stale and a slider would snap back mid-drag.
+      read: () => this.currentGroup(groupId)?.attrFilters[index] ?? filter,
+      write: (next) => this.setAttrFilter(groupId, index, next),
+      remove: () => {
+        const group = this.currentGroup(groupId);
+        if (group === undefined) return;
+        this.roiFilter.updateGroup(groupId, {
+          attrFilters: group.attrFilters.filter((_, i) => i !== index),
+        });
+      },
+      requestStats: () => void this.attrStats.request(filter.name, scope),
+    });
   }
 
   private makeRoiSection(group: RoiGroup): HTMLElement {
@@ -1339,19 +1469,18 @@ export class StreamlineFilterTab extends Tab {
       this.countEl.textContent = "";
       return;
     }
-    // The dissection is evaluated at the finest level whose regional geometry is
-    // resident, so the passing count is no longer "this level" -- it can name
-    // tracts that exist only at levels far finer than the one being drawn. Only
-    // those the full-detail budget admits are actually shown, so reporting the
-    // pass count alone would look like most of them had silently vanished.
+    // The dissection is evaluated over the level the layer draws, so every
+    // passing tract is one already on screen and the count needs no caveat.
+    // (It used to report "N at full detail" alongside, because the filter
+    // could load tracts the drawn level did not hold; it no longer can.)
     const passing = this.passingSegments?.size ?? 0;
-    const shown = this.layer.displayState.roiHighDetailSegments?.size;
     const plural = passing === 1 ? "" : "s";
-    this.countEl.textContent =
-      shown === undefined
-        ? `${passing.toLocaleString()} streamline${plural} pass`
-        : `${passing.toLocaleString()} streamline${plural} pass · ` +
-          `${shown.toLocaleString()} at full detail`;
+    // What one passing id IS depends on the geometry: a tract, a surface, or a
+    // single cell in a point cloud. Naming them "streamlines" everywhere read
+    // as a bug the moment the tab opened on a MERFISH store.
+    const noun =
+      OBJECT_NOUN[this.layer.displayState.roiGeometryPrimitive ?? "lines"];
+    this.countEl.textContent = `${passing.toLocaleString()} ${noun}${plural} pass`;
   }
 
   disposed() {

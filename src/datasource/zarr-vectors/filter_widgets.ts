@@ -22,6 +22,35 @@
  * to one tab's labelling would otherwise silently misalign the other.
  */
 
+import type { WatchableValueInterface } from "#src/trackable_value.js";
+import type { NullarySignal } from "#src/util/signal.js";
+
+/**
+ * Adapt a scalar getter/setter to the `WatchableValueInterface` the range and
+ * checkbox widgets expect.
+ *
+ * `changed` over-fires (it is the whole filter state's signal, not this one
+ * field's), which is harmless: the widget simply re-reads `value`. The getter
+ * indirection is the point -- every edit replaces the group or ROI wholesale,
+ * so a widget bound to a captured value would snap back to the build-time one
+ * mid-drag.
+ */
+export function fieldWatchable<T>(
+  changed: NullarySignal,
+  get: () => T,
+  set: (v: T) => void,
+): WatchableValueInterface<T> {
+  return {
+    get value() {
+      return get();
+    },
+    set value(v: T) {
+      set(v);
+    },
+    changed,
+  };
+}
+
 /** Wrap a control in a `<label>` with leading text. */
 export function labelled(
   text: string,

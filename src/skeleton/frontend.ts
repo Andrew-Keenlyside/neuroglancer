@@ -27,6 +27,16 @@ import type {
   RoiLabelField,
   RoiObjectAttrColumn,
 } from "#src/datasource/zarr-vectors/roi.js";
+import type {
+  PackedAttributeInterp,
+  PackedAttributeRange,
+} from "#src/skeleton/packed_attributes.js";
+import {
+  PACKED_ATTRIBUTE_STRIDE_UNIFORM,
+  packedAttributeAccessorCode,
+  packedAttributePropExpr,
+  packedAttributeVaryings,
+} from "#src/skeleton/packed_attributes.js";
 import { hashCombine } from "#src/gpu_hash/hash_function.js";
 import type { HashMapUint64, HashSetUint64 } from "#src/gpu_hash/hash_table.js";
 import { GPUHashTable, HashSetShaderManager } from "#src/gpu_hash/shader.js";
@@ -74,12 +84,18 @@ import type {
   SpatiallyIndexedSkeletonNode,
   SpatialSkeletonSourceState,
 } from "#src/skeleton/api.js";
-import type { VertexAttributeInfo } from "#src/skeleton/base.js";
+import type {
+  VertexAttributeInfo,
+  VertexAttrStats,
+} from "#src/skeleton/base.js";
 import {
+  forEachSpatialSkeletonVolumeCell,
+  SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR,
   SKELETON_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_VERTEX_ATTR_STATS_RPC_ID,
 } from "#src/skeleton/base.js";
 import {
   buildSpatiallyIndexedSkeletonOverlayGeometry,
@@ -92,11 +108,16 @@ import {
 } from "#src/skeleton/segment_overlay.js";
 import {
   getSpatiallyIndexedSkeletonGridIndex,
+  getSpatiallyIndexedSkeletonPartitionsObjects,
   getSpatiallyIndexedSkeletonSourceView,
   selectSpatiallyIndexedSkeletonEntriesForView,
   selectSpatiallyIndexedSkeletonEntriesForViewWithFallback,
   type SpatiallyIndexedSkeletonView,
 } from "#src/skeleton/source_selection.js";
+import {
+  SpatialSkeletonDetailFocus,
+  targetSpacingForCellBudget,
+} from "#src/skeleton/spatial_chunk_sizing.js";
 import {
   forEachVisibleVolumetricChunk,
   type SliceViewChunkSpecification,
@@ -129,11 +150,19 @@ import type { Uint64Map } from "#src/uint64_map.js";
 import { Uint64Set } from "#src/uint64_set.js";
 import { gatherUpdate } from "#src/util/array.js";
 import { hsvToRgb } from "#src/util/colorspace.js";
-import { DataType } from "#src/util/data_type.js";
+import { DATA_TYPE_SIGNED, DataType } from "#src/util/data_type.js";
 import { RefCounted } from "#src/util/disposable.js";
 import type { ValueOrError } from "#src/util/error.js";
 import { makeValueOrError, valueOrThrow } from "#src/util/error.js";
-import { kOneVec4, mat4, vec3, vec4 } from "#src/util/geom.js";
+import {
+  kOneVec4,
+  mat3,
+  mat3FromMat4,
+  mat4,
+  scaleMat3Output,
+  vec3,
+  vec4,
+} from "#src/util/geom.js";
 import { verifyFinitePositiveFloat } from "#src/util/json.js";
 import * as matrix from "#src/util/matrix.js";
 import { getObjectId } from "#src/util/object_id.js";
@@ -173,6 +202,7 @@ import { ShaderBuilder } from "#src/webgl/shader.js";
 import {
   dataTypeShaderDefinition,
   getShaderType,
+  getShaderVectorType,
 } from "#src/webgl/shader_lib.js";
 import type { ShaderControlsBuilderState } from "#src/webgl/shader_ui_controls.js";
 import {
@@ -216,6 +246,38 @@ export const DEFAULT_FRAGMENT_MAIN = `void main() {
 }
 `;
 
+/**
+ * The attribute name the renderer synthesises as `prop_position()` (the vertex
+ * world position). A declared attribute of the same name is not exposed, so the
+ * macro is never defined twice with different bodies.
+ */
+const SYNTHESISED_POSITION_ATTRIBUTE_NAME = "position";
+
+/** GLSL's three interchangeable swizzle component sets. */
+const GLSL_SWIZZLE_SETS = ["xyzw", "rgba", "stpq"];
+
+/**
+ * Whether exposing `name` as a BARE `#define` would corrupt shader source that
+ * has nothing to do with the attribute.
+ *
+ * A `#define` is preprocessor-level and applies to every occurrence of the
+ * token, member accesses included -- `#define z vCustom3` rewrites `d.z` into
+ * `d.vCustom3`. So any name that is also a legal swizzle (`z`, `a`, `xy`,
+ * `rgb`, ...) breaks arbitrary unrelated shader code, and the failure is
+ * near-invisible: the shader does not compile, the layer falls back to the
+ * built-in segment-coloured one, and the tracts simply come out in per-object
+ * hash colours.
+ *
+ * Only the bare alias is withheld. `prop_<name>()` is namespaced, cannot
+ * collide, and is the form the shader property list documents.
+ */
+export function isUnsafeBareAttributeAlias(name: string): boolean {
+  if (name.length === 0 || name.length > 4) return false;
+  return GLSL_SWIZZLE_SETS.some((set) =>
+    [...name].every((component) => set.includes(component)),
+  );
+}
+
 const SELECTED_NODE_OUTLINE_COLOR_RGB = "1.0, 0.95, 0.35";
 const SELECTED_NODE_OUTLINE_MIN_WIDTH_2D = "1.75";
 const SELECTED_NODE_OUTLINE_MAX_WIDTH_2D = "3.0";
@@ -228,7 +290,14 @@ interface VertexAttributeRenderInfo extends VertexAttributeInfo {
   glslDataType: string;
 }
 
+const tempNormalMat3 = mat3.create();
+
 const vertexAttributeSamplerSymbols: symbol[] = [];
+
+/** Texture unit for the one texture a {@link PackedAttributeRange} occupies. */
+const packedAttributeSamplerSymbol = Symbol(
+  "SkeletonShader.packedAttributeTextureUnit",
+);
 
 const vertexPositionTextureFormat = computeTextureFormat(
   new TextureFormat(),
@@ -271,6 +340,11 @@ interface SkeletonShaderParameters {
   spatialChunkCulling: boolean;
 }
 
+export type {
+  PackedAttributeInterp,
+  PackedAttributeRange,
+} from "#src/skeleton/packed_attributes.js";
+
 interface SkeletonShaderContext {
   vertexAttributes: VertexAttributeRenderInfo[];
   gl: GL;
@@ -278,10 +352,14 @@ interface SkeletonShaderContext {
   displayState: SkeletonLayerDisplayState;
   skeletonShaderParameters: WatchableValueInterface<SkeletonShaderParameters>;
   segmentColorAttributeIndex?: number;
+  /** See {@link PackedAttributeRange}; absent means one texture per attribute. */
+  packedAttributeRange?: PackedAttributeRange;
 }
 
 interface SkeletonGPUGeometry {
   vertexAttributeTextures: (WebGLTexture | null)[];
+  /** One texture for the whole {@link PackedAttributeRange}, when there is one. */
+  packedAttributeTexture?: WebGLTexture | null;
   indexBuffer: GLBuffer;
   numIndices: number;
   numVertices: number;
@@ -317,6 +395,11 @@ type SpatiallyIndexedSkeletonPickData =
     }
   | {
       kind: "segment-edge";
+      chunk: SpatiallyIndexedSkeletonChunk;
+    }
+  | {
+      /** Surface geometry: the picked primitive is one triangle. */
+      kind: "segment-face";
       chunk: SpatiallyIndexedSkeletonChunk;
     };
 
@@ -428,6 +511,26 @@ void spatialChunkCull() {
     shaderBuilderState: ShaderControlsBuilderState,
     skeletonParams: SkeletonShaderParameters,
     vertexMain: string,
+    options?: {
+      /**
+       * Draw fragments outside the host chunk's box instead of discarding them.
+       *
+       * The cull exists because line geometry is duplicated across a chunk
+       * boundary -- each side draws its own bridge stub to a ghost vertex, and
+       * without the cull the overlap draws twice. A boundary FACE is the
+       * opposite case: the links family files it under exactly one chunk, so it
+       * is drawn once, and clipping it at the box leaves a visible gap along
+       * every chunk seam rather than preventing anything.
+       */
+      skipChunkCull?: boolean;
+      /**
+       * How this shader addresses packed attributes: what vertex a fragment
+       * belongs to, and how to blend between the vertices of its primitive.
+       * Required when the source declares a {@link PackedAttributeRange};
+       * ignored otherwise.
+       */
+      packedAttributeInterp?: PackedAttributeInterp;
+    },
   ): void {
     builder.addFragmentCode(glsl_COLORMAPS);
     const { vertexAttributes } = this;
@@ -445,6 +548,16 @@ void spatialChunkCull() {
         `#define prop_${segInfo.name}() ${segInfo.glslDataType}(vSegmentValue)\n`,
       );
     }
+    const packedRange = this.base.packedAttributeRange;
+    if (packedRange !== undefined && packedRange.count > 0) {
+      const interp = options?.packedAttributeInterp;
+      if (interp === undefined) {
+        throw new Error(
+          "packedAttributeInterp is required when the source packs attributes",
+        );
+      }
+      vertexMain += this.definePackedAttributeVaryings(builder, interp);
+    }
     for (let i = 1; i < numAttributes; ++i) {
       if (
         i === this.segmentAttributeIndex ||
@@ -453,10 +566,65 @@ void spatialChunkCull() {
         continue;
       }
       const info = vertexAttributes[i];
-      builder.addVarying(`highp ${info.glslDataType}`, `vCustom${i}`);
-      vertexMain += `vCustom${i} = readAttribute${i}(vertexIndex);\n`;
-      builder.addFragmentCode(`#define ${info.name} vCustom${i}\n`);
-      builder.addFragmentCode(`#define prop_${info.name}() vCustom${i}\n`);
+      if (packedRange !== undefined && this.isPackedAttribute(i)) {
+        // No varying and no vertex-stage read: the fragment fetches this
+        // attribute's value from the shared texture only where the user shader
+        // actually names it.
+        this.definePackedAttributeMacros(
+          builder,
+          info.name,
+          i - packedRange.start,
+          options!.packedAttributeInterp!,
+        );
+        continue;
+      }
+      // A varying must be a built-in scalar/vector type, and an integer one
+      // must be `flat`. `info.glslDataType` is neuroglancer's own wrapper
+      // (`int32_t` is a struct), which is legal as a function return but not as
+      // a varying: declaring it produced `out int32_t vCustomN;` and a vertex
+      // shader that would not compile, taking every shader on the layer with
+      // it. So carry the raw value across the stage boundary and rebuild the
+      // wrapper in the fragment stage, exactly as `vSegmentValue` does.
+      const isFloat = info.dataType === DataType.FLOAT32;
+      const rawType = isFloat
+        ? info.glslDataType
+        : getShaderVectorType(
+            DATA_TYPE_SIGNED[info.dataType] ? "int" : "uint",
+            info.numComponents,
+          );
+      const propExpr = isFloat
+        ? `vCustom${i}`
+        : `${info.glslDataType}(vCustom${i})`;
+      builder.addVarying(
+        `highp ${rawType}`,
+        `vCustom${i}`,
+        isFloat ? "" : "flat",
+      );
+      vertexMain += isFloat
+        ? `vCustom${i} = readAttribute${i}(vertexIndex);\n`
+        : `vCustom${i} = toRaw(readAttribute${i}(vertexIndex));\n`;
+      if (!isFloat) {
+        // `int32_t(...)` and friends only exist where the type is defined.
+        builder.addFragmentCode(dataTypeShaderDefinition[info.dataType]);
+      }
+      // `position` is synthesised below as the vertex world position. A store
+      // that ALSO declares an attribute of that name would redefine the macro
+      // with a different body -- a preprocessing error that kills every shader
+      // on the layer. The synthesised one wins, matching how the zarr-vectors
+      // reader resolves the same clash on `tangent`.
+      if (info.name === SYNTHESISED_POSITION_ATTRIBUTE_NAME) continue;
+      // The bare alias is a legacy convenience; `prop_<name>()` is the
+      // documented form and the only one the shader property list advertises.
+      // It is skipped for swizzle-shaped names because a `#define` applies to
+      // the WHOLE user shader, member accesses included: a store carrying a
+      // per-vertex `z` (they do -- e.g. a depth/coordinate column) would
+      // `#define z vCustom3` and rewrite `d.z` into `d.vCustom3`, so the
+      // colour-by-direction default stopped compiling and the layer fell back
+      // to the generic per-object hash colour with no visible error.
+      if (!isUnsafeBareAttributeAlias(info.name)) {
+        builder.addFragmentCode(`#define ${info.name} ${propExpr}\n`);
+      }
+      builder.addFragmentCode(`#define prop_${info.name}() ${propExpr}\n`);
     }
     // Expose the vertex world position as `prop_position()` so a shader can
     // colour by position (attribute slot 0 is always position; `vertexIndex` is
@@ -474,7 +642,7 @@ void spatialChunkCull() {
         "\n#undef main\n",
     );
     builder.setFragmentMain(
-      skeletonParams.spatialChunkCulling
+      skeletonParams.spatialChunkCulling && !options?.skipChunkCull
         ? "spatialChunkCull();\nuserMain();"
         : "userMain();",
     );
@@ -511,6 +679,12 @@ void spatialChunkCull() {
 
   edgeShaderGetter;
   nodeShaderGetter;
+  /**
+   * Built on first use, unlike the edge and node getters: only a surface
+   * source ever asks for it, and constructing it eagerly would compile a third
+   * program for every skeleton layer in the viewer that will never draw a face.
+   */
+  private faceShaderGetter_?: typeof this.edgeShaderGetter;
 
   get gl(): GL {
     return this.base.gl;
@@ -543,7 +717,7 @@ void spatialChunkCull() {
     // is not ghosted, it is simply not drawn here at all.
     const roiHighDetailHideFragment = params.hasRoiHighDetailHide
       ? `
-  if (uRoiFilterActive > 0.5 &&
+  if (uRoiHighDetailActive > 0.5 &&
       ${this.roiHighDetailSegmentsShaderManager.hasFunctionName}(segmentId)) {
     return 0.0;
   }`
@@ -606,6 +780,11 @@ void spatialChunkCull() {
     }
     if (params.hasRoiHighDetailHide) {
       this.roiHighDetailSegmentsShaderManager.defineShader(builder);
+      // Its own uniform rather than a second reader of `uRoiFilterActive`: the
+      // high-detail set is now also driven by the object-focused fill, which
+      // runs with the ROI filter off, and pass 1 must hide whatever pass 2 draws
+      // in either case.
+      builder.addUniform("highp float", "uRoiHighDetailActive");
     }
     if (params.hasRoiSegmentColors) {
       this.roiSegmentColorShaderManager.defineShader(builder);
@@ -737,11 +916,16 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
       );
     }
     if (skeletonParams.hasRoiHighDetailHide) {
+      const highDetail = this.base.displayState.roiHighDetailSegments;
       this.roiHighDetailSegmentsShaderManager.enable(
         gl,
         shader,
         this.gpuRoiHighDetailSegmentsHashTable ??
           this.gpuEmptySegmentsHashTable,
+      );
+      gl.uniform1f(
+        shader.uniform("uRoiHighDetailActive"),
+        highDetail !== undefined && highDetail.size !== 0 ? 1 : 0,
       );
     }
     // 3D (perspective) uses objectAlpha/hiddenObjectAlpha; 2D (slice) uses
@@ -863,9 +1047,17 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
     super();
     this.vertexIdHelper = this.registerDisposer(VertexIdHelper.get(this.gl));
     const { maxTextureImageUnits } = this.gl;
-    if (this.vertexAttributes.length > maxTextureImageUnits) {
+    // Packed attributes share one unit, so the count that matters is units, not
+    // attributes: a store with a thousand columns is fine, and a store with
+    // twenty unpacked ones is not.
+    const packedCount = this.base.packedAttributeRange?.count ?? 0;
+    const textureUnitsNeeded =
+      this.vertexAttributes.length - packedCount + (packedCount > 0 ? 1 : 0);
+    if (textureUnitsNeeded > maxTextureImageUnits) {
       console.warn(
-        `Skeleton has ${this.vertexAttributes.length} vertex attributes but device only supports ${maxTextureImageUnits} shader texture units`,
+        `Skeleton needs ${textureUnitsNeeded} texture units for ` +
+          `${this.vertexAttributes.length} vertex attributes but device only ` +
+          `supports ${maxTextureImageUnits}`,
       );
     }
     const segmentAttrIndex = this.vertexAttributes.findIndex(
@@ -1014,28 +1206,13 @@ highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexInde
             // the tract colour-by-direction default, or a group colour) bypasses
             // it, so mix it in here too — otherwise the Saturation slider has no
             // effect on directional/group-coloured streamlines.
-            builder.addFragmentCode(`
-vec4 segmentColor() {
-  return getSegmentAppearance(vSegmentValue);
-}
-void emitRGB(vec3 color) {
-  vec4 baseColor = segmentColor();
-  highp float alpha = baseColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
-  if (alpha <= 0.0) discard;
-  // Group colour first (claimed tracts), then the background attribute colour,
-  // which skips claimed tracts -- so with the ROI filter off the whole
-  // tractogram is "background" and owns the colour, matching the length tier.
-  vec3 rgb = color;${roiColorFragment}${bgColorFragment}
-  rgb = mix(vec3(1.0), rgb, uSaturation);
-  ${this.emitColorStatement("rgb", "alpha")}
-}
-void emitDefault() {
-  vec4 baseColor = segmentColor();
-  highp float alpha = baseColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
-  if (alpha <= 0.0) discard;
-  ${this.emitColorStatement("baseColor.rgb", "alpha")}
-}
-`);
+            builder.addFragmentCode(
+              this.dynamicAppearanceEmitters({
+                coverage: "getLineAlpha()",
+                roiColorFragment,
+                bgColorFragment,
+              }),
+            );
           } else if (this.segmentColorAttributeIndex === undefined) {
             // Legacy path (non-spatial skeletons): one skeleton drawn per call;
             // uColor is set per-skeleton by the CPU via getObjectColor(), which
@@ -1078,6 +1255,16 @@ void emitDefault() {
             shaderBuilderState,
             skeletonParams,
             vertexMain,
+            {
+              // A line fragment lies between two vertices; the smooth
+              // coefficient reproduces the blend a per-attribute varying
+              // used to get from the rasteriser.
+              packedAttributeInterp: {
+                mode: "line",
+                pairExpr: "aVertexIndex",
+                endpointCoefficientExpr: "getLineEndpointCoefficient()",
+              },
+            },
           );
         },
       },
@@ -1263,10 +1450,36 @@ void emitDefault() {
             shaderBuilderState,
             skeletonParams,
             vertexMain,
+            {
+              packedAttributeInterp: {
+                mode: "point",
+                vertexIndexExpr: "vertexIndex",
+              },
+            },
           );
         },
       },
     );
+  }
+
+  /** Whether attribute `i` rides the packed texture rather than its own. */
+  private isPackedAttribute(i: number) {
+    const range = this.base.packedAttributeRange;
+    if (range === undefined) return false;
+    // The internal columns keep their own texture whatever a source declares:
+    // each is read in the VERTEX stage (segment ids feed `vSegmentValue`, the
+    // selected-node flag sizes the outline, the colour column is read as
+    // `vCustom<i>`), which a fragment-stage packed fetch cannot serve. A source
+    // that packed one of them would produce a shader referencing a varying that
+    // was never declared.
+    if (
+      i === this.segmentAttributeIndex ||
+      i === this.selectedNodeAttributeIndex ||
+      i === this.segmentColorAttributeIndex
+    ) {
+      return false;
+    }
+    return i >= range.start && i < range.start + range.count;
   }
 
   defineAttributeAccess(builder: ShaderBuilder) {
@@ -1279,6 +1492,9 @@ void emitDefault() {
       );
     }
     this.vertexAttributes.forEach((info, i) => {
+      // Packed attributes share one sampler, declared below; giving each its
+      // own here is exactly the texture-unit exhaustion the packing avoids.
+      if (this.isPackedAttribute(i)) return;
       builder.addTextureSampler(
         `${getSamplerPrefixForDataType(
           info.dataType,
@@ -1295,6 +1511,352 @@ void emitDefault() {
         ),
       );
     });
+    if (this.base.packedAttributeRange !== undefined) {
+      builder.addTextureSampler(
+        "sampler2D",
+        "uPackedAttributeSampler",
+        packedAttributeSamplerSymbol,
+      );
+      // Per chunk, not per layer: the run is laid out attribute-major, so the
+      // stride between one attribute and the next is that chunk's vertex count.
+      builder.addUniform("highp uint", PACKED_ATTRIBUTE_STRIDE_UNIFORM);
+      // Fragment stage, deliberately. Reading in the vertex stage would need a
+      // varying per attribute to carry the value across, which is the second
+      // ceiling (60 varying components) the packing exists to remove. Fetching
+      // here also means an attribute no shader mentions costs nothing at all.
+      builder.addFragmentCode(
+        textureAccessHelper.getAccessor(
+          "readPackedAttributeValue",
+          "uPackedAttributeSampler",
+          DataType.FLOAT32,
+          1,
+        ),
+      );
+      builder.addFragmentCode(
+        packedAttributeAccessorCode("readPackedAttributeValue"),
+      );
+    }
+  }
+
+  /**
+   * Declare the varyings a packed run needs and return the vertex-stage
+   * statements that fill them. A fixed cost -- one or two varyings -- however
+   * many attributes the store has.
+   */
+  private definePackedAttributeVaryings(
+    builder: ShaderBuilder,
+    interp: PackedAttributeInterp,
+  ): string {
+    const { varyings, vertexMain } = packedAttributeVaryings(interp);
+    for (const { type, name, interpolationMode } of varyings) {
+      builder.addVarying(type, name, interpolationMode);
+    }
+    return vertexMain;
+  }
+
+  /**
+   * Define `prop_<name>()` (and the bare alias) for one packed attribute, as a
+   * fetch blended over the primitive's vertices.
+   */
+  private definePackedAttributeMacros(
+    builder: ShaderBuilder,
+    name: string,
+    packedIndex: number,
+    interp: PackedAttributeInterp,
+  ) {
+    if (name === SYNTHESISED_POSITION_ATTRIBUTE_NAME) return;
+    const propExpr = packedAttributePropExpr(packedIndex, interp);
+    if (!isUnsafeBareAttributeAlias(name)) {
+      builder.addFragmentCode(`#define ${name} ${propExpr}\n`);
+    }
+    builder.addFragmentCode(`#define prop_${name}() ${propExpr}\n`);
+  }
+
+  /**
+   * Bind one chunk's attribute textures for `shader`: a unit per unpacked
+   * attribute, plus one for the whole packed run.
+   */
+  private bindAttributeTextures(
+    gl: GL,
+    shader: ShaderProgram,
+    geometry: SkeletonGPUGeometry,
+  ) {
+    const { vertexAttributes } = this;
+    const { vertexAttributeTextures } = geometry;
+    for (let i = 0; i < vertexAttributes.length; ++i) {
+      // A packed attribute has no sampler of its own to bind to; asking the
+      // program for its texture unit would return undefined.
+      if (this.isPackedAttribute(i)) continue;
+      gl.activeTexture(
+        WebGL2RenderingContext.TEXTURE0 +
+          shader.textureUnit(vertexAttributeSamplerSymbols[i]),
+      );
+      gl.bindTexture(
+        WebGL2RenderingContext.TEXTURE_2D,
+        vertexAttributeTextures[i],
+      );
+    }
+    if (this.base.packedAttributeRange !== undefined) {
+      gl.activeTexture(
+        WebGL2RenderingContext.TEXTURE0 +
+          shader.textureUnit(packedAttributeSamplerSymbol),
+      );
+      gl.bindTexture(
+        WebGL2RenderingContext.TEXTURE_2D,
+        geometry.packedAttributeTexture ?? null,
+      );
+    }
+  }
+
+  /**
+   * Tell `shader` how far apart consecutive attributes sit in the packed
+   * texture. Per chunk and per program: uniforms do not survive a program
+   * switch, so this runs after every `bind()` rather than once per chunk.
+   */
+  private setPackedAttributeStride(
+    gl: GL,
+    shader: ShaderProgram,
+    geometry: SkeletonGPUGeometry,
+  ) {
+    if (this.base.packedAttributeRange === undefined) return;
+    gl.uniform1ui(
+      shader.uniform("uPackedAttributeStride"),
+      geometry.numVertices,
+    );
+  }
+
+  /**
+   * The fragment-stage emitters for the dynamic (spatially-indexed) path, where
+   * colour, visibility and every ROI tier are resolved per segment in the
+   * shader by `getSegmentAppearance`.
+   *
+   * Shared by the edge and face shaders, which differ only in two places:
+   * `coverage` is the primitive's own anti-aliasing factor (a line's analytic
+   * quad coverage; a triangle has none, so `1.0`), and `rgbModulation` scales
+   * the emitted colour without touching alpha -- how a lit surface shades.
+   * Keeping the ROI tiers in one place is the point: they are subtle, ordered,
+   * and a second copy would drift.
+   */
+  /**
+   * Shader for surface geometry: one instanced triangle per face.
+   *
+   * The face index triple arrives as an instanced integer vertex attribute and
+   * `gl_VertexID % 3` picks the corner, exactly as the edge shader extrudes a
+   * quad from an index pair. Instancing (rather than an indexed draw) is what
+   * makes `gl_InstanceID` the face number, which is what the pick IDs are keyed
+   * on, and it also puts all three corner positions in every vertex invocation
+   * -- so the flat normal is a cross product with no normal data uploaded.
+   */
+  get faceShaderGetter(): typeof this.edgeShaderGetter {
+    let getter = this.faceShaderGetter_;
+    if (getter !== undefined) return getter;
+    getter = this.faceShaderGetter_ = parameterizedEmitterDependentShaderGetter(
+      this,
+      this.gl,
+      {
+        // Distinct from the edge shader's key: same vertexAttributes, different
+        // program, and gl.memoize would otherwise hand back the wrong one.
+        memoizeKey: {
+          type: "skeleton/SkeletonShaderManager/face",
+          vertexAttributes: this.vertexAttributes,
+        },
+        fallbackParameters: this.base.fallbackShaderParameters,
+        parameters:
+          this.base.displayState.skeletonRenderingOptions.shaderControlState
+            .builderState,
+        extraParameters: this.base.skeletonShaderParameters,
+        shaderError: this.base.displayState.shaderError,
+        defineShader: (
+          builder: ShaderBuilder,
+          shaderBuilderState: ShaderControlsBuilderState,
+          skeletonParams: SkeletonShaderParameters,
+        ) => {
+          this.defineCommonShader(builder, shaderBuilderState, skeletonParams);
+          builder.addAttribute("highp uvec3", "aFaceIndex");
+          // Model-space light direction packed with the ambient term, as the
+          // mesh layer does. Zero in a slice view, which has no lighting inputs
+          // at all -- a cross-section of a surface is then flat-shaded.
+          builder.addUniform("highp vec4", "uLightDirection");
+          // Model -> display normal matrix. The corner positions are model
+          // space, so the cross product is a model-space normal, while the
+          // light direction is a display-space vector; under an anisotropic
+          // transform the two frames disagree and the surface is lit from the
+          // wrong direction. Same correction `MeshLayer` applies.
+          builder.addUniform("highp mat3", "uNormalMatrix");
+          builder.addVarying("highp vec3", "vNormal", "flat");
+          let vertexMain = `
+highp uint pickOffset = uint(gl_InstanceID) * uPickInstanceStride;
+vPickID = uPickID + pickOffset;
+highp vec3 cornerA = readAttribute0(aFaceIndex.x);
+highp vec3 cornerB = readAttribute0(aFaceIndex.y);
+highp vec3 cornerC = readAttribute0(aFaceIndex.z);
+vNormal = normalize(uNormalMatrix * cross(cornerB - cornerA, cornerC - cornerA));
+highp uint corner = uint(gl_VertexID % 3);
+// Ternary chain rather than aFaceIndex[corner]: dynamic indexing of a vector
+// by a non-constant is where quad.ts documents an Apple GPU miscompilation.
+highp uint vertexIndex = corner == 0u ? aFaceIndex.x : (corner == 1u ? aFaceIndex.y : aFaceIndex.z);
+highp vec3 vertexPosition = corner == 0u ? cornerA : (corner == 1u ? cornerB : cornerC);
+gl_Position = uProjection * vec4(vertexPosition, 1.0);
+`;
+          // `vCullPos` is still declared by defineCommonShader when culling is
+          // compiled in, and an unwritten varying is undefined -- but the face
+          // shader never calls spatialChunkCull(), so nothing reads it.
+          if (skeletonParams.spatialChunkCulling) {
+            vertexMain += "vCullPos = vertexPosition;\n";
+          }
+          if (
+            skeletonParams.dynamicSegmentAppearance &&
+            this.segmentAttributeIndex !== undefined
+          ) {
+            // One face, one segment: the first corner decides, mirroring the
+            // edge shader taking endpoint A.
+            vertexMain += this.segmentValueAssignment("aFaceIndex.x");
+          }
+          // `abs` makes the shading independent of winding, which ZVF does not
+          // declare and nothing here culls on.
+          const lighting =
+            "(abs(dot(vNormal, uLightDirection.xyz)) + uLightDirection.w)";
+          builder.addFragmentCode(
+            this.dynamicAppearanceEmitters({
+              // A triangle has no analytic edge coverage to fade by.
+              coverage: "1.0",
+              roiColorFragment: "",
+              bgColorFragment: "",
+              rgbModulation: lighting,
+            }),
+          );
+          this.finalizeShaderBuilder(
+            builder,
+            shaderBuilderState,
+            skeletonParams,
+            vertexMain,
+            {
+              skipChunkCull: true,
+              // One flat uvec3 plus barycentric weights carries every
+              // packed attribute across the stage boundary.
+              packedAttributeInterp: {
+                mode: "face",
+                triExpr: "aFaceIndex",
+                cornerExpr: "corner",
+              },
+            },
+          );
+        },
+      },
+    );
+    return getter;
+  }
+
+  /**
+   * Draw one instanced triangle per face. Mirrors the edge pass in
+   * {@link drawSkeletons}: the index buffer is bound as an instanced integer
+   * attribute rather than an element array, so `gl_InstanceID` is the face
+   * number the pick IDs are keyed on.
+   */
+  private tempLightVec = new Float32Array(4);
+
+  /**
+   * Upload the model-space light direction packed with the ambient term, the
+   * same `vec4(direction * directional, ambient)` convention `MeshLayer` uses
+   * (src/mesh/frontend.ts:250-262).
+   *
+   * A slice view carries no lighting inputs at all -- `SliceViewPanelRenderContext`
+   * has no `lightDirection` -- so a cross-section of a surface is drawn fully
+   * ambient rather than half-lit by a direction that does not exist there.
+   */
+  setLightDirection(
+    gl: GL,
+    shader: ShaderProgram,
+    renderContext: SliceViewPanelRenderContext | PerspectiveViewRenderContext,
+    modelMatrix: mat4,
+  ) {
+    // Normal matrix: the inverse transpose of the model matrix, scaled by the
+    // canonical voxel factors, exactly as `MeshLayer.beginLayer` builds it.
+    mat3FromMat4(tempNormalMat3, modelMatrix);
+    scaleMat3Output(
+      tempNormalMat3,
+      tempNormalMat3,
+      renderContext.projectionParameters.displayDimensionRenderInfo
+        .canonicalVoxelFactors,
+    );
+    mat3.invert(tempNormalMat3, tempNormalMat3);
+    mat3.transpose(tempNormalMat3, tempNormalMat3);
+    gl.uniformMatrix3fv(shader.uniform("uNormalMatrix"), false, tempNormalMat3);
+    const lightVec = this.tempLightVec;
+    const perspective = renderContext as Partial<PerspectiveViewRenderContext>;
+    if (perspective.lightDirection === undefined) {
+      lightVec[0] = lightVec[1] = lightVec[2] = 0;
+      lightVec[3] = 1;
+    } else {
+      const directional = perspective.directionalLighting ?? 0;
+      lightVec[0] = perspective.lightDirection[0] * directional;
+      lightVec[1] = perspective.lightDirection[1] * directional;
+      lightVec[2] = perspective.lightDirection[2] * directional;
+      lightVec[3] = perspective.ambientLighting ?? 1;
+    }
+    gl.uniform4fv(shader.uniform("uLightDirection"), lightVec);
+  }
+
+  drawTriangles(
+    gl: GL,
+    faceShader: ShaderProgram,
+    skeletonGpuGeometry: SkeletonGPUGeometry,
+  ) {
+    this.bindAttributeTextures(gl, faceShader, skeletonGpuGeometry);
+    faceShader.bind();
+    this.setPackedAttributeStride(gl, faceShader, skeletonGpuGeometry);
+    const aFaceIndex = faceShader.attribute("aFaceIndex");
+    skeletonGpuGeometry.indexBuffer.bindToVertexAttribI(
+      aFaceIndex,
+      3,
+      WebGL2RenderingContext.UNSIGNED_INT,
+    );
+    gl.vertexAttribDivisor(aFaceIndex, 1);
+    gl.drawArraysInstanced(
+      WebGL2RenderingContext.TRIANGLES,
+      0,
+      3,
+      skeletonGpuGeometry.numIndices / 3,
+    );
+    gl.vertexAttribDivisor(aFaceIndex, 0);
+    gl.disableVertexAttribArray(aFaceIndex);
+  }
+
+  private dynamicAppearanceEmitters(options: {
+    coverage: string;
+    roiColorFragment: string;
+    bgColorFragment: string;
+    rgbModulation?: string;
+  }): string {
+    const { coverage, roiColorFragment, bgColorFragment } = options;
+    const modulate =
+      options.rgbModulation === undefined
+        ? ""
+        : `\n  rgb *= ${options.rgbModulation};`;
+    const fade = this.getCrossSectionFadeFactor();
+    return `
+vec4 segmentColor() {
+  return getSegmentAppearance(vSegmentValue);
+}
+void emitRGB(vec3 color) {
+  vec4 baseColor = segmentColor();
+  highp float alpha = baseColor.a * ${coverage} * ${fade};
+  if (alpha <= 0.0) discard;
+  // Group colour first (claimed tracts), then the background attribute colour,
+  // which skips claimed tracts -- so with the ROI filter off the whole
+  // tractogram is "background" and owns the colour, matching the length tier.
+  vec3 rgb = color;${roiColorFragment}${bgColorFragment}
+  rgb = mix(vec3(1.0), rgb, uSaturation);${modulate}
+  ${this.emitColorStatement("rgb", "alpha")}
+}
+void emitDefault() {
+  vec4 baseColor = segmentColor();
+  highp float alpha = baseColor.a * ${coverage} * ${fade};
+  if (alpha <= 0.0) discard;
+  vec3 rgb = baseColor.rgb;${modulate}
+  ${this.emitColorStatement("rgb", "alpha")}
+}
+`;
   }
 
   getCrossSectionFadeFactor() {
@@ -1357,28 +1919,19 @@ void emitDefault() {
     skeletonGpuGeometry: SkeletonGPUGeometry,
     projectionParameters: { width: number; height: number },
     renderMode: SkeletonRenderMode = SkeletonRenderMode.LINES_AND_POINTS,
+    primitive: GeometryPrimitive = "lines",
   ) {
     // Bind vertex attribute textures to be used across edge and node shaders
     // The edge shader and node shader share the same texture unit for each attribute
     // so we only bind once. However, if this ever changes, we
     // instead must bind for the edge shader, draw, then bind for node shader
-    const { vertexAttributes } = this;
-    const { vertexAttributeTextures } = skeletonGpuGeometry;
-    const numAttributes = vertexAttributes.length;
-    for (let i = 0; i < numAttributes; ++i) {
-      const textureUnit =
-        WebGL2RenderingContext.TEXTURE0 +
-        edgeShader.textureUnit(vertexAttributeSamplerSymbols[i]);
-      gl.activeTexture(textureUnit);
-      gl.bindTexture(
-        WebGL2RenderingContext.TEXTURE_2D,
-        vertexAttributeTextures[i],
-      );
-    }
+    this.bindAttributeTextures(gl, edgeShader, skeletonGpuGeometry);
 
-    // Draw edges
-    {
+    // Draw edges.  Skipped entirely for point geometry: there are no edges,
+    // and binding the edge shader for a zero-instance draw is pure overhead.
+    if (primitive !== "points") {
       edgeShader.bind();
+      this.setPackedAttributeStride(gl, edgeShader, skeletonGpuGeometry);
       const aVertexIndex = edgeShader.attribute("aVertexIndex");
       skeletonGpuGeometry.indexBuffer.bindToVertexAttribI(
         aVertexIndex,
@@ -1396,14 +1949,26 @@ void emitDefault() {
       gl.disableVertexAttribArray(aVertexIndex);
     }
 
-    // Draw node dots only in "lines and points" mode — in "lines" mode
-    // the user wants line segments only.
-    if (nodeShader !== null && renderMode !== SkeletonRenderMode.LINES) {
+    // Draw node dots in "lines and points" mode — in "lines" mode the user
+    // wants line segments only.  Point geometry always draws them: its vertices
+    // are the whole drawing, so "lines" would leave the layer empty.
+    if (
+      nodeShader !== null &&
+      (primitive === "points" || renderMode !== SkeletonRenderMode.LINES)
+    ) {
       nodeShader.bind();
+      this.setPackedAttributeStride(gl, nodeShader, skeletonGpuGeometry);
       initializeCircleShader(nodeShader, projectionParameters, {
         featherWidthInPixels: this.targetIsSliceView ? 1.0 : 0.0,
       });
-      drawCircles(nodeShader.gl, 2, skeletonGpuGeometry.numVertices);
+      // ONE circle per instance: the node shader calls `emitCircle` exactly
+      // once and keys it on `gl_InstanceID`, so a second quad's worth of
+      // vertices just re-runs `gl_VertexID % 6` over the same corners and
+      // rasterises the identical disc on top of itself. Harmless on a skeleton
+      // with a few thousand nodes; on a point cloud the vertices ARE the
+      // drawing, so it doubled both vertex invocations and blended coverage
+      // (a translucent point came out twice as opaque as asked).
+      drawCircles(nodeShader.gl, 1, skeletonGpuGeometry.numVertices);
     }
   }
 
@@ -1411,16 +1976,21 @@ void emitDefault() {
     const { vertexAttributes, clearedTextureUnits } = this;
     const numAttributes = vertexAttributes.length;
     clearedTextureUnits.clear();
+    const clearUnit = (unit: number) => {
+      const curTextureUnit = unit + WebGL2RenderingContext.TEXTURE0;
+      if (clearedTextureUnits.has(curTextureUnit)) return;
+      clearedTextureUnits.add(curTextureUnit);
+      gl.activeTexture(curTextureUnit);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+    };
     for (const shader of shaders) {
       if (shader === null) continue;
       for (let i = 0; i < numAttributes; ++i) {
-        const curTextureUnit =
-          shader.textureUnit(vertexAttributeSamplerSymbols[i]) +
-          WebGL2RenderingContext.TEXTURE0;
-        if (clearedTextureUnits.has(curTextureUnit)) continue;
-        clearedTextureUnits.add(curTextureUnit);
-        gl.activeTexture(curTextureUnit);
-        gl.bindTexture(gl.TEXTURE_2D, null);
+        if (this.isPackedAttribute(i)) continue;
+        clearUnit(shader.textureUnit(vertexAttributeSamplerSymbols[i]));
+      }
+      if (this.base.packedAttributeRange !== undefined) {
+        clearUnit(shader.textureUnit(packedAttributeSamplerSymbol));
       }
     }
     this.vertexIdHelper.disable();
@@ -1516,10 +2086,31 @@ gl_Position = uChunkToClip * vec4(uTranslation + boxVertex * uChunkDataSize, 1.0
   }
 }
 
+/**
+ * The user's lines-versus-points PREFERENCE for skeleton geometry.
+ *
+ * Deliberately only these two: every key of this enum becomes an option in the
+ * "Skeleton mode" dropdown that every segmentation layer shows
+ * (`EnumSelectWidget` enumerates the enum object), so a value that exists to
+ * describe one datasource's geometry would appear as a choice on all of them.
+ * What primitive a source's geometry IS -- points, lines, triangles -- is a
+ * property of the source instead; see {@link GeometryPrimitive}.
+ */
 export enum SkeletonRenderMode {
   LINES = 0,
   LINES_AND_POINTS = 1,
 }
+
+/**
+ * What GPU primitive a source's geometry is made of.
+ *
+ * Read structurally off the chunk source (see `SpatiallyIndexedSkeletonLayer`'s
+ * constructor), so a datasource opts in by declaring a `geometryPrimitive`
+ * getter and every other source keeps the `"lines"` default. This is not a user
+ * setting: a point cloud has no edges to draw and a mesh has no line segments,
+ * so neither is a mode anyone could sensibly switch away from.
+ */
+export type GeometryPrimitive = "points" | "lines" | "triangles";
 
 export function setSpatialSkeletonModesToLinesAndPoints(layer: {
   displayState: { skeletonRenderingOptions: SkeletonRenderingOptions };
@@ -1684,13 +2275,6 @@ export interface SkeletonLayerDisplayState extends SegmentationDisplayState3D {
    * reads it as its visible set. Threaded to the backend counterpart.
    */
   roiHighDetailSegments?: Uint64Set;
-  /**
-   * Maximum streamlines pass 2 may load at full resolution, in OBJECTS.
-   *
-   * Counted in streamlines because pass 2 fetches whole objects: a tract that
-   * clips the view brings its whole length, so bytes-in-view understates it.
-   */
-  roiHighDetailBudget?: WatchableValueInterface<number>;
 }
 
 export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
@@ -1698,6 +2282,8 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
   redrawNeeded = new NullarySignal();
   private sharedObject: SegmentationLayerSharedObject;
   vertexAttributes: VertexAttributeRenderInfo[];
+  /** See {@link PackedAttributeRange}; set by sources that pack. */
+  packedAttributeRange: PackedAttributeRange | undefined;
   segmentColorAttributeIndex: number | undefined = undefined;
   // Non-spatial skeletons iterate segments individually and pass color/alpha via
   // uniforms (getObjectColor), so the dynamic per-vertex segment appearance path
@@ -1793,6 +2379,11 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
         glslDataType: getShaderType(info.dataType, info.numComponents),
       });
     }
+    // Position is prepended above and nothing else is inserted, so a range the
+    // source states in its own attribute order still lines up here.
+    this.packedAttributeRange = (
+      source as { packedAttributeRange?: PackedAttributeRange }
+    ).packedAttributeRange;
   }
 
   get gl() {
@@ -1817,13 +2408,16 @@ export class SkeletonLayer extends RefCounted implements SkeletonShaderContext {
     }
     if (
       displayState.roiHighDetailSegments !== undefined &&
-      displayState.roiFilterActive?.value !== true
+      displayState.roiHighDetailSegments.size === 0
     ) {
-      // ROI high-detail pass-2 layer: draw nothing while the filter is inactive.
-      // The worker also empties the visible set then, but this enforces the
-      // "coarse pass-1 shows those tracts instead" invariant even for the frame
-      // before that clear lands (pass-1's hide tier is likewise off when
-      // inactive, so nothing double-draws).
+      // Object-keyed pass-2 layer: nothing is claimed, so draw nothing and let
+      // the coarse pass-1 bulk show those tracts instead. Keyed on the SET, not
+      // on whether the ROI filter is on: the set has two independent drivers now
+      // -- a dissection asking for full detail, and the object-focused fill
+      // spending the pyramid's leftover memory on whole tracts -- and gating on
+      // one of them would blank the other. It is also exact where the old check
+      // was approximate: whoever empties the set turns this layer off in the
+      // same frame, with no window where pass 1 hides tracts nothing draws.
       return;
     }
     const modelMatrix = update3dRenderLayerAttachment(
@@ -2084,10 +2678,25 @@ export class SliceViewPanelSkeletonLayer extends SliceViewPanelRenderLayer {
   }
 }
 
+// Per-vertex attributes reach the shader as TEXTURES (`uVertexAttributeSampler<i>`,
+// typed from `info.dataType`), so this enum is not used to set up any attribute
+// pointer -- but it is computed eagerly for every attribute in the `SkeletonLayer`
+// constructor, so a dtype missing here fails the whole layer at load time rather
+// than degrading one attribute. The 8/16-bit widths are all legal WebGL2 vertex
+// types; they are listed so a store declaring e.g. a `uint8` compartment label
+// loads. Mirrors `zvWebglDataType` in `datasource/zarr-vectors/geometry_frontend.ts`.
 function getWebglDataType(dataType: DataType) {
   switch (dataType) {
     case DataType.FLOAT32:
       return WebGL2RenderingContext.FLOAT;
+    case DataType.INT8:
+      return WebGL2RenderingContext.BYTE;
+    case DataType.UINT8:
+      return WebGL2RenderingContext.UNSIGNED_BYTE;
+    case DataType.INT16:
+      return WebGL2RenderingContext.SHORT;
+    case DataType.UINT16:
+      return WebGL2RenderingContext.UNSIGNED_SHORT;
     case DataType.INT32:
       return WebGL2RenderingContext.INT;
     case DataType.UINT32:
@@ -2127,33 +2736,76 @@ interface SkeletonChunkBase extends SkeletonGPUGeometry {
   vertexAttributes: Uint8Array;
   vertexAttributeOffsets: Uint32Array;
   indices: Uint32Array;
-  source: { attributeTextureFormats: TextureFormat[] };
+  source: {
+    attributeTextureFormats: TextureFormat[];
+    packedAttributeRange?: PackedAttributeRange;
+  };
+}
+
+/** Byte range attribute `i` occupies in the chunk's packed attribute buffer. */
+function attributeByteRange(
+  chunk: SkeletonChunkBase,
+  i: number,
+): [number, number] {
+  const { vertexAttributes, vertexAttributeOffsets } = chunk;
+  return [
+    vertexAttributeOffsets[i],
+    i + 1 !== vertexAttributeOffsets.length
+      ? vertexAttributeOffsets[i + 1]
+      : vertexAttributes.length,
+  ];
 }
 
 // Used by both SkeletonChunk and SpatiallyIndexedSkeletonChunk.
 function uploadSkeletonChunkToGPU(gl: GL, chunk: SkeletonChunkBase) {
-  const { attributeTextureFormats } = chunk.source;
+  const { attributeTextureFormats, packedAttributeRange } = chunk.source;
   const { vertexAttributes, vertexAttributeOffsets } = chunk;
   const vertexAttributeTextures: (WebGLTexture | null)[] =
     (chunk.vertexAttributeTextures = []);
+  const packedEnd =
+    packedAttributeRange === undefined
+      ? -1
+      : packedAttributeRange.start + packedAttributeRange.count;
   for (
     let i = 0, numAttributes = vertexAttributeOffsets.length;
     i < numAttributes;
     ++i
   ) {
+    if (
+      packedAttributeRange !== undefined &&
+      i >= packedAttributeRange.start &&
+      i < packedEnd
+    ) {
+      // Uploaded once for the whole run, below.
+      vertexAttributeTextures[i] = null;
+      continue;
+    }
     const texture = gl.createTexture();
     gl.bindTexture(WebGL2RenderingContext.TEXTURE_2D, texture);
+    const [begin, end] = attributeByteRange(chunk, i);
     setOneDimensionalTextureData(
       gl,
       attributeTextureFormats[i],
-      vertexAttributes.subarray(
-        vertexAttributeOffsets[i],
-        i + 1 !== numAttributes
-          ? vertexAttributeOffsets[i + 1]
-          : vertexAttributes.length,
-      ),
+      vertexAttributes.subarray(begin, end),
     );
     vertexAttributeTextures[i] = texture;
+  }
+  if (packedAttributeRange !== undefined && packedAttributeRange.count > 0) {
+    // The run is already contiguous in the serialized chunk -- the backend
+    // packs attributes back to back in declaration order -- so one texture over
+    // [first attribute, last attribute] needs no repacking on this side. Every
+    // entry is 1-component float32, so element `a * numVertices + v` addresses
+    // attribute `a` of vertex `v`.
+    const texture = gl.createTexture();
+    gl.bindTexture(WebGL2RenderingContext.TEXTURE_2D, texture);
+    const begin = attributeByteRange(chunk, packedAttributeRange.start)[0];
+    const end = attributeByteRange(chunk, packedEnd - 1)[1];
+    setOneDimensionalTextureData(
+      gl,
+      attributeTextureFormats[packedAttributeRange.start],
+      vertexAttributes.subarray(begin, end),
+    );
+    chunk.packedAttributeTexture = texture;
   }
   gl.bindTexture(WebGL2RenderingContext.TEXTURE_2D, null);
   chunk.indexBuffer = GLBuffer.fromData(
@@ -2171,6 +2823,10 @@ function freeSkeletonChunkGPUMemory(gl: GL, chunk: SkeletonChunkBase) {
     gl.deleteTexture(vertexAttributeTextures[i]);
   }
   vertexAttributeTextures.length = 0;
+  if (chunk.packedAttributeTexture != null) {
+    gl.deleteTexture(chunk.packedAttributeTexture);
+    chunk.packedAttributeTexture = null;
+  }
 }
 
 export class SkeletonChunk extends Chunk implements SkeletonChunkBase {
@@ -2334,7 +2990,10 @@ export function getSpatialSkeletonCellKeyPrefix(
     }
     cell[i] = Math.floor(coordinate / chunkSize);
   }
-  return `${cell[0]},${cell[1]},${cell[2]}:`;
+  // A chunk key is the grid position plus the terminator, and nothing else
+  // (`getChunk` in `skeleton/backend.ts`), so the whole key IS the prefix. The
+  // terminator is what keeps the match exact -- see its docstring.
+  return `${cell[0]},${cell[1]},${cell[2]}${SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR}`;
 }
 
 export abstract class MultiscaleSpatiallyIndexedSkeletonSource extends MultiscaleSliceViewChunkSource<SpatiallyIndexedSkeletonSource> {
@@ -2408,6 +3067,17 @@ interface SpatiallyIndexedSkeletonLayerOptions {
   lod?: WatchableValueInterface<number>;
   gridLevel2d?: WatchableValueInterface<number>;
   lod2d?: WatchableValueInterface<number>;
+  /**
+   * Which detail-focus mode the layer draws in; see
+   * {@link SpatialSkeletonDetailFocus}. Decides whether each visible cell picks
+   * its own level or every cell is pinned to the selected one.
+   */
+  detailFocus?: WatchableValueInterface<number>;
+  /**
+   * Share of the drawn level's new objects to decode, in [0, 1]; `1` disables
+   * per-object admission. See `object_admission.ts`.
+   */
+  admissionFraction?: WatchableValueInterface<number>;
   sources2d?: SpatiallyIndexedSkeletonSourceEntry[];
   selectedNodeId?: WatchableValueInterface<number | undefined>;
   pendingNodePositionVersion?: WatchableValueInterface<number>;
@@ -2724,6 +3394,33 @@ const AUTO_SPATIAL_SKELETON_GRID_MAX_OCTAVE_STEP = 0.5;
  * choice only matters for perspective views; either way the helper
  * returns a meaningful value for any of these fallbacks.
  */
+/**
+ * The grid spacing this layer's memory budget sustains across `visibleCellCount`
+ * cells, or `undefined` when the layer publishes no per-cell costs.
+ */
+function memoryAwareSpacingTarget(
+  displayState: SpatiallyIndexedSkeletonLayerDisplayState,
+  visibleCellCount: number,
+): number | undefined {
+  const perCellCost = displayState.spatialSkeletonPerCellCostBytes?.value;
+  const budgetBytes = displayState.spatialSkeletonGpuBudgetBytes?.value;
+  const levels = displayState.spatialSkeletonGridLevels?.value;
+  if (
+    perCellCost === undefined ||
+    perCellCost.length === 0 ||
+    budgetBytes === undefined ||
+    levels === undefined
+  ) {
+    return undefined;
+  }
+  return targetSpacingForCellBudget(
+    levels.map(({ size }) => Math.min(size.x, size.y, size.z)),
+    perCellCost,
+    visibleCellCount,
+    budgetBytes,
+  );
+}
+
 export function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
   displayState: SpatiallyIndexedSkeletonLayerDisplayState,
   projectionParameters: {
@@ -2735,6 +3432,11 @@ export function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
   },
   localPosition: Float32Array,
   view: "2d" | "3d",
+  /**
+   * Cells the view covers, for the memory-aware target. Omit to keep the
+   * pixel-derived target (every non-tract spatially-indexed skeleton layer).
+   */
+  visibleCellCount?: number,
 ): void {
   const autoFlag =
     view === "3d"
@@ -2770,7 +3472,21 @@ export function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
   );
   if (!Number.isFinite(pixelSize) || pixelSize <= 0) return;
   // Camera-only target (no user bias yet).
-  const autoUnbiased = pixelSize * AUTO_SPATIAL_SKELETON_GRID_DETAIL_CUTOFF;
+  //
+  // Prefer a MEMORY-derived target where the layer can supply one. The
+  // pixel-derived figure below is the right answer for a pyramid whose levels
+  // differ in resolution, but for one whose levels differ in how many whole
+  // objects they hold it saturates: `pixelSize * CUTOFF` is already at or below
+  // the finest level's spacing at a whole-volume view and only falls further as
+  // you zoom in, so the level it selects never changes over the entire useful
+  // range. What does vary usefully is how many cells the view covers — see
+  // `targetSpacingForCellBudget`.
+  const memoryTarget =
+    visibleCellCount === undefined
+      ? undefined
+      : memoryAwareSpacingTarget(displayState, visibleCellCount);
+  const autoUnbiased =
+    memoryTarget ?? pixelSize * AUTO_SPATIAL_SKELETON_GRID_DETAIL_CUTOFF;
 
   // The multiplicative detail `bias` (set when the user clicks/drags the
   // widget) lives in the *persistent* displayState so the calibration
@@ -2857,6 +3573,18 @@ export interface SpatiallyIndexedSkeletonLayerDisplayState
   extends SkeletonLayerDisplayState {
   spatialSkeletonGridLevel2d?: WatchableValueInterface<number>;
   spatialSkeletonGridLevel3d?: WatchableValueInterface<number>;
+  /**
+   * Bytes ONE cell of each pyramid level costs on the GPU, coarsest-first.
+   * Drives the memory-aware resolution target; absent for sources that publish
+   * no per-level costs, which keeps the pixel-derived target.
+   */
+  spatialSkeletonPerCellCostBytes?: WatchableValueInterface<number[]>;
+  /**
+   * The GPU byte budget the layer is sizing against. A watchable rather than a
+   * number because render layers hold a spread copy of the display state, in
+   * which a plain field would freeze at its value on activation.
+   */
+  spatialSkeletonGpuBudgetBytes?: WatchableValueInterface<number>;
   skeletonLod?: WatchableValueInterface<number>;
   spatialSkeletonLod2d?: WatchableValueInterface<number>;
   spatialSkeletonGridLevels?: WatchableValueInterface<
@@ -2911,7 +3639,7 @@ export function resolveSpatiallyIndexedSkeletonSegmentPick(
   chunk: { indices: Uint32Array; numVertices: number },
   segmentIds: Uint32Array,
   pickedOffset: number,
-  kind: "node" | "edge",
+  kind: "node" | "edge" | "face",
   segmentComponents = 1,
 ): bigint | undefined {
   const readId = (vertex: number): bigint | undefined => {
@@ -2929,13 +3657,20 @@ export function resolveSpatiallyIndexedSkeletonSegmentPick(
     if (pickedOffset >= chunk.numVertices) return undefined;
     return readId(pickedOffset);
   }
-  const indexOffset = pickedOffset * 2;
-  if (indexOffset + 1 >= chunk.indices.length) {
+  // The picked primitive spans this many indices: an edge two, a triangle
+  // three. Any of its corners can answer for the whole primitive -- they belong
+  // to one object -- so take the first that has an id, which is also what makes
+  // a bridge edge to a ghost vertex resolvable.
+  const verticesPerPrimitive = kind === "face" ? 3 : 2;
+  const indexOffset = pickedOffset * verticesPerPrimitive;
+  if (indexOffset + verticesPerPrimitive > chunk.indices.length) {
     return undefined;
   }
-  return (
-    readId(chunk.indices[indexOffset]) ?? readId(chunk.indices[indexOffset + 1])
-  );
+  for (let i = 0; i < verticesPerPrimitive; ++i) {
+    const id = readId(chunk.indices[indexOffset + i]);
+    if (id !== undefined) return id;
+  }
+  return undefined;
 }
 
 export class SpatiallyIndexedSkeletonLayer
@@ -2947,6 +3682,10 @@ export class SpatiallyIndexedSkeletonLayer
   vertexAttributes: VertexAttributeRenderInfo[];
   segmentColorAttributeIndex: number | undefined;
   selectedNodeAttributeIndex: number | undefined;
+  /** See {@link PackedAttributeRange}; set by sources that pack. */
+  packedAttributeRange: PackedAttributeRange | undefined;
+  /** What primitive this source's geometry is drawn as; see the constructor. */
+  readonly geometryPrimitive: GeometryPrimitive;
   readonly browsePassLayerView: SkeletonShaderContext;
   readonly skeletonShaderParameters: WatchableValue<SkeletonShaderParameters>;
   readonly browsePassSkeletonShaderParameters: WatchableValueInterface<SkeletonShaderParameters>;
@@ -2971,6 +3710,8 @@ export class SpatiallyIndexedSkeletonLayer
   lod: WatchableValueInterface<number>;
   gridLevel2d: WatchableValueInterface<number>;
   lod2d: WatchableValueInterface<number>;
+  detailFocus: WatchableValueInterface<number>;
+  admissionFraction: WatchableValueInterface<number>;
   private selectedNodeId:
     | WatchableValueInterface<number | undefined>
     | undefined;
@@ -3332,6 +4073,13 @@ export class SpatiallyIndexedSkeletonLayer
       displayState.spatialSkeletonGridLevel2d ??
       this.gridLevel;
     this.lod2d = options.lod2d ?? displayState.spatialSkeletonLod2d ?? this.lod;
+    // A source that names no mode gets LOCAL, which is the behaviour every
+    // spatially-indexed skeleton layer had before the mode existed.
+    this.detailFocus =
+      options.detailFocus ??
+      new WatchableValue<number>(SpatialSkeletonDetailFocus.LOCAL);
+    this.admissionFraction =
+      options.admissionFraction ?? new WatchableValue<number>(1);
     this.selectedNodeId = options.selectedNodeId;
     this.pendingNodePositionVersion = options.pendingNodePositionVersion;
     this.getPendingNodePositionOverride = options.getPendingNodePosition;
@@ -3358,6 +4106,19 @@ export class SpatiallyIndexedSkeletonLayer
       ...this.source.vertexAttributes,
       selectedNodeAttribute,
     ];
+    // Indices are into the source's list, and this only appends, so they carry
+    // over unchanged.
+    this.packedAttributeRange = (
+      this.source as { packedAttributeRange?: PackedAttributeRange }
+    ).packedAttributeRange;
+    // What the geometry IS, as opposed to how the user prefers to see it. A
+    // zarr-vectors point cloud has no edges and a zarr-vectors mesh has no line
+    // segments, so neither can honour the lines/points preference. Structural
+    // read, like `isRoiHighDetailSource` below -- other datasources sharing this
+    // class declare nothing and keep the `"lines"` default.
+    this.geometryPrimitive =
+      (this.source as { geometryPrimitive?: GeometryPrimitive })
+        .geometryPrimitive ?? "lines";
     // Constant for the layer's lifetime: the passing set is attached at layer
     // creation for zarr-vectors tract layers and never for others.
     const hasRoiFilter = this.displayState.roiPassingSegments !== undefined;
@@ -3439,6 +4200,7 @@ export class SpatiallyIndexedSkeletonLayer
     this.browsePassLayerView = {
       vertexAttributes: this.source.vertexAttributes,
       segmentColorAttributeIndex: undefined,
+      packedAttributeRange: this.packedAttributeRange,
       gl: this.gl,
       fallbackShaderParameters: this.fallbackShaderParameters,
       displayState: this.displayState,
@@ -3450,6 +4212,26 @@ export class SpatiallyIndexedSkeletonLayer
     this.selectedNodeAttributeIndex =
       selectedNodeIndex >= 0 ? selectedNodeIndex : undefined;
     const requestRedraw = () => this.redrawNeeded.dispatch();
+    // The mode changes which source each visible cell draws from, so a change
+    // to it must repaint even though nothing about the camera moved.
+    if (this.detailFocus.changed) {
+      this.registerDisposer(this.detailFocus.changed.add(requestRedraw));
+    }
+    // A change to the admission fraction changes what each chunk CONTAINS, not
+    // merely which chunk is drawn, so already-decoded chunks are wrong and must
+    // go. Dropping them beats keying them by fraction: an invalidated chunk is
+    // freed, whereas a re-keyed one lingers in the budget under a dead key until
+    // something outbids it — the trap the `lod` suffix used to set.
+    if (this.admissionFraction.changed) {
+      this.registerDisposer(
+        this.admissionFraction.changed.add(() => {
+          for (const entries of [this.sources, this.sources2d]) {
+            for (const entry of entries) entry.chunkSource.invalidateCache();
+          }
+          requestRedraw();
+        }),
+      );
+    }
     const selectedNodeWatchable = this.selectedNodeId;
     if (selectedNodeWatchable?.changed) {
       this.registerDisposer(selectedNodeWatchable.changed.add(requestRedraw));
@@ -3499,6 +4281,30 @@ export class SpatiallyIndexedSkeletonLayer
       SharedWatchableValue.makeFromExisting(rpc, this.gridLevel2d),
     );
 
+    const skeletonDetailFocusWatchable = this.registerDisposer(
+      SharedWatchableValue.makeFromExisting(rpc, this.detailFocus),
+    );
+
+    const skeletonAdmissionFractionWatchable = this.registerDisposer(
+      SharedWatchableValue.makeFromExisting(rpc, this.admissionFraction),
+    );
+
+    // Per-level spacing in metres, indexed by grid level. The backend's
+    // arbitration needs the same density-corrected figure this side uses; see
+    // `getLevelSpacingsMeters`.
+    const skeletonLevelSpacingsMetersWatchable = this.registerDisposer(
+      SharedWatchableValue.make<number[]>(rpc, this.getLevelSpacingsMeters()),
+    );
+    const gridLevels = displayState.spatialSkeletonGridLevels;
+    if (gridLevels?.changed !== undefined) {
+      this.registerDisposer(
+        gridLevels.changed.add(() => {
+          skeletonLevelSpacingsMetersWatchable.value =
+            this.getLevelSpacingsMeters();
+        }),
+      );
+    }
+
     const skeletonGridResolutionTarget3dWatchable = this.registerDisposer(
       SharedWatchableValue.makeFromExisting(
         rpc,
@@ -3516,6 +4322,9 @@ export class SpatiallyIndexedSkeletonLayer
       skeletonGridLevel: skeletonGridLevelWatchable.rpcId,
       skeletonLod2d: skeletonLod2dWatchable.rpcId,
       skeletonGridLevel2d: skeletonGridLevel2dWatchable.rpcId,
+      skeletonDetailFocus: skeletonDetailFocusWatchable.rpcId,
+      skeletonAdmissionFraction: skeletonAdmissionFractionWatchable.rpcId,
+      skeletonLevelSpacingsMeters: skeletonLevelSpacingsMetersWatchable.rpcId,
       skeletonGridResolutionTarget3d:
         skeletonGridResolutionTarget3dWatchable.rpcId,
     };
@@ -3539,20 +4348,6 @@ export class SpatiallyIndexedSkeletonLayer
       if (displayState.roiSegmentColors !== undefined) {
         counterpartOptions.roiSegmentColors =
           displayState.roiSegmentColors.rpcId;
-      }
-      if (displayState.roiHighDetailSegments !== undefined) {
-        counterpartOptions.roiHighDetailSegments =
-          displayState.roiHighDetailSegments.rpcId;
-      }
-      if (displayState.roiHighDetailBudget !== undefined) {
-        // Shared, not snapshotted: the cap is user-adjustable, and a plain
-        // value would freeze whatever it happened to be at construction.
-        counterpartOptions.roiHighDetailBudget = this.registerDisposer(
-          SharedWatchableValue.makeFromExisting(
-            rpc,
-            displayState.roiHighDetailBudget,
-          ),
-        ).rpcId;
       }
       counterpartOptions.roiGroups = this.registerDisposer(
         SharedWatchableValue.makeFromExisting(rpc, displayState.roiGroups),
@@ -3608,6 +4403,15 @@ export class SpatiallyIndexedSkeletonLayer
           displayState.roiBackground.changed.add(roiRedraw),
         );
       }
+      if (displayState.roiHighDetailSegments !== undefined) {
+        // Pass 1's hide tier reads this set, but it is not pass 1's visible set,
+        // so no segmentation-state redraw covers it. Without this, tracts pass 2
+        // has taken over keep drawing here until something else forces a frame --
+        // which shows as every newly claimed tract briefly drawn twice.
+        this.registerDisposer(
+          displayState.roiHighDetailSegments.changed.add(roiRedraw),
+        );
+      }
     }
 
     sharedObject.initializeCounterpart(rpc, counterpartOptions);
@@ -3637,12 +4441,54 @@ export class SpatiallyIndexedSkeletonLayer
     return perGroup.map((ids) => ids.map((s) => BigInt(s)));
   }
 
+  /**
+   * Ask the backend for the observed range of each named per-vertex attribute
+   * over the resident chunks -- what the Filter tab's attribute picker needs to
+   * offer a meaningful control. Positional: `result[i]` ↔ `names[i]`. The
+   * values exist only in the worker, hence the round trip.
+   */
+  async computeRoiVertexAttrStats(
+    names: readonly string[],
+  ): Promise<VertexAttrStats[]> {
+    const rpc = this.rpc;
+    if (rpc === undefined) {
+      throw new Error("This geometry layer is not connected to a worker.");
+    }
+    const { stats } = await rpc.promiseInvoke<{ stats: VertexAttrStats[] }>(
+      SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_VERTEX_ATTR_STATS_RPC_ID,
+      { layer: this.backend.rpcId, names: [...names] },
+    );
+    return stats;
+  }
+
   get gl() {
     return this.chunkManager.chunkQueueManager.gl;
   }
 
   getSources(view: SpatiallyIndexedSkeletonView) {
     return view === "2d" ? this.sources2d : this.sources;
+  }
+
+  /**
+   * Whether OBJECT focus may draw the UNION of levels for this view.
+   *
+   * Object focus has two halves, and only one of them needs the store's help.
+   * Drawing one level everywhere instead of arbitrating per cell -- so an
+   * object is never cut off where the finer chunks ran out -- works on any
+   * pyramid. Drawing several levels at once only works where they partition the
+   * objects between them; on a resolution pyramid (mesh and point-cloud stores,
+   * whose levels are decimated copies of every object) the union superimposes
+   * those copies. So the union is gated here and the rest of object focus is
+   * not.
+   */
+  objectPartitionAvailable(view: SpatiallyIndexedSkeletonView) {
+    const sources = this.getSources(view);
+    return (
+      sources.length > 0 &&
+      sources.every((entry) =>
+        getSpatiallyIndexedSkeletonPartitionsObjects(entry.chunkSource),
+      )
+    );
   }
 
   private selectSourcesForViewAndGrid(
@@ -3669,6 +4515,71 @@ export class SpatiallyIndexedSkeletonLayer
       getSpatiallyIndexedSkeletonSourceView,
       getSpatiallyIndexedSkeletonGridIndex,
     );
+  }
+
+  /**
+   * Per-level chunk spacing in METRES, indexed by grid level (coarsest first,
+   * which is what `gridIndex` counts).
+   *
+   * Read from the same `spatialSkeletonGridLevels` list the resolution widget
+   * and the camera-driven target use, so all three agree on how coarse a level
+   * is. For an object-sparsity pyramid that figure is density-corrected -- mean
+   * spacing between OBJECTS -- and is the only thing that distinguishes the
+   * levels at all, since they share a chunk shape.
+   *
+   * `[]` where the display state publishes no levels, which sends every caller
+   * back to the chunk-shape spacing they used before.
+   */
+  private getLevelSpacingsMeters(): number[] {
+    const levels = this.displayState.spatialSkeletonGridLevels?.value;
+    if (levels === undefined) return [];
+    return levels.map(({ size }) =>
+      Math.max(Math.min(size.x, size.y, size.z), 0),
+    );
+  }
+
+  /**
+   * How many grid cells the view covers, counted on the COARSEST level's grid.
+   *
+   * Deliberately not the level currently being drawn: the count feeds the
+   * memory-aware resolution target, which then decides which level to draw, and
+   * counting on the drawn level would close that loop into a feedback cycle. The
+   * coarsest grid is a stable reference, and for an object-sparsity pyramid
+   * (where every level shares one chunk_shape) it is the same count anyway.
+   */
+  countVisibleCells(
+    view: SpatiallyIndexedSkeletonView,
+    transformedSources: readonly TransformedSource[][],
+    projectionParameters: ProjectionParameters,
+  ): number {
+    let coarsest: TransformedSource | undefined;
+    let coarsestGridIndex = Number.POSITIVE_INFINITY;
+    const wanted = new Set(
+      this.getSources(view).map((e) => getObjectId(e.chunkSource)),
+    );
+    for (const scales of transformedSources) {
+      for (const tsource of scales) {
+        if (!wanted.has(getObjectId(tsource.source))) continue;
+        // Grid index 0 is the coarsest level, so the smallest wins.
+        const gridIndex =
+          getSpatiallyIndexedSkeletonGridIndex(tsource.source) ?? 0;
+        if (gridIndex < coarsestGridIndex) {
+          coarsestGridIndex = gridIndex;
+          coarsest = tsource;
+        }
+      }
+    }
+    if (coarsest === undefined) return 0;
+    let count = 0;
+    forEachVisibleVolumetricChunk(
+      projectionParameters,
+      this.localPosition.value,
+      coarsest,
+      () => {
+        ++count;
+      },
+    );
+    return count;
   }
 
   private getChunkSpacing(chunkLayout: ChunkLayout): number {
@@ -3867,7 +4778,7 @@ export class SpatiallyIndexedSkeletonLayer
   resolveSegmentPickFromChunk(
     chunk: SpatiallyIndexedSkeletonChunk,
     pickedOffset: number,
-    kind: "node" | "edge",
+    kind: "node" | "edge" | "face",
   ) {
     const data = this.getChunkPositionAndSegmentArrays(chunk);
     if (data === undefined) {
@@ -3918,14 +4829,17 @@ export class SpatiallyIndexedSkeletonLayer
     };
   }
 
-  // Iterates every chunk slot in view for the given view/gridLevel/lod.
+  // Iterates every chunk slot in view for the given view/gridLevel.
   // Callback receives (chunkKey, chunkSource, chunkLayout); return false to stop early.
+  //
+  // Takes no `lod`: chunk keys are grid position alone (see `getChunk` in
+  // `skeleton/backend.ts`). Callers still resolve their own `lod` first, but only
+  // to decide whether there is a level to draw at all.
   private forEachVisibleChunkSlot(
     view: SpatiallyIndexedSkeletonView,
     gridLevel: number | undefined,
     transformedSources: readonly TransformedSource[][],
     projectionParameters: ProjectionParameters,
-    lod: number,
     callback: (
       chunkKey: string,
       chunkSource: SpatiallyIndexedSkeletonSource,
@@ -3936,12 +4850,50 @@ export class SpatiallyIndexedSkeletonLayer
       view === "3d"
         ? this.selectSourcesForViewAndGridWithFallback(view, gridLevel)
         : this.selectSourcesForViewAndGrid(view, gridLevel);
-    const selectedSourceIds = new Set<string>(
-      selectedSources.map((s) => getObjectId(s.chunkSource)),
-    );
-    const lodSuffix = `:${lod}`;
+    // Which sources the non-arbitrating path below draws from.
+    //
+    // Normally exactly one: the preferred level. `...WithFallback` returns every
+    // level in preference order for a caller to try in sequence, not a list to
+    // draw simultaneously, and drawing the whole list would render every
+    // resident level on top of itself.
+    //
+    // Under OBJECT focus it is every level from the drawn one up to the
+    // coarsest, because there they do not overlap: each draws only the objects
+    // that are new at it (see `admitObjects` in the zarr-vectors backend), so
+    // together they cover the admitted set exactly once. Grid index counts from
+    // the coarsest, so that is `gridIndex <= gridLevel`.
+    //
+    // ...and only where the levels really do partition the objects. Without
+    // that the union draws every resident level's copy of the same object on
+    // top of itself; object focus still means "one level everywhere", it just
+    // means the SELECTED level rather than a coarse-to-fine stack.
+    const objectFocus =
+      this.detailFocus.value === SpatialSkeletonDetailFocus.OBJECT &&
+      this.objectPartitionAvailable(view);
+    const drawSourceIds = new Set<string>();
+    if (objectFocus && gridLevel !== undefined) {
+      for (const entry of this.getSources(view)) {
+        const entryGrid = getSpatiallyIndexedSkeletonGridIndex(
+          entry.chunkSource,
+        );
+        if (entryGrid !== undefined && entryGrid <= gridLevel) {
+          drawSourceIds.add(getObjectId(entry.chunkSource));
+        }
+      }
+    }
+    if (drawSourceIds.size === 0 && selectedSources.length > 0) {
+      drawSourceIds.add(getObjectId(selectedSources[0].chunkSource));
+    }
 
-    if (view === "3d" && selectedSources.length > 1) {
+    // Per-cell level arbitration -- the standard neuroglancer behaviour, where
+    // a cell near the camera resolves finer than one far from it. OBJECT focus
+    // opts out: it draws ONE level everywhere and spends the memory that leaves
+    // on whole objects, which scattering levels across the view would undo.
+    if (
+      view === "3d" &&
+      this.detailFocus.value === SpatialSkeletonDetailFocus.LOCAL &&
+      selectedSources.length > 1
+    ) {
       const transformedBySourceId = new Map<string, TransformedSource>();
       for (const scales of transformedSources) {
         for (const tsource of scales) {
@@ -3949,18 +4901,33 @@ export class SpatiallyIndexedSkeletonLayer
         }
       }
       const metersPerUnit = this.getMetersPerUnit(projectionParameters);
+      const levelSpacings = this.getLevelSpacingsMeters();
       const arbitrationCandidates = selectedSources
         .map((source, fallbackRank) => {
           const sourceId = getObjectId(source.chunkSource);
           const transformed = transformedBySourceId.get(sourceId);
           if (transformed === undefined) return undefined;
           const spacing = this.getChunkSpacing(transformed.chunkLayout);
+          // Published level spacing in preference to chunk shape, and for the
+          // same reason the backend's copy of this does it: on an
+          // object-sparsity pyramid every level shares one chunk_shape, so
+          // chunk-derived spacings all tie and every cell falls through to the
+          // selected level. The two sides must agree, or the view draws a level
+          // the priorities never fetched.
+          const gridIndex = getSpatiallyIndexedSkeletonGridIndex(
+            source.chunkSource,
+          );
+          const published =
+            gridIndex === undefined ? undefined : levelSpacings[gridIndex];
           return {
             fallbackRank,
             sourceId,
             transformed,
             spacing,
-            spacingMeters: spacing * metersPerUnit,
+            spacingMeters:
+              published !== undefined && published > 0
+                ? published
+                : spacing * metersPerUnit,
           };
         })
         .filter((x): x is NonNullable<typeof x> => x !== undefined);
@@ -4037,7 +5004,7 @@ export class SpatiallyIndexedSkeletonLayer
               ) {
                 continue;
               }
-              const chunkKey = `${candidateChunkPosition.join()}${lodSuffix}`;
+              const chunkKey = `${candidateChunkPosition.join()}${SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR}`;
               const chunk = (
                 candidate.transformed.source as SpatiallyIndexedSkeletonSource
               ).chunks.get(chunkKey);
@@ -4078,25 +5045,41 @@ export class SpatiallyIndexedSkeletonLayer
     for (const scales of transformedSources) {
       for (const tsource of scales) {
         if (!shouldContinue) return;
-        if (!selectedSourceIds.has(getObjectId(tsource.source))) continue;
-        forEachVisibleVolumetricChunk(
-          projectionParameters,
-          this.localPosition.value,
-          tsource,
-          (positionInChunks) => {
-            if (!shouldContinue) return;
-            const chunkKey = `${positionInChunks.join()}${lodSuffix}`;
-            if (
-              callback(
-                chunkKey,
-                tsource.source as SpatiallyIndexedSkeletonSource,
-                tsource.chunkLayout,
-              ) === false
-            ) {
-              shouldContinue = false;
-            }
-          },
-        );
+        if (!drawSourceIds.has(getObjectId(tsource.source))) continue;
+        const emit = (positionInChunks: Float32Array) => {
+          if (!shouldContinue) return;
+          const chunkKey = `${positionInChunks.join()}${SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR}`;
+          if (
+            callback(
+              chunkKey,
+              tsource.source as SpatiallyIndexedSkeletonSource,
+              tsource.chunkLayout,
+            ) === false
+          ) {
+            shouldContinue = false;
+          }
+        };
+        // OBJECT focus draws the WHOLE VOLUME, not the frustum -- the same
+        // enumeration the worker requests with, so the two agree cell for cell.
+        // Drawing only what the frustum reaches would make a complete tract
+        // appear to end at the edge of the view and reappear on panning, which
+        // is the opposite of what loading whole objects is for.
+        const source = tsource.source as SpatiallyIndexedSkeletonSource;
+        const wholeVolume =
+          objectFocus &&
+          forEachSpatialSkeletonVolumeCell(
+            source.spec.lowerChunkBound,
+            source.spec.upperChunkBound,
+            emit,
+          ) >= 0;
+        if (!wholeVolume) {
+          forEachVisibleVolumetricChunk(
+            projectionParameters,
+            this.localPosition.value,
+            tsource,
+            emit,
+          );
+        }
       }
     }
   }
@@ -4117,7 +5100,6 @@ export class SpatiallyIndexedSkeletonLayer
       gridLevel,
       transformedSources,
       projectionParameters,
-      lod,
       (chunkKey, chunkSource, chunkLayout) => {
         const chunk = chunkSource.chunks.get(chunkKey);
         if (chunk?.state === ChunkState.GPU_MEMORY) {
@@ -4169,7 +5151,6 @@ export class SpatiallyIndexedSkeletonLayer
       gridLevel,
       transformedSources,
       projectionParameters,
-      lod,
       (chunkKey, chunkSource, chunkLayout) => {
         const gridIndex = getSpatiallyIndexedSkeletonGridIndex(chunkSource);
         // Prefer the level's physical (meters) spacing — the same value the
@@ -4276,7 +5257,6 @@ export class SpatiallyIndexedSkeletonLayer
       gridLevel,
       transformedSources,
       projectionParameters,
-      lod,
       (chunkKey, chunkSource, _) => {
         const chunk = chunkSource.chunks.get(chunkKey);
         if (chunk?.state !== ChunkState.GPU_MEMORY) {
@@ -4351,6 +5331,7 @@ export class SpatiallyIndexedSkeletonLayer
         gl: GL;
         edgeShader: ShaderProgram;
         nodeShader: ShaderProgram;
+        faceShader: ShaderProgram | undefined;
         skeletonParams: SkeletonShaderParameters;
       }
     | undefined {
@@ -4408,7 +5389,40 @@ export class SpatiallyIndexedSkeletonLayer
       excludedGPUTable,
     );
 
-    return { gl, edgeShader, nodeShader, skeletonParams };
+    // Surface geometry only: a third program, compiled on first use.
+    let faceShader: ShaderProgram | undefined;
+    if (this.geometryPrimitive === "triangles") {
+      const faceShaderResult = renderHelper.faceShaderGetter(
+        renderContext.emitter,
+      );
+      const { shader, parameters: faceShaderParameters } = faceShaderResult;
+      if (shader === null) return undefined;
+      faceShader = shader;
+      faceShader.bind();
+      renderHelper.beginLayer(gl, faceShader, renderContext, modelMatrix);
+      renderHelper.setPickInstanceStride(gl, faceShader, 0);
+      setControlsInShader(
+        gl,
+        faceShader,
+        shaderControlState,
+        faceShaderParameters.parseResult.controls,
+      );
+      renderHelper.setColor(gl, faceShader, kOneVec4);
+      renderHelper.setLightDirection(
+        gl,
+        faceShader,
+        renderContext,
+        modelMatrix,
+      );
+      renderHelper.maybeEnableDynamicSegmentAppearance(
+        gl,
+        faceShader,
+        skeletonParams,
+        excludedGPUTable,
+      );
+    }
+
+    return { gl, edgeShader, nodeShader, faceShader, skeletonParams };
   }
 
   private endSkeletonRenderPass(
@@ -4417,6 +5431,7 @@ export class SpatiallyIndexedSkeletonLayer
     edgeShader: ShaderProgram,
     nodeShader: ShaderProgram,
     skeletonParams: SkeletonShaderParameters,
+    faceShader?: ShaderProgram,
   ) {
     renderHelper.maybeDisableDynamicSegmentAppearance(
       gl,
@@ -4428,7 +5443,14 @@ export class SpatiallyIndexedSkeletonLayer
       nodeShader,
       skeletonParams,
     );
-    renderHelper.endLayer(gl, edgeShader, nodeShader);
+    if (faceShader !== undefined) {
+      renderHelper.maybeDisableDynamicSegmentAppearance(
+        gl,
+        faceShader,
+        skeletonParams,
+      );
+    }
+    renderHelper.endLayer(gl, edgeShader, nodeShader, faceShader ?? null);
   }
 
   private drawBrowsePass(
@@ -4453,7 +5475,8 @@ export class SpatiallyIndexedSkeletonLayer
       hasExcludedSegments ? this.gpuBrowseExcludedSegmentsHashTable : undefined,
     );
     if (passState === undefined) return;
-    const { gl, edgeShader, nodeShader, skeletonParams } = passState;
+    const { gl, edgeShader, nodeShader, faceShader, skeletonParams } =
+      passState;
 
     const chunkOrigin = vec3.create();
     const chunkBound = vec3.create();
@@ -4461,10 +5484,40 @@ export class SpatiallyIndexedSkeletonLayer
       if (skeletonParams.spatialChunkCulling) {
         vec3.mul(chunkOrigin, chunk.chunkGridPosition, chunkLayout.size);
         vec3.add(chunkBound, chunkOrigin, chunkLayout.size);
+        if (faceShader !== undefined) {
+          faceShader.bind();
+          renderHelper.setChunkBounds(gl, faceShader, chunkOrigin, chunkBound);
+        }
         edgeShader.bind();
         renderHelper.setChunkBounds(gl, edgeShader, chunkOrigin, chunkBound);
         nodeShader.bind();
         renderHelper.setChunkBounds(gl, nodeShader, chunkOrigin, chunkBound);
+      }
+      if (faceShader !== undefined) {
+        // Surface geometry: `chunk.indices` holds triangles, so one instanced
+        // triangle per face and one pick id per face -- `gl_InstanceID` is the
+        // face number.
+        if (renderContext.emitPickID) {
+          let facePickId = 0;
+          let facePickStride = 0;
+          if (chunk.numIndices > 0) {
+            facePickId = renderContext.pickIDs.register(
+              layer,
+              chunk.numIndices / 3,
+              0n,
+              {
+                kind: "segment-face",
+                chunk,
+              } satisfies SpatiallyIndexedSkeletonPickData,
+            );
+            facePickStride = 1;
+          }
+          faceShader.bind();
+          renderHelper.setPickID(gl, faceShader, facePickId);
+          renderHelper.setPickInstanceStride(gl, faceShader, facePickStride);
+        }
+        renderHelper.drawTriangles(gl, faceShader, chunk);
+        continue;
       }
       if (renderContext.emitPickID) {
         let edgePickId = 0;
@@ -4538,6 +5591,7 @@ export class SpatiallyIndexedSkeletonLayer
         chunk,
         renderContext.projectionParameters,
         renderMode,
+        this.geometryPrimitive,
       );
     }
     this.endSkeletonRenderPass(
@@ -4546,6 +5600,7 @@ export class SpatiallyIndexedSkeletonLayer
       edgeShader,
       nodeShader,
       skeletonParams,
+      faceShader,
     );
   }
 
@@ -4626,6 +5681,7 @@ export class SpatiallyIndexedSkeletonLayer
       overlayChunk,
       renderContext.projectionParameters,
       renderMode,
+      this.geometryPrimitive,
     );
     this.endSkeletonRenderPass(
       renderHelper,
@@ -4654,10 +5710,13 @@ export class SpatiallyIndexedSkeletonLayer
     }
 
     const lineWidth = renderOptions.lineWidth.value;
-    const pointDiameter = getSkeletonNodeDiameter(
-      renderOptions.mode.value,
-      lineWidth,
-    );
+    const renderMode = renderOptions.mode.value;
+    // Point geometry always draws its vertices at the larger dot size: there is
+    // no line for the "lines" preference to fall back to.
+    const pointDiameter =
+      this.geometryPrimitive === "points"
+        ? Math.max(5, lineWidth * 2)
+        : getSkeletonNodeDiameter(renderMode, lineWidth);
 
     this.drawBrowsePass(
       renderContext,
@@ -4667,7 +5726,7 @@ export class SpatiallyIndexedSkeletonLayer
       lineWidth,
       pointDiameter,
       visibleChunks,
-      renderOptions.mode.value,
+      renderMode,
     );
     this.drawInspectionOverlayPass(
       renderContext,
@@ -4676,7 +5735,7 @@ export class SpatiallyIndexedSkeletonLayer
       modelMatrix,
       lineWidth,
       pointDiameter,
-      renderOptions.mode.value,
+      renderMode,
     );
   }
 
@@ -4783,7 +5842,11 @@ function updateSpatiallyIndexedSkeletonMouseState(
     }
     return;
   }
-  if (data.kind === "segment-node" || data.kind === "segment-edge") {
+  if (
+    data.kind === "segment-node" ||
+    data.kind === "segment-edge" ||
+    data.kind === "segment-face"
+  ) {
     if (data.kind === "segment-node") {
       const pickedNode = base.resolveNodePickFromChunk(
         data.chunk,
@@ -4796,13 +5859,28 @@ function updateSpatiallyIndexedSkeletonMouseState(
           position: new Float32Array(pickedNode.position),
           sourceState: pickedNode.sourceState,
         };
+        return;
+      }
+      // No node identity: `resolveNodePickFromChunk` needs `chunk.nodeIds`,
+      // which only the CATMAID backend populates. Everything else -- notably a
+      // zarr-vectors point cloud, whose vertices are ALL that is drawn and whose
+      // decoder gives each one its own segment id -- would otherwise pick
+      // nothing at all. The vertex still knows its segment, so fall through and
+      // report that.
+      const nodeSegmentId = base.resolveSegmentPickFromChunk(
+        data.chunk,
+        pickedOffset,
+        "node",
+      );
+      if (nodeSegmentId !== undefined) {
+        mouseState.pickedSpatialSkeleton = pickedSegmentIdFields(nodeSegmentId);
       }
       return;
     }
     const segmentId = base.resolveSegmentPickFromChunk(
       data.chunk,
       pickedOffset,
-      "edge",
+      data.kind === "segment-face" ? "face" : "edge",
     );
     if (segmentId !== undefined) {
       mouseState.pickedSpatialSkeleton = pickedSegmentIdFields(segmentId);
@@ -4963,6 +6041,20 @@ export class PerspectiveViewSpatiallyIndexedSkeletonLayer extends PerspectiveVie
       renderContext.projectionParameters,
       this.base.localPosition.value,
       "3d",
+      // Only where this target decides the level. Under LOCAL focus it always
+      // does; under OBJECT focus the memory budget decides instead -- but only
+      // on a store that can be budgeted per object, which is the same store
+      // property that lets the levels be drawn as a union. Everywhere else
+      // OBJECT focus leaves level selection to the camera, and skipping this
+      // would freeze the level at whatever was picked first.
+      this.base.detailFocus.value === SpatialSkeletonDetailFocus.LOCAL ||
+        !this.base.objectPartitionAvailable("3d")
+        ? this.base.countVisibleCells(
+            "3d",
+            this.transformedSources,
+            renderContext.projectionParameters,
+          )
+        : undefined,
     );
     const lodValue = displayState.skeletonLod?.value;
     const visibleChunks = this.base.getVisibleChunksInCurrentViewAndLod(
@@ -5149,6 +6241,20 @@ export class SliceViewPanelSpatiallyIndexedSkeletonLayer extends SliceViewPanelR
       renderContext.sliceView.projectionParameters.value,
       this.base.localPosition.value,
       "2d",
+      // Only where this target decides the level. Under LOCAL focus it always
+      // does; under OBJECT focus the memory budget decides instead -- but only
+      // on a store that can be budgeted per object, which is the same store
+      // property that lets the levels be drawn as a union. Everywhere else
+      // OBJECT focus leaves level selection to the camera, and skipping this
+      // would freeze the level at whatever was picked first.
+      this.base.detailFocus.value === SpatialSkeletonDetailFocus.LOCAL ||
+        !this.base.objectPartitionAvailable("2d")
+        ? this.base.countVisibleCells(
+            "2d",
+            this.transformedSources,
+            renderContext.sliceView.projectionParameters.value,
+          )
+        : undefined,
     );
     const lodValue = displayState.spatialSkeletonLod2d?.value;
     const visibleChunks = this.base.getVisibleChunksInCurrentViewAndLod(

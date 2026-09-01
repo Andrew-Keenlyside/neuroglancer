@@ -16,6 +16,18 @@
  * `vertexAttributes` — ready to drop into a per-segment `SkeletonChunk`.
  */
 
+import type { ChunkCoalescingCache } from "#src/datasource/zarr-vectors/chunk_coalescing_cache.js";
+import type {
+  AttributeTypedArray,
+  LinksConvention,
+  SkeletonChunk,
+  GeometryKind,
+} from "#src/datasource/zarr-vectors/geometry_chunk.js";
+import {
+  downloadGeometryChunk,
+  type AttributeDtype,
+  type LinkDtype,
+} from "#src/datasource/zarr-vectors/geometry_chunk_download.js";
 import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import type { CrossChunkLinksTable } from "#src/datasource/zarr-vectors/links.js";
 import { resolveFragmentRef } from "#src/datasource/zarr-vectors/object_manifest.js";
@@ -23,18 +35,6 @@ import {
   readObjectManifest,
   type ObjectManifestReaderOptions,
 } from "#src/datasource/zarr-vectors/object_manifest_reader.js";
-import type {
-  AttributeTypedArray,
-  LinksConvention,
-  SkeletonChunk,
-  SkeletonGeometryKind,
-} from "#src/datasource/zarr-vectors/skeleton_chunk.js";
-import type { ChunkCoalescingCache } from "#src/datasource/zarr-vectors/chunk_coalescing_cache.js";
-import {
-  downloadSkeletonChunk,
-  type AttributeDtype,
-  type LinkDtype,
-} from "#src/datasource/zarr-vectors/skeleton_chunk_download.js";
 import type { CellReader } from "#src/datasource/zarr-vectors/shard_cell_reader.js";
 
 /**
@@ -177,7 +177,7 @@ export interface DownloadSegmentSkeletonOptions {
    * decodes independently, as before.
    */
   readonly chunkCache?: ChunkCoalescingCache<
-    Awaited<ReturnType<typeof downloadSkeletonChunk>>
+    Awaited<ReturnType<typeof downloadGeometryChunk>>
   >;
   /** Spatial-chunk download parameters (rank, dtypes, links convention, etc.). */
   readonly rank: number;
@@ -185,7 +185,7 @@ export interface DownloadSegmentSkeletonOptions {
   readonly attributeNames: readonly string[];
   readonly attributeDtypes: readonly AttributeDtype[];
   readonly linksConvention: LinksConvention;
-  readonly geometryKind: SkeletonGeometryKind;
+  readonly geometryKind: GeometryKind;
   /**
    * Optional decoded ``cross_chunk_links/0/`` table for the level.  When
    * present, ``downloadSegmentSkeleton`` appends one edge per record
@@ -324,7 +324,7 @@ export function collectOwnedCrossChunkEdges(
  *
  * 1. Resolve `oid` → `ManifestBlock[]` via `readObjectManifest`.
  * 2. For each block:
- *    a. Fetch + decode the spatial chunk via `downloadSkeletonChunk`.
+ *    a. Fetch + decode the spatial chunk via `downloadGeometryChunk`.
  *    b. Resolve `block.fragmentRef` to a flat list of fragment indices
  *       within that chunk.
  *    c. Call `filterChunkByFragments` to extract just those fragments'
@@ -405,7 +405,7 @@ export async function downloadSegmentSkeleton(
     ...new Set(manifest.map((block) => block.chunkCoords.join("."))),
   ];
   const loadChunk = (chunkKey: string, chunkSignal: AbortSignal) =>
-    downloadSkeletonChunk(
+    downloadGeometryChunk(
       {
         chunkKey,
         rank,
@@ -421,7 +421,7 @@ export async function downloadSegmentSkeleton(
     );
   const fetchedChunks = new Map<
     string,
-    Awaited<ReturnType<typeof downloadSkeletonChunk>>
+    Awaited<ReturnType<typeof downloadGeometryChunk>>
   >();
   await Promise.all(
     uniqueChunkKeys.map(async (chunkKey) => {
@@ -438,6 +438,11 @@ export async function downloadSegmentSkeleton(
     }),
   );
   if (signal.aborted) return undefined;
+
+  // Chunk-local vertex -> merged-output index, accumulated across every block
+  // of that chunk. `ownedChunks` cannot serve this: it is last-write-wins per
+  // chunk, so it forgets all but the final block's remap.
+  const chunkVertexGlobal = new Map<string, Int32Array>();
 
   for (const block of manifest) {
     const chunkKey = block.chunkCoords.join(".");
@@ -501,7 +506,57 @@ export async function downloadSegmentSkeleton(
       perChunkAttrs[i].push(filtered.attributes[i]);
     }
 
+    {
+      let globalOf = chunkVertexGlobal.get(chunkKey);
+      if (globalOf === undefined) {
+        globalOf = new Int32Array(skel.numVertices).fill(-1);
+        chunkVertexGlobal.set(chunkKey, globalOf);
+      }
+      const { vertexRemap } = filtered;
+      for (let v = 0; v < vertexRemap.length; ++v) {
+        const r = vertexRemap[v];
+        if (r >= 0) globalOf[v] = r + runningVertexOffset;
+      }
+    }
+
     runningVertexOffset += filtered.positions.length / rank;
+  }
+
+  // Branch links joining two fragments of the SAME chunk.
+  //
+  // Each manifest block is filtered on its own fragment list, and
+  // `filterChunkByFragments` keeps only edges with both endpoints inside that
+  // list -- so an edge between two fragments is dropped by both blocks and
+  // never appears in the output. For `implicit_sequential` that is harmless
+  // (the bridges are re-derived from block order below), but a skeleton's
+  // branch links live exactly there: dropping them returns one path per
+  // fragment instead of one tree, and every path start then looks like a root.
+  // Measured on a 1075-vertex axon: 36 fragments came back as 36 roots with
+  // zero branch points.
+  const intraChunkBranchEdges: number[] = [];
+  if (linksConvention !== "implicit_sequential") {
+    const emitted = new Set<number>();
+    const edgeKey = (a: number, b: number) =>
+      a < b ? a * runningVertexOffset + b : b * runningVertexOffset + a;
+    for (const chunkEdges of perChunkEdges) {
+      for (let i = 0; i < chunkEdges.length; i += 2) {
+        emitted.add(edgeKey(chunkEdges[i], chunkEdges[i + 1]));
+      }
+    }
+    for (const [chunkKey, globalOf] of chunkVertexGlobal) {
+      const skel = fetchedChunks.get(chunkKey);
+      if (skel === undefined) continue;
+      const { edges } = skel;
+      for (let e = 0; e + 1 < edges.length; e += 2) {
+        const a = globalOf[edges[e]];
+        const b = globalOf[edges[e + 1]];
+        if (a < 0 || b < 0 || a === b) continue;
+        const key = edgeKey(a, b);
+        if (emitted.has(key)) continue;
+        emitted.add(key);
+        intraChunkBranchEdges.push(a, b);
+      }
+    }
   }
 
   // Inter-fragment bridge reconstruction.  Two strategies:
@@ -542,7 +597,7 @@ export async function downloadSegmentSkeleton(
       cursor += p.length;
     }
   }
-  let totalEdgeEntries = 0;
+  let totalEdgeEntries = intraChunkBranchEdges.length;
   for (const e of perChunkEdges) totalEdgeEntries += e.length;
   if (crossChunkEdges !== undefined) totalEdgeEntries += crossChunkEdges.length;
   const indices = new Uint32Array(totalEdgeEntries);
@@ -551,6 +606,10 @@ export async function downloadSegmentSkeleton(
     for (const e of perChunkEdges) {
       indices.set(e, cursor);
       cursor += e.length;
+    }
+    if (intraChunkBranchEdges.length > 0) {
+      indices.set(intraChunkBranchEdges, cursor);
+      cursor += intraChunkBranchEdges.length;
     }
     if (crossChunkEdges !== undefined) {
       indices.set(crossChunkEdges, cursor);

@@ -67,7 +67,7 @@ function makeStore(auth: typeof stubAuth | undefined = stubAuth) {
 function buildGroupJson(name: string) {
   const state = new RoiFilterState();
   const id = state.addGroup();
-  state.updateGroup(id, { name, opacity: 0.42, highDetail: true });
+  state.updateGroup(id, { name, opacity: 0.42 });
   state.addRoi(id, {
     shape: {
       kind: "ellipsoid",
@@ -141,7 +141,6 @@ describe("RoiGroupStore", () => {
     const restored = state.groups[1];
     expect(restored.name).toEqual("Corticospinal R");
     expect(restored.opacity).toBeCloseTo(0.42);
-    expect(restored.highDetail).toBe(true);
     expect(restored.rois).toHaveLength(2);
     expect(restored.rois[0].shape.kind).toEqual("ellipsoid");
     expect(restored.rois[0].predicate).toEqual(RoiPredicate.ANY_SEGMENT);

@@ -38,13 +38,14 @@ import {
   LocalDataSource,
   localEquivalencesUrl,
 } from "#src/datasource/local.js";
+import { buildRoiLabelField } from "#src/datasource/zarr-vectors/label_field.js";
+import type { ObjectAdmission } from "#src/datasource/zarr-vectors/object_admission.js";
 import type {
   RoiBackgroundUniforms,
   RoiGroupConfig,
   RoiLabelField,
   RoiObjectAttrColumn,
 } from "#src/datasource/zarr-vectors/roi.js";
-import { buildRoiLabelField } from "#src/datasource/zarr-vectors/label_field.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import { StreamlineFilterTab } from "#src/datasource/zarr-vectors/streamline_filter_tab.js";
 import { StreamlineGuideTab } from "#src/datasource/zarr-vectors/streamline_guide_tab.js";
@@ -140,6 +141,7 @@ import type {
   SpatiallyIndexedSkeletonNode,
   SpatialSkeletonSourceState,
 } from "#src/skeleton/api.js";
+import type { VertexAttrStats } from "#src/skeleton/base.js";
 import { resolveSkeletonDefaultShader } from "#src/skeleton/default_shader.js";
 import {
   PerspectiveViewSkeletonLayer,
@@ -171,6 +173,7 @@ import {
   buildSpatialSkeletonGridLevels,
   getSpatialSkeletonGridSpacing,
   selectSpatialSkeletonGridLevelByBudget,
+  SpatialSkeletonDetailFocus,
   type SpatialSkeletonGridLevel,
   type SpatialSkeletonGridSize,
 } from "#src/skeleton/spatial_chunk_sizing.js";
@@ -710,13 +713,6 @@ function getSpatialSkeletonGridHistogramConfig(
  * shader) and attributes each passing tract the colour of its group.
  */
 function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
-  // High detail drives the pass-2 layer, whose draw loop and pass-1 hide tier
-  // are only meaningful while the filter is effectively active. Zero it out when
-  // the filter is inactive so the worker empties `roiHighDetailSegments` — else
-  // pass-2 would keep drawing (and fetching) the high-detail tracts on top of
-  // the coarse pass-1 bulk (which pass-1 no longer hides once inactive),
-  // double-drawing them.
-  const active = roiFilter.active && roiFilter.hasVisibleRois();
   // Include the live label-selection preview (if any) so a staged, not-yet-
   // committed selection ghosts/colours streamlines exactly like a real group.
   return roiFilter.groupsForWorker().map((g) => ({
@@ -727,10 +723,11 @@ function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
       vec4.fromValues(g.color[0], g.color[1], g.color[2], g.opacity),
     ),
     visible: g.visible,
-    highDetail: g.highDetail && active,
-    // Per-group unified colour-by + length filter (both settable like opacity).
+    // Per-group unified colour-by + attribute predicates (both settable like
+    // opacity). The predicates are what let a group select by data rather than
+    // by geometry, which for a point cloud is the only kind of group there is.
     colorBy: g.colorBy,
-    ...(g.lengthFilter !== undefined ? { lengthRange: g.lengthFilter } : {}),
+    ...(g.attrFilters.length !== 0 ? { attrFilters: g.attrFilters } : {}),
   }));
 }
 
@@ -823,23 +820,31 @@ function rebuildRoiAnnotations(
 }
 
 /**
- * Default full-detail cap, in streamlines.
+ * Nothing to the object-keyed full-detail pass by default.
  *
- * ~50k tracts at a whole-brain tractogram's ~200 vertices each is ~10M
- * vertices -- a few hundred MB once positions, tangents and the segment column
- * are counted, so it sits well inside a 1 GB GPU budget while being far more
- * than the ~5k a mid pyramid level holds.
+ * It was an even-ish split while an ROI group could ask for its tracts at full
+ * resolution. No group can now -- a dissection is a selection within the level
+ * the layer draws -- so any reservation here is withheld from the only pass
+ * that draws, which is a direct cut to how much of the tractogram fits.
+ * Non-zero only if something is deliberately driving the pass-2 layer.
  */
-const DEFAULT_ROI_HIGH_DETAIL_BUDGET = 50000;
 
-/**
- * Half the GPU pool to full-resolution streamlines by default.
- *
- * An even split is the honest starting point: neither pass is inherently more
- * important, and which one the user is actually looking at depends entirely on
- * whether they are inspecting a dissection or navigating the whole brain.
- */
-const DEFAULT_ROI_FULL_DETAIL_MEMORY_SHARE = 0.2;
+let warnedAdmissionUnavailable = false;
+function warnOnceAdmissionUnavailable(hasSource: boolean) {
+  if (warnedAdmissionUnavailable) return;
+  warnedAdmissionUnavailable = true;
+  console.warn(
+    "Object detail focus is selected but this store cannot be budgeted per " +
+      (hasSource
+        ? "object: its levels are not nested subsets of one object id space, " +
+          "or it omits object_attributes/vertex_count at some level."
+        : "object: no spatially-indexed tract source reported one.") +
+      " Object focus stays in force -- one level everywhere, its whole volume" +
+      " resident -- but the level is chosen by the whole-level memory ceiling" +
+      " rather than by which objects fit, and the levels are not drawn" +
+      " together.",
+  );
+}
 
 class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   constructor(public layer: SegmentationUserLayer) {
@@ -1062,11 +1067,40 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   ) {
     const levels = this.spatialSkeletonGridLevels.value;
     if (levels.length === 0) return;
+    // Under OBJECT focus the level is a consequence of what the memory budget
+    // admits, not of the camera; letting a resolution target write it too would
+    // simply overwrite that choice on the next frame. See
+    // {@link refreshSpatialSkeletonAdmission}.
+    if (
+      this.spatialSkeletonDetailFocus.value ===
+        SpatialSkeletonDetailFocus.OBJECT &&
+      this.spatialSkeletonComputeAdmission !== undefined
+    ) {
+      return;
+    }
     const requested = findClosestSpatialSkeletonGridLevelBySpacing(
       levels,
       target,
     );
-    const ceiling = this.spatialSkeletonBudgetLevel;
+    // The whole-level ceiling is skipped once a per-cell budget is available.
+    //
+    // The two are rival answers to the same question, and the coarser one was
+    // winning: the target `requested` comes from `targetSpacingForCellBudget`,
+    // which divides the memory limit by the cells actually in view, while the
+    // ceiling asks whether the level would fit if EVERY cell were resident.
+    // Zooming in makes the first finer and leaves the second untouched, so
+    // `Math.min` pinned the level at the whole-level answer no matter how far
+    // the user zoomed -- the level simply never moved.
+    //
+    // Whole-volume residency would change that -- "if every cell were resident"
+    // stops being hypothetical -- but that is requested only under the object
+    // PARTITION, whose level is chosen by `refreshSpatialSkeletonAdmission` and
+    // never reaches here (the early return above). Object focus without the
+    // partition requests the frustum, like LOCAL, so it budgets like LOCAL.
+    const ceiling =
+      this.spatialSkeletonPerCellCostBytes.value.length > 0
+        ? undefined
+        : this.spatialSkeletonBudgetLevel;
     this.setSpatialSkeletonGridLevel(
       view,
       ceiling === undefined ? requested : Math.min(requested, ceiling),
@@ -1111,6 +1145,40 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   computeRoiExportIds?: (
     groups: readonly RoiGroupConfig[],
   ) => Promise<bigint[][]>;
+  /**
+   * The per-vertex attribute names the geometry source loaded, in load order
+   * (the on-disk `vertex_attributes/<name>` directory names). The Filter tab
+   * offers these as filter targets; for a point cloud they are the ONLY tier it
+   * can offer, since that kind has no per-object attributes at all. Set when a
+   * zarr-vectors geometry source activates.
+   */
+  roiVertexAttributeNames?: readonly string[];
+  /**
+   * On-disk dtypes parallel to {@link roiVertexAttributeNames}. The Filter tab
+   * needs them to tell a FLAG from a measurement when the loaded chunks happen
+   * to show only one of the flag's two values.
+   */
+  roiVertexAttributeDtypes?: readonly string[];
+  /**
+   * Measure the named per-vertex attributes over the currently-resident chunks.
+   * The values live in the worker (the frontend holds them as opaque packed
+   * texture bytes), so a range for a slider has to be asked for. Positional:
+   * `result[i]` ↔ `names[i]`.
+   */
+  computeRoiVertexAttrStats?: (
+    names: readonly string[],
+  ) => Promise<VertexAttrStats[]>;
+  /**
+   * Whether this layer's geometry is exportable as tracts. The Export tab's two
+   * formats are streamline-shaped, so a point-cloud or mesh store gets the
+   * Filter tab without it.
+   */
+  roiSupportsTractExport?: boolean;
+  /**
+   * What the filterable geometry draws as, so the Filter tab can name what it
+   * is selecting: a point cloud's passing ids are single cells, not tracts.
+   */
+  roiGeometryPrimitive?: "points" | "lines" | "triangles";
   /**
    * The pass-2 (object-keyed, high-detail) skeleton source. Its resident chunks
    * hold whole tracts' geometry in frontend memory, which the Export tab reads
@@ -1212,35 +1280,82 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
    */
   ignoreSpatialSkeletonMemoryCeiling = new TrackableBoolean(false, false);
   /**
-   * Fraction of the GPU pool reserved for full-resolution streamlines.
+   * What the memory left over by the pyramid level being drawn is spent on.
+   * See {@link SpatialSkeletonDetailFocus} for why a tractogram wants a
+   * different answer here than an image pyramid does.
    *
-   * The coarse pyramid pass and the object-keyed full-detail pass draw from one
-   * pool. Splitting it explicitly is what stops each sizing itself as though it
-   * owned the whole thing and then evicting the other.
+   * Defaults to OBJECT: every source that reaches this code publishes per-level
+   * costs, which today means zarr-vectors geometry, whose objects are long
+   * enough that the local answer returns them in pieces.
    */
-  roiFullDetailMemoryShare = new TrackableValue<number>(
-    DEFAULT_ROI_FULL_DETAIL_MEMORY_SHARE,
-    verifyFiniteNonNegativeFloat,
-    DEFAULT_ROI_FULL_DETAIL_MEMORY_SHARE,
+  // Explicit type argument: without it the initialiser narrows the generic to
+  // the literal `SpatialSkeletonDetailFocus.OBJECT`, so assigning any other
+  // member (see `refreshSpatialSkeletonAdmission`, which drops to LOCAL when
+  // the store cannot be budgeted per object) fails to typecheck.
+  spatialSkeletonDetailFocus = new TrackableEnum<SpatialSkeletonDetailFocus>(
+    SpatialSkeletonDetailFocus,
+    SpatialSkeletonDetailFocus.OBJECT,
   );
   /**
-   * Derive the streamline budget from the memory limit instead of using the
-   * manual figure. Off means `roiHighDetailBudget` is taken literally.
-   */
-  autoRoiHighDetailBudget = new TrackableBoolean(true, true);
-  /**
-   * How many streamlines pass 2 may hold at full resolution.
+   * Whether the focus above was CHOSEN -- restored from the layer's JSON or
+   * picked in the UI -- as opposed to being the class default.
    *
-   * A streamline count, not a byte budget: pass 2 loads whole objects, so a
-   * tract clipping the view costs its entire length no matter how little is on
-   * screen -- an in-view or per-chunk estimate systematically understates it.
-   * 0 disables full-detail loading entirely.
+   * The default is OBJECT because that is what a tractogram wants, and a
+   * tractogram is what the mode was built for. A store that cannot be budgeted
+   * per object still honours object focus (one level everywhere, its whole
+   * volume resident), but the sizing behind that is "the whole level fits the
+   * GPU budget" -- which assumes the layer has the budget to itself. Three
+   * geometry layers over one volume each assume that, and together they thrash:
+   * every layer's whole level is requested, nothing stays resident, and the
+   * viewer draws nothing at all. So on those stores the DEFAULT reverts to
+   * LOCAL, once, when the source reports the capability
+   * ({@link updateSpatialSkeletonSourceState}) -- and an explicit choice is
+   * left alone.
    */
-  roiHighDetailBudget = new TrackableValue<number>(
-    DEFAULT_ROI_HIGH_DETAIL_BUDGET,
-    verifyNonnegativeInt,
-    DEFAULT_ROI_HIGH_DETAIL_BUDGET,
-  );
+  spatialSkeletonDetailFocusExplicit = false;
+  /** Guards our own writes to the focus, so they do not read as a choice. */
+  private applyingDefaultDetailFocus = false;
+
+  /**
+   * Set the focus without marking it as the user's choice.
+   *
+   * Returns true if the value moved.
+   */
+  applyDefaultSpatialSkeletonDetailFocus(value: SpatialSkeletonDetailFocus) {
+    if (this.spatialSkeletonDetailFocus.value === value) return false;
+    this.applyingDefaultDetailFocus = true;
+    try {
+      this.spatialSkeletonDetailFocus.value = value;
+    } finally {
+      this.applyingDefaultDetailFocus = false;
+    }
+    return true;
+  }
+
+  /** See {@link spatialSkeletonDetailFocusExplicit}. */
+  noteSpatialSkeletonDetailFocusChanged() {
+    if (!this.applyingDefaultDetailFocus) {
+      this.spatialSkeletonDetailFocusExplicit = true;
+    }
+  }
+
+  /**
+   * Bytes the level being drawn leaves unspent: the budget minus its
+   * fully-resident estimate. Under OBJECT focus this is what buys whole
+   * objects; under LOCAL focus nothing reads it.
+   */
+  /**
+   * Share of the drawn level's NEW objects to decode, in [0, 1]. `1` means no
+   * rationing. Derived, never set by the user; see
+   * {@link refreshSpatialSkeletonAdmission}.
+   */
+  spatialSkeletonAdmissionFraction = new WatchableValue<number>(1);
+  /**
+   * Bytes ONE cell of each level costs on the GPU, coarsest-first. This is what
+   * makes LOCAL focus respond to zoom: the budget divided by the number of cells
+   * in view names the finest level each cell can afford.
+   */
+  spatialSkeletonPerCellCostBytes = new WatchableValue<number[]>([]);
   spatialSkeletonGridRenderScaleHistogram2d = new RenderScaleHistogram();
   spatialSkeletonGridRenderScaleHistogram3d = new RenderScaleHistogram();
   spatialSkeletonLod2d = new WatchableValue<number>(0);
@@ -1293,7 +1408,17 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
     levelCostsBytes?: number[],
     budgetBytes?: number,
     levelObjectCounts?: (number | undefined)[],
+    levelCellCounts?: number[],
   ) {
+    const perCell =
+      levelCostsBytes !== undefined &&
+      levelCellCounts !== undefined &&
+      levelCellCounts.length === levelCostsBytes.length
+        ? levelCostsBytes.map((cost, k) =>
+            levelCellCounts[k] > 0 ? cost / levelCellCounts[k] : Number.NaN,
+          )
+        : [];
+    this.spatialSkeletonPerCellCostBytes.value = perCell;
     const levels = buildSpatialSkeletonGridLevels(gridSizes, levelObjectCounts);
     const { origin: histogramOrigin, binSize: histogramBinSize } =
       getSpatialSkeletonGridHistogramConfig(levels);
@@ -1352,10 +1477,21 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
         this.spatialSkeletonGridResolutionTarget2d.value,
       );
     this.setSpatialSkeletonGridLevel("2d", target2dIndex);
+    // Under OBJECT focus this immediately overrides both picks above with the
+    // level the memory budget actually implies.
+    this.refreshSpatialSkeletonAdmission();
   }
 
   /** Per-level fully-resident cost estimates, coarsest first; see the ctor. */
   private spatialSkeletonLevelCostsBytes: number[] | undefined;
+  /**
+   * The tract source's own answer to "which whole objects fit in this many
+   * bytes", or `undefined` for a store that cannot be budgeted per object.
+   * Set when the subsource activates; see `computeObjectAdmission`.
+   */
+  spatialSkeletonComputeAdmission:
+    | ((budgetBytes: number) => ObjectAdmission | undefined)
+    | undefined;
   /** Budget the ceiling was last computed against, so a toggle can reuse it. */
   private spatialSkeletonBudgetBytes: number | undefined;
 
@@ -1402,39 +1538,16 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
    * auto-LOD, or user-set), so clamping respects them while still refusing
    * anything that does not fit.
    */
-  /** Bytes one full-resolution streamline costs; see the datasource. */
-  private fullDetailBytesPerStreamline: number | undefined;
-
-  setFullDetailBytesPerStreamline(bytes: number | undefined) {
-    this.fullDetailBytesPerStreamline = bytes;
-    this.updateAutoRoiHighDetailBudget();
-  }
-
-  /**
-   * Recompute the streamline budget from the memory limit and its share.
-   *
-   * Counted in streamlines because the object-keyed pass fetches whole tracts: a
-   * tract clipping the view costs its entire length, so bytes-in-view would
-   * understate it systematically.
-   *
-   * Declines silently when the store cannot say what a streamline costs -- the
-   * manual figure stands rather than being overwritten with a guess.
-   */
-  updateAutoRoiHighDetailBudget(gpuLimitBytes?: number) {
-    if (!this.autoRoiHighDetailBudget.value) return;
-    const perStreamline = this.fullDetailBytesPerStreamline;
-    if (perStreamline === undefined || !(perStreamline > 0)) return;
-    const limit = gpuLimitBytes ?? this.spatialSkeletonGpuLimitBytes;
-    if (limit === undefined || !Number.isFinite(limit)) return;
-    const share = this.roiFullDetailMemoryShare.value;
-    const budget = Math.max(0, Math.floor((limit * share) / perStreamline));
-    if (this.roiHighDetailBudget.value !== budget) {
-      this.roiHighDetailBudget.value = budget;
-    }
-  }
-
   /** Last GPU limit seen, so the auto budget can be recomputed on its own. */
-  spatialSkeletonGpuLimitBytes: number | undefined;
+  /**
+   * The GPU byte limit the layer sizes against.
+   *
+   * A watchable, not a plain number: the render layers receive a SPREAD of this
+   * display state, which copies plain fields by value — so a number would freeze
+   * at its value on activation and stop tracking the user's memory limit, while
+   * a watchable is copied by reference and keeps reporting the live one.
+   */
+  spatialSkeletonGpuBudgetBytes = new WatchableValue<number>(0);
 
   updateSpatialSkeletonBudget(budgetBytes?: number | undefined) {
     if (this.spatialSkeletonGridLevels.value.length === 0) return;
@@ -1443,8 +1556,28 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
     const next = this.computeSpatialSkeletonBudgetLevel(
       this.spatialSkeletonBudgetBytes,
     );
-    if (next === this.spatialSkeletonBudgetLevel) return;
-    this.spatialSkeletonBudgetLevel = next;
+    if (next !== this.spatialSkeletonBudgetLevel) {
+      this.spatialSkeletonBudgetLevel = next;
+      this.reapplySpatialSkeletonResolutionTargets();
+    }
+    // Always, even when the whole-level ceiling did not move: raising the GPU
+    // limit by less than a whole rung still buys more objects out of the next
+    // one, and that is the entire point of budgeting per object.
+    this.refreshSpatialSkeletonAdmission();
+  }
+
+  /**
+   * Re-run both views' resolution targets through the current ceiling.
+   *
+   * Needed wherever the CEILING moved without the target doing so -- a new
+   * budget level, or a detail-focus switch, which changes whether the
+   * whole-level ceiling applies at all (see
+   * {@link applySpatialSkeletonResolutionTarget}). Without this the level stays
+   * where the previous mode left it: on a store that cannot be budgeted per
+   * object, switching to OBJECT focus would keep a level chosen for the cells
+   * in view and then make its whole volume resident.
+   */
+  reapplySpatialSkeletonResolutionTargets() {
     this.applySpatialSkeletonResolutionTarget(
       "3d",
       this.spatialSkeletonGridResolutionTarget3d.value,
@@ -1473,6 +1606,106 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
       this.skeletonLod.value = nextLod;
     }
     return clampedIndex;
+  }
+
+  /**
+   * Re-derive the fill level for both views from the levels they now draw.
+   *
+   * Offered ONLY to a view sitting exactly on the memory ceiling. Below the
+   * ceiling the next level down fits whole, so there is nothing to ration and
+   * a partial load would be a worse picture than the one the user (or the
+   * camera) asked for; above it there is no ceiling in force at all, because
+   * the source published no costs or the user overrode it -- and in that case
+   * the finer level is already free to be selected outright.
+   */
+  /**
+   * Re-derive which objects the memory budget buys, and which level to read
+   * them from.
+   *
+   * This REPLACES level selection under OBJECT focus. The camera cannot answer
+   * the question: an object-sparsity pyramid's levels differ in how many whole
+   * tracts they hold, not in detail per pixel, so a resolution target saturates
+   * at "finest" over the entire useful zoom range and the level stops moving.
+   * What actually bounds the picture is memory, so memory chooses — the finest
+   * level whose objects fit, plus a rationed share of the level below it.
+   *
+   * Under LOCAL focus this is inert and the camera keeps deciding, per cell.
+   */
+  private refreshSpatialSkeletonAdmission() {
+    const levels = this.spatialSkeletonGridLevels.value;
+    const compute = this.spatialSkeletonComputeAdmission;
+    const budgetBytes = this.spatialSkeletonBudgetBytes;
+    const objectFocus =
+      this.spatialSkeletonDetailFocus.value ===
+      SpatialSkeletonDetailFocus.OBJECT;
+    // The user's override has to reach here too. It is consulted nowhere else
+    // than the whole-level ceiling, and OBJECT focus bypasses that path
+    // entirely -- so without this the checkbox is inert on exactly the layers it
+    // exists for. Under per-object budgeting "ignore the ceiling" means "spend
+    // as if memory were unlimited", which admits every object at the finest
+    // level: the same escape hatch, expressed in this mode's terms.
+    const effectiveBudget = this.ignoreSpatialSkeletonMemoryCeiling.value
+      ? Number.POSITIVE_INFINITY
+      : budgetBytes;
+    const admission =
+      objectFocus &&
+      compute !== undefined &&
+      effectiveBudget !== undefined &&
+      levels.length > 0
+        ? compute(effectiveBudget)
+        : undefined;
+    if (admission === undefined) {
+      // No per-object budgeting available (or not asked for): draw whole levels
+      // and leave the rationing off.
+      if (this.spatialSkeletonAdmissionFraction.value !== 1) {
+        this.spatialSkeletonAdmissionFraction.value = 1;
+      }
+      if (objectFocus) {
+        warnOnceAdmissionUnavailable(compute !== undefined);
+        // ...and that is the whole of it: the mode STAYS SELECTED.
+        //
+        // Object focus is two behaviours, and only one of them needs the store
+        // to carry per-object membership.
+        //
+        // The half that always works: one level everywhere instead of per-cell
+        // arbitration, and that level's WHOLE VOLUME resident rather than the
+        // frustum. That is what makes an object load as an object -- uniform
+        // detail across it, no cut-off where the finer chunks ran out, no decay
+        // into the visible piece as the camera turns -- and it is exactly what
+        // a mesh or point-cloud store wants. Level selection simply reverts to
+        // the camera under the whole-level ceiling (see
+        // {@link applySpatialSkeletonResolutionTarget}), which is the right
+        // ceiling here because the whole level really is loaded.
+        //
+        // The half that does not: drawing the UNION of every level with
+        // `gridIndex <= gridLevel` (in the draw list
+        // `SpatiallyIndexedSkeletonLayer.forEachVisibleChunkSlot` and in the
+        // worker's request set `selectScales`), plus rationing the finest one.
+        // That is sound only where the levels PARTITION the objects between
+        // them, as `admitObjects` in the zarr-vectors backend guarantees from
+        // `coarserMembership`; on a plain resolution pyramid -- every level a
+        // decimated copy of every object, `object_sparsity` 1.0 -- it draws the
+        // same object once per resident level, superimposed. Overlapping
+        // decimations of one surface sum on screen, which reads as additive
+        // rendering; it is duplicated geometry, not blending, so no opacity
+        // control affects it.
+        //
+        // So the union is gated at its own sites, on the same store property
+        // (`partitionsObjects`, published per source), and this branch no
+        // longer has to switch the user's mode off to keep it safe. It used
+        // to, which is why object focus could not be selected at all on a mesh
+        // or point-cloud layer: the control sprang back to LOCAL.
+      }
+      return;
+    }
+    // `loadLevel` counts from the finest level; a grid level counts from the
+    // coarsest (see `gridIndex` in the zarr-vectors datasource).
+    const gridLevel = levels.length - 1 - admission.loadLevel;
+    this.setSpatialSkeletonGridLevel("3d", gridLevel);
+    this.setSpatialSkeletonGridLevel("2d", gridLevel);
+    if (this.spatialSkeletonAdmissionFraction.value !== admission.fraction) {
+      this.spatialSkeletonAdmissionFraction.value = admission.fraction;
+    }
   }
 
   linkedSegmentationGroup: LinkedLayerGroup;
@@ -1978,6 +2211,11 @@ export class SegmentationUserLayer extends Base {
     // sources (e.g. CATMAID) that render tracts but cannot be filtered. Unlike
     // the Skeleton *edit* tab, it does NOT require the skeleton-editing API,
     // which read-only zarr-vectors tracts lack.
+    //
+    // Every zarr-vectors geometry kind opts in, points and meshes included: a
+    // dissection of a point cloud is what its attribute predicates select, and
+    // the fold knows from each chunk how to attribute geometry to objects (see
+    // `RoiFilterableChunk.perVertexObjects`).
     const hideFilterTab = this.registerDisposer(
       makeCachedLazyDerivedWatchableValue(
         (layers) =>
@@ -1996,13 +2234,29 @@ export class SegmentationUserLayer extends Base {
       getter: () => new StreamlineFilterTab(this),
       hidden: hideFilterTab,
     });
-    // Same visibility condition as the Filter tab: there is nothing to export
-    // without a dissection to export, and both need `roiFilter` to exist.
+    // The Filter tab's condition AND a store the export applies to. Both of the
+    // Export tab's formats are streamline-shaped -- TrackVis `.trk` is polylines
+    // by definition, and the zarr-vectors exporter reads whole tracts -- so a
+    // point-cloud or mesh store is filterable without being exportable, and
+    // offering the tab there would only lead to a job that cannot be written.
+    const hideExportTab = this.registerDisposer(
+      makeCachedLazyDerivedWatchableValue(
+        (layers) =>
+          this.displayState.roiPassingSegments === undefined ||
+          this.displayState.roiSupportsTractExport !== true ||
+          !layers.some(
+            (layer) =>
+              layer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
+              layer instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer,
+          ),
+        { changed: this.layersChanged, value: this.renderLayers },
+      ),
+    );
     this.tabs.add("export", {
       label: "Export",
       order: -38,
       getter: () => new TractExportTab(this),
-      hidden: hideFilterTab,
+      hidden: hideExportTab,
     });
     // Shares the Filter tab's visibility condition: the guide documents that
     // panel, so it should never appear without it.
@@ -2032,25 +2286,29 @@ export class SegmentationUserLayer extends Base {
       const gpuLimit =
         this.manager.chunkManager.chunkQueueManager.capacities.gpuMemory
           .sizeLimit;
-      const share = this.displayState.roiFullDetailMemoryShare;
       const reapplyBudgets = () => {
-        this.displayState.spatialSkeletonGpuLimitBytes = gpuLimit.value;
-        // The coarse pass gets what the full-detail pass does not.
-        this.displayState.updateSpatialSkeletonBudget(
-          gpuLimit.value * (1 - share.value),
-        );
-        this.displayState.updateAutoRoiHighDetailBudget(gpuLimit.value);
+        this.displayState.spatialSkeletonGpuBudgetBytes.value = gpuLimit.value;
+        this.displayState.updateSpatialSkeletonBudget(gpuLimit.value);
       };
-      this.displayState.spatialSkeletonGpuLimitBytes = gpuLimit.value;
+      this.displayState.spatialSkeletonGpuBudgetBytes.value = gpuLimit.value;
       this.registerDisposer(gpuLimit.changed.add(reapplyBudgets));
-      this.registerDisposer(share.changed.add(reapplyBudgets));
-      this.registerDisposer(
-        this.displayState.autoRoiHighDetailBudget.changed.add(reapplyBudgets),
-      );
       this.registerDisposer(
         this.displayState.ignoreSpatialSkeletonMemoryCeiling.changed.add(() =>
           this.displayState.updateSpatialSkeletonBudget(),
         ),
+      );
+      // Switching focus moves the same leftover from one consumer to the other,
+      // so both have to be re-derived: the spatial fill level and the whole-
+      // object set are each cleared or repopulated by this pass.
+      this.registerDisposer(
+        this.displayState.spatialSkeletonDetailFocus.changed.add(() => {
+          this.displayState.noteSpatialSkeletonDetailFocusChanged();
+          this.displayState.updateSpatialSkeletonBudget();
+          // ...and the level itself, which the budget pass re-derives only when
+          // the budget LEVEL moved. Switching focus does not move it; it moves
+          // which ceiling applies to it.
+          this.displayState.reapplySpatialSkeletonResolutionTargets();
+        }),
       );
     }
     this.tabs.default = "rendering";
@@ -2104,6 +2362,28 @@ export class SegmentationUserLayer extends Base {
           (x) =>
             x instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
             x instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer,
+        ),
+      { changed: this.layersChanged, value: this.renderLayers },
+    ),
+  );
+
+  /**
+   * Whether any drawn geometry is made of LINE segments.
+   *
+   * Distinct from {@link hasSkeletonsLayer}, which is true for anything drawn by
+   * the skeleton render layers -- including a zarr-vectors point cloud or mesh,
+   * which go through the same class but draw circles and triangles. The
+   * lines-versus-points preference is meaningless for those, so the control that
+   * offers it is gated on this instead.
+   */
+  readonly hasLineGeometryLayer = this.registerDisposer(
+    makeCachedLazyDerivedWatchableValue(
+      (layers) =>
+        layers.some(
+          (x) =>
+            x instanceof PerspectiveViewSkeletonLayer ||
+            (x instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer &&
+              x.base.geometryPrimitive === "lines"),
         ),
       { changed: this.layersChanged, value: this.renderLayers },
     ),
@@ -2380,6 +2660,30 @@ export class SegmentationUserLayer extends Base {
     throw new Error(
       "This layer's tract geometry is not ready yet — wait for it to load, " +
         "then export.",
+    );
+  }
+
+  /**
+   * Measure the named per-vertex attributes over the geometry render layer's
+   * resident chunks. Backs the `computeRoiVertexAttrStats` display-state
+   * callback the Filter tab calls before it can draw a control for an
+   * attribute; the render-layer lookup is done here, not captured at
+   * channel-creation, because the render layer is created after the ROI
+   * channel. Rejects while no geometry render layer exists.
+   */
+  private async computeRoiVertexAttrStats(
+    names: readonly string[],
+  ): Promise<VertexAttrStats[]> {
+    for (const renderLayer of this.renderLayers) {
+      if (
+        renderLayer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
+        renderLayer instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer
+      ) {
+        return renderLayer.base.computeRoiVertexAttrStats(names);
+      }
+    }
+    throw new Error(
+      "This layer's geometry is not ready yet — wait for it to load.",
     );
   }
 
@@ -2680,8 +2984,8 @@ export class SegmentationUserLayer extends Base {
     let spatialSkeletonGridSizes: SpatialSkeletonGridSize[] | undefined;
     let spatialSkeletonLevelCostsBytes: number[] | undefined;
     let spatialSkeletonLevelObjectCounts: (number | undefined)[] | undefined;
+    let spatialSkeletonLevelCellCounts: number[] | undefined;
     let spatialSkeletonBudgetBytes: number | undefined;
-    let spatialSkeletonBytesPerStreamline: number | undefined;
     // A datasource-preferred default shader, and whether any subsource would be
     // One entry per skeleton subsource: the shader it nominates as the layer
     // default, or `undefined` for no opinion. Resolved after the loop, once
@@ -2689,8 +2993,19 @@ export class SegmentationUserLayer extends Base {
     const skeletonShaderCandidates: (string | undefined)[] = [];
     for (const loadedSubsource of subsources) {
       if (this.addStaticAnnotations(loadedSubsource)) continue;
-      const { volume, mesh, segmentPropertyMap, segmentationGraph, local } =
-        loadedSubsource.subsourceEntry.subsource;
+      const {
+        volume,
+        mesh,
+        zarrVectors,
+        segmentPropertyMap,
+        segmentationGraph,
+        local,
+      } = loadedSubsource.subsourceEntry.subsource;
+      // The two slots are distinct in the data model -- a zarr-vectors store is
+      // not a `MeshSource` -- but they resolve to the same render layers here,
+      // chosen by source class below. Binding them together keeps one activation
+      // path rather than two copies that would drift apart.
+      const geometry = mesh ?? zarrVectors;
       if (volume instanceof MultiscaleVolumeChunkSource) {
         switch (volume.dataType) {
           case DataType.FLOAT32:
@@ -2713,8 +3028,8 @@ export class SegmentationUserLayer extends Base {
             ),
           this.displayState.segmentationGroupState.value,
         );
-      } else if (mesh !== undefined) {
-        if (mesh instanceof MultiscaleSpatiallyIndexedSkeletonSource) {
+      } else if (geometry !== undefined) {
+        if (geometry instanceof MultiscaleSpatiallyIndexedSkeletonSource) {
           // Collect grid metadata outside `activate`, since `activate` is a no-op
           // when guard values are unchanged and may skip the callback.
           // Compose the live render-layer transform (reflects any output
@@ -2742,54 +3057,90 @@ export class SegmentationUserLayer extends Base {
             );
           }
           spatialSkeletonGridSizes =
-            mesh.getSpatialSkeletonGridSizes(liveScale);
+            geometry.getSpatialSkeletonGridSizes(liveScale);
           // A source that can estimate what each level costs opts into
           // budget-driven selection; see `setSpatialSkeletonGridSizes`.
           const costs = (
-            mesh as {
+            geometry as {
               getSpatialSkeletonLevelCostsBytes?: () => number[];
             }
           ).getSpatialSkeletonLevelCostsBytes?.();
           if (costs !== undefined) {
             spatialSkeletonLevelCostsBytes = costs;
-            // Only the coarse pass's SHARE of the GPU pool. The two passes draw
-            // from one budget: pass 1 used to size its level against the whole
-            // limit, then the object-keyed pass landed full-resolution tracts in
-            // the same pool, and they evicted each other.
+            // The whole GPU pool. The object-keyed pass draws from the same
+            // one, but it is sized from what the level chosen here LEAVES (see
+            // `refreshSpatialSkeletonObjectFill`), so the two cannot outbid
+            // each other and no share needs reserving up front.
             spatialSkeletonBudgetBytes =
               this.manager.chunkManager.chunkQueueManager.capacities.gpuMemory
-                .sizeLimit.value *
-              (1 - this.displayState.roiFullDetailMemoryShare.value);
+                .sizeLimit.value;
           }
-          // Bytes per full-resolution streamline, which turns the object-keyed
-          // pass's share of the pool into a streamline count. `undefined` when
-          // the store lacks the metadata to say -- the manual budget stands.
-          spatialSkeletonBytesPerStreamline = (
-            mesh as {
-              getFullDetailBytesPerStreamline?: () => number | undefined;
-            }
-          ).getFullDetailBytesPerStreamline?.();
           // Objects per level, when the source can say. Sizes the resolution
           // histogram's bars by how many streamlines each level holds, which is
           // what a user means by "how big is this level".
           spatialSkeletonLevelObjectCounts = (
-            mesh as {
+            geometry as {
               getSpatialSkeletonLevelObjectCounts?: () => (
                 | number
                 | undefined
               )[];
             }
           ).getSpatialSkeletonLevelObjectCounts?.();
-          skeletonShaderCandidates.push(mesh.defaultFragmentMain);
+          // Cells per level, so a whole-level cost becomes a per-cell one.
+          spatialSkeletonLevelCellCounts = (
+            geometry as {
+              getSpatialSkeletonLevelCellCounts?: () => number[];
+            }
+          ).getSpatialSkeletonLevelCellCounts?.();
+          // How this store answers "which whole objects fit in N bytes". Only a
+          // source with per-level object membership can; the rest keep
+          // whole-level selection.
+          const objectSource = geometry as {
+            computeObjectAdmission?: (b: number) => ObjectAdmission | undefined;
+            canBudgetPerObject?: boolean;
+          };
+          // Gate on the source's actual CAPABILITY, not on the method existing:
+          // a store missing per-level object membership has the method but
+          // always answers `undefined`, and installing the closure anyway
+          // suppresses whole-level selection without providing a per-object
+          // replacement. `=== false` so a source that does not declare the
+          // capability at all keeps the previous behaviour.
+          this.displayState.spatialSkeletonComputeAdmission =
+            objectSource.computeObjectAdmission === undefined ||
+            objectSource.canBudgetPerObject === false
+              ? undefined
+              : (budgetBytes: number) =>
+                  objectSource.computeObjectAdmission!(budgetBytes);
+          // ...and where it cannot, object focus stops being the DEFAULT.
+          //
+          // It remains selectable, and doing so gets the half of it that needs
+          // no per-object membership. But defaulting to it is wrong on a
+          // resolution pyramid: sizing "one level everywhere, whole volume
+          // resident" against the whole-level ceiling assumes the layer owns
+          // the GPU budget, and the mesh/point/skeleton stores this applies to
+          // are exactly the ones loaded three-at-a-time over one volume. See
+          // {@link SegmentationUserLayerDisplayState.spatialSkeletonDetailFocusExplicit}.
+          if (
+            this.displayState.spatialSkeletonComputeAdmission === undefined &&
+            !this.displayState.spatialSkeletonDetailFocusExplicit
+          ) {
+            this.displayState.applyDefaultSpatialSkeletonDetailFocus(
+              SpatialSkeletonDetailFocus.LOCAL,
+            );
+          }
+          skeletonShaderCandidates.push(geometry.defaultFragmentMain);
         } else if (
-          mesh !== undefined &&
-          !(mesh instanceof MeshSource || mesh instanceof MultiscaleMeshSource)
+          geometry !== undefined &&
+          !(
+            geometry instanceof MeshSource ||
+            geometry instanceof MultiscaleMeshSource
+          )
         ) {
-          // Anything else in the `mesh` slot that is not a mesh is drawn by the
+          // Anything else in the `geometry` slot that is not a geometry is drawn by the
           // plain `SkeletonLayer` and shares this layer's skeleton shader, so
           // it gets a vote. Meshes have their own shader and are not consulted.
           skeletonShaderCandidates.push(
-            (mesh as { defaultFragmentMain?: string }).defaultFragmentMain,
+            (geometry as { defaultFragmentMain?: string }).defaultFragmentMain,
           );
         }
         loadedSubsource.activate(() => {
@@ -2802,32 +3153,53 @@ export class SegmentationUserLayer extends Base {
           // *before* the spread below copies it into the per-activation display
           // state the render layers receive (which is what lights up the shader).
           if (
-            (mesh as { supportsRoiStreamlineFilter?: boolean })
+            (geometry as { supportsRoiStreamlineFilter?: boolean })
               .supportsRoiStreamlineFilter === true
           ) {
             this.ensureRoiFilterChannel();
             this.addRoiOverlays(loadedSubsource);
+            // What the Filter tab can offer for THIS store: its loaded
+            // per-vertex attribute columns (the only filterable tier a point
+            // cloud has), and whether the tract export applies at all.
+            const filterable = geometry as {
+              vertexAttributeNames?: readonly string[];
+              vertexAttributeDtypes?: readonly string[];
+              supportsTractExport?: boolean;
+              geometryPrimitive?: "points" | "lines" | "triangles";
+            };
+            this.displayState.roiVertexAttributeNames =
+              filterable.vertexAttributeNames;
+            this.displayState.roiVertexAttributeDtypes =
+              filterable.vertexAttributeDtypes;
+            this.displayState.roiSupportsTractExport =
+              filterable.supportsTractExport === true;
+            this.displayState.roiGeometryPrimitive =
+              filterable.geometryPrimitive;
+            this.displayState.computeRoiVertexAttrStats = (names) =>
+              this.computeRoiVertexAttrStats(names);
           }
           const displayState = {
             ...this.displayState,
             transform: loadedSubsource.getRenderLayerTransform(),
             localPosition: this.localPosition,
           };
-          if (mesh instanceof MeshSource) {
+          if (geometry instanceof MeshSource) {
             loadedSubsource.addRenderLayer(
-              new MeshLayer(this.manager.chunkManager, mesh, displayState),
+              new MeshLayer(this.manager.chunkManager, geometry, displayState),
             );
-          } else if (mesh instanceof MultiscaleMeshSource) {
+          } else if (geometry instanceof MultiscaleMeshSource) {
             loadedSubsource.addRenderLayer(
               new MultiscaleMeshLayer(
                 this.manager.chunkManager,
-                mesh,
+                geometry,
                 displayState,
               ),
             );
-          } else if (mesh instanceof MultiscaleSpatiallyIndexedSkeletonSource) {
-            const perspectiveSources = mesh.getPerspectiveSources();
-            const slicePanelSources = mesh.getSliceViewPanelSources();
+          } else if (
+            geometry instanceof MultiscaleSpatiallyIndexedSkeletonSource
+          ) {
+            const perspectiveSources = geometry.getPerspectiveSources();
+            const slicePanelSources = geometry.getSliceViewPanelSources();
             const sharedSpatialSkeletonSources =
               perspectiveSources.length > 0
                 ? perspectiveSources
@@ -2836,7 +3208,7 @@ export class SegmentationUserLayer extends Base {
             // emit several pyramid levels and want camera-driven level
             // switching (e.g. zarr-vectors) opt in here.  CATMAID
             // leaves it false, preserving manual-slider UX.
-            if (mesh.prefersAutoSpatialSkeletonGridLevel) {
+            if (geometry.prefersAutoSpatialSkeletonGridLevel) {
               this.displayState.autoSpatialSkeletonGridLevel3d.value = true;
               this.displayState.autoSpatialSkeletonGridLevel2d.value = true;
             }
@@ -2852,6 +3224,9 @@ export class SegmentationUserLayer extends Base {
                   lod: displayState.skeletonLod,
                   gridLevel2d: displayState.spatialSkeletonGridLevel2d,
                   lod2d: displayState.spatialSkeletonLod2d,
+                  detailFocus: displayState.spatialSkeletonDetailFocus,
+                  admissionFraction:
+                    displayState.spatialSkeletonAdmissionFraction,
                   sources2d: slicePanelSources,
                   selectedNodeId: this.selectedSpatialSkeletonNodeId,
                   pendingNodePositionVersion:
@@ -2880,10 +3255,10 @@ export class SegmentationUserLayer extends Base {
                 base.dispose();
               }
             }
-          } else if (mesh instanceof SpatiallyIndexedSkeletonSource) {
+          } else if (geometry instanceof SpatiallyIndexedSkeletonSource) {
             const base = new SpatiallyIndexedSkeletonLayer(
               this.manager.chunkManager,
-              mesh,
+              geometry,
               displayState,
               {
                 gridLevel: displayState.spatialSkeletonGridLevel3d,
@@ -2921,7 +3296,7 @@ export class SegmentationUserLayer extends Base {
             const highDetail = displayState.roiHighDetailSegments;
             if (
               highDetail !== undefined &&
-              (mesh as { isRoiHighDetailSource?: boolean })
+              (geometry as { isRoiHighDetailSource?: boolean })
                 .isRoiHighDetailSource === true
             ) {
               const realGroupState =
@@ -2942,11 +3317,11 @@ export class SegmentationUserLayer extends Base {
               // TRK path) instead of re-reading the store. Set on the real display
               // state (the one the tab holds), not the spread above.
               this.displayState.roiHighDetailSkeletonSource =
-                mesh as SkeletonSource;
+                geometry as SkeletonSource;
             }
             const base = new SkeletonLayer(
               this.manager.chunkManager,
-              mesh,
+              geometry,
               skeletonDisplayState,
             );
             loadedSubsource.addRenderLayer(
@@ -3042,9 +3417,7 @@ export class SegmentationUserLayer extends Base {
       spatialSkeletonLevelCostsBytes,
       spatialSkeletonBudgetBytes,
       spatialSkeletonLevelObjectCounts,
-    );
-    this.displayState.setFullDetailBytesPerStreamline(
-      spatialSkeletonBytesPerStreamline,
+      spatialSkeletonLevelCellCounts,
     );
     this.displayState.hasVolume.value = hasVolume;
     this.updateSpatialSkeletonChunkLoadState();
@@ -3215,18 +3588,13 @@ export class SegmentationUserLayer extends Base {
     );
     verifyOptionalObjectProperty(
       specification,
-      json_keys.ROI_HIGH_DETAIL_BUDGET_JSON_KEY,
-      (value) => this.displayState.roiHighDetailBudget.restoreState(value),
-    );
-    verifyOptionalObjectProperty(
-      specification,
-      json_keys.ROI_FULL_DETAIL_MEMORY_SHARE_JSON_KEY,
-      (value) => this.displayState.roiFullDetailMemoryShare.restoreState(value),
-    );
-    verifyOptionalObjectProperty(
-      specification,
-      json_keys.AUTO_ROI_HIGH_DETAIL_BUDGET_JSON_KEY,
-      (value) => this.displayState.autoRoiHighDetailBudget.restoreState(value),
+      json_keys.SPATIAL_SKELETON_DETAIL_FOCUS_JSON_KEY,
+      (value) => {
+        this.displayState.spatialSkeletonDetailFocus.restoreState(value);
+        // A focus in the JSON is a choice, and outlives whatever the source
+        // turns out to support.
+        this.displayState.spatialSkeletonDetailFocusExplicit = true;
+      },
     );
     this.displayState.spatialSkeletonGridResolutionTarget2d.restoreState(
       specification[json_keys.SKELETON_CROSS_SECTION_RENDER_SCALE_JSON_KEY],
@@ -3312,12 +3680,8 @@ export class SegmentationUserLayer extends Base {
       this.displayState.roiLabelLayer.toJSON();
     x[json_keys.IGNORE_SKELETON_MEMORY_CEILING_JSON_KEY] =
       this.displayState.ignoreSpatialSkeletonMemoryCeiling.toJSON();
-    x[json_keys.ROI_HIGH_DETAIL_BUDGET_JSON_KEY] =
-      this.displayState.roiHighDetailBudget.toJSON();
-    x[json_keys.ROI_FULL_DETAIL_MEMORY_SHARE_JSON_KEY] =
-      this.displayState.roiFullDetailMemoryShare.toJSON();
-    x[json_keys.AUTO_ROI_HIGH_DETAIL_BUDGET_JSON_KEY] =
-      this.displayState.autoRoiHighDetailBudget.toJSON();
+    x[json_keys.SPATIAL_SKELETON_DETAIL_FOCUS_JSON_KEY] =
+      this.displayState.spatialSkeletonDetailFocus.toJSON();
     x[json_keys.HIDDEN_OPACITY_3D_JSON_KEY] =
       this.displayState.hiddenObjectAlpha.toJSON();
     x[json_keys.SKELETON_CROSS_SECTION_RENDER_SCALE_JSON_KEY] =
@@ -4448,7 +4812,7 @@ registerLayerControls(SegmentationUserLayer);
 registerLayerType(SegmentationUserLayer);
 registerVolumeLayerType(VolumeType.SEGMENTATION, SegmentationUserLayer);
 registerLayerTypeDetector((subsource) => {
-  if (subsource.mesh !== undefined) {
+  if (subsource.mesh !== undefined || subsource.zarrVectors !== undefined) {
     return { layerConstructor: SegmentationUserLayer, priority: 1 };
   }
   return undefined;
