@@ -22,7 +22,7 @@ import {
   listAttrChoices,
   measureObjectAttr,
 } from "#src/datasource/zarr-vectors/attribute_catalog.js";
-import type { VertexAttrStats } from "#src/skeleton/base.js";
+import type { VertexAttrStats } from "#src/skeleton/spatial_base.js";
 
 const stats = (partial: Partial<AttrStats>): AttrStats => ({
   name: "attr",

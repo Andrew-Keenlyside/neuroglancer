@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import {
   forEachSpatialSkeletonVolumeCell,
   MAX_SPATIAL_SKELETON_VOLUME_CELLS,
-} from "#src/skeleton/base.js";
+} from "#src/skeleton/spatial_base.js";
 
 function collect(lower: number[], upper: number[]) {
   const seen: string[] = [];

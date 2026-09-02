@@ -35,7 +35,7 @@ import type {
   RoiAttrFilter,
   RoiAttrScope,
 } from "#src/datasource/zarr-vectors/roi.js";
-import type { VertexAttrStats } from "#src/skeleton/base.js";
+import type { VertexAttrStats } from "#src/skeleton/spatial_base.js";
 import { DataType } from "#src/util/data_type.js";
 import { RefCounted } from "#src/util/disposable.js";
 import { NullarySignal } from "#src/util/signal.js";

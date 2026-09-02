@@ -84,19 +84,17 @@ import type {
   SpatiallyIndexedSkeletonNode,
   SpatialSkeletonSourceState,
 } from "#src/skeleton/api.js";
-import type {
-  VertexAttributeInfo,
-  VertexAttrStats,
-} from "#src/skeleton/base.js";
+import type { VertexAttributeInfo } from "#src/skeleton/base.js";
+import type { VertexAttrStats } from "#src/skeleton/spatial_base.js";
+import { SKELETON_LAYER_RPC_ID } from "#src/skeleton/base.js";
 import {
   forEachSpatialSkeletonVolumeCell,
   SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR,
-  SKELETON_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_VERTEX_ATTR_STATS_RPC_ID,
-} from "#src/skeleton/base.js";
+} from "#src/skeleton/spatial_base.js";
 import {
   buildSpatiallyIndexedSkeletonOverlayGeometry,
   type SpatiallyIndexedSkeletonOverlayGeometry,

@@ -141,7 +141,7 @@ import type {
   SpatiallyIndexedSkeletonNode,
   SpatialSkeletonSourceState,
 } from "#src/skeleton/api.js";
-import type { VertexAttrStats } from "#src/skeleton/base.js";
+import type { VertexAttrStats } from "#src/skeleton/spatial_base.js";
 import { resolveSkeletonDefaultShader } from "#src/skeleton/default_shader.js";
 import {
   PerspectiveViewSkeletonLayer,

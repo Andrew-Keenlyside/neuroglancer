@@ -69,16 +69,16 @@ import {
 } from "#src/segmentation_display_state/base.js";
 import type { SharedWatchableValue } from "#src/shared_watchable_value.js";
 import type { SpatialSkeletonSourceState } from "#src/skeleton/api.js";
+import { SKELETON_LAYER_RPC_ID } from "#src/skeleton/base.js";
 import {
   forEachSpatialSkeletonVolumeCell,
-  SKELETON_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
   SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_VERTEX_ATTR_STATS_RPC_ID,
   SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR,
   type VertexAttrStats,
-} from "#src/skeleton/base.js";
+} from "#src/skeleton/spatial_base.js";
 import {
   freeSkeletonChunkSystemMemory,
   getVertexAttributeBytes,
