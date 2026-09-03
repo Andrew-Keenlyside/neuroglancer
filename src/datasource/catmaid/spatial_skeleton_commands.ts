@@ -66,7 +66,7 @@ import type {
   SpatialSkeletonCommand,
   SpatialSkeletonCommandContext,
 } from "#src/skeleton/command_history.js";
-import type { SpatiallyIndexedSkeletonLayer } from "#src/skeleton/frontend.js";
+import type { SpatiallyIndexedSkeletonLayer } from "#src/skeleton/spatial_frontend.js";
 import {
   findSpatiallyIndexedSkeletonNode,
   getSpatiallyIndexedSkeletonDirectChildren,

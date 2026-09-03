@@ -150,13 +150,15 @@ import {
   type SkeletonSource,
   DEFAULT_FRAGMENT_MAIN,
   SliceViewPanelSkeletonLayer,
+} from "#src/skeleton/frontend.js";
+import {
   PerspectiveViewSpatiallyIndexedSkeletonLayer,
   SliceViewPanelSpatiallyIndexedSkeletonLayer,
   SpatiallyIndexedSkeletonLayer,
   SpatiallyIndexedSkeletonSource,
   MultiscaleSpatiallyIndexedSkeletonSource,
   computeDiagonalModelToGlobalMetersScale,
-} from "#src/skeleton/frontend.js";
+} from "#src/skeleton/spatial_frontend.js";
 import {
   findSpatiallyIndexedSkeletonNode,
   getSpatiallyIndexedSkeletonDirectChildren,

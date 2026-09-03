@@ -61,14 +61,16 @@ import type {
 } from "#src/skeleton/api.js";
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import {
-  MultiscaleSpatiallyIndexedSkeletonSource,
   SkeletonSource,
-  SPATIAL_SKELETON_SOURCE_OPTIONS,
-  SpatiallyIndexedSkeletonSource,
   type GeometryPrimitive,
   type PackedAttributeRange,
-  type SpatiallyIndexedSkeletonChunkSpecification,
 } from "#src/skeleton/frontend.js";
+import {
+  MultiscaleSpatiallyIndexedSkeletonSource,
+  SPATIAL_SKELETON_SOURCE_OPTIONS,
+  SpatiallyIndexedSkeletonSource,
+  type SpatiallyIndexedSkeletonChunkSpecification,
+} from "#src/skeleton/spatial_frontend.js";
 import type { SliceViewSourceOptions } from "#src/sliceview/base.js";
 import { makeSliceViewChunkSpecification } from "#src/sliceview/base.js";
 import { ChunkLayout } from "#src/sliceview/chunk_layout.js";

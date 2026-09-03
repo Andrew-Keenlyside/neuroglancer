@@ -56,12 +56,12 @@ import type {
   SpatiallyIndexedSkeletonNode,
   SpatiallyIndexedSkeletonNodeBase,
 } from "#src/skeleton/api.js";
+import { SkeletonSource } from "#src/skeleton/frontend.js";
 import {
   SpatiallyIndexedSkeletonSource,
-  SkeletonSource,
   MultiscaleSpatiallyIndexedSkeletonSource,
   SPATIAL_SKELETON_SOURCE_OPTIONS,
-} from "#src/skeleton/frontend.js";
+} from "#src/skeleton/spatial_frontend.js";
 import {
   buildSpatialSkeletonGridLevels,
   sortSpatialSkeletonGridSizes,

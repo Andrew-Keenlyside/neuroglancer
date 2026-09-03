@@ -41,7 +41,7 @@ const { SegmentationUserLayer } = await import(
 const {
   PerspectiveViewSpatiallyIndexedSkeletonLayer,
   SliceViewPanelSpatiallyIndexedSkeletonLayer,
-} = await import("#src/skeleton/frontend.js");
+} = await import("#src/skeleton/spatial_frontend.js");
 
 const { SegmentSelectionState } = await import(
   "#src/segmentation_display_state/frontend.js"

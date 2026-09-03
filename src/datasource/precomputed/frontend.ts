@@ -97,10 +97,7 @@ import {
 } from "#src/sliceview/volume/frontend.js";
 import type { TypedNumberArrayConstructor } from "#src/util/array.js";
 import { transposeNestedArrays } from "#src/util/array.js";
-import {
-  packColor,
-  parseRGBColorSpecification,
-} from "#src/util/color.js";
+import { packColor, parseRGBColorSpecification } from "#src/util/color.js";
 import { DATA_TYPE_ARRAY_CONSTRUCTOR, DataType } from "#src/util/data_type.js";
 import { mat4, vec3 } from "#src/util/geom.js";
 import {
