@@ -76,14 +76,10 @@ import {
 import { WithSharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
 import { joinBaseUrlAndPath } from "#src/kvstore/url.js";
 import type { SpatiallyIndexedSkeletonNode } from "#src/skeleton/api.js";
-import type {
-  SkeletonChunk,
-  SpatiallyIndexedSkeletonChunk,
-} from "#src/skeleton/backend.js";
-import {
-  SkeletonSource,
-  SpatiallyIndexedSkeletonSourceBackend,
-} from "#src/skeleton/backend.js";
+import type { SkeletonChunk } from "#src/skeleton/backend.js";
+import type { SpatiallyIndexedSkeletonChunk } from "#src/skeleton/spatial_backend.js";
+import { SkeletonSource } from "#src/skeleton/backend.js";
+import { SpatiallyIndexedSkeletonSourceBackend } from "#src/skeleton/spatial_backend.js";
 import type { ProgressOptions } from "#src/util/progress_listener.js";
 import type { RPC } from "#src/worker_rpc.js";
 import { registerPromiseRPC, registerSharedObject } from "#src/worker_rpc.js";

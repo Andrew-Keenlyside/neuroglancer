@@ -21,13 +21,13 @@ import {
   getSpatiallyIndexedSkeletonRenderPriority,
   selectRoiBackgroundScales,
   SpatiallyIndexedSkeletonChunkRequestOwner,
-} from "#src/skeleton/backend.js";
+} from "#src/skeleton/spatial_backend.js";
 import {
   BASE_PRIORITY,
   SCALE_PRIORITY_MULTIPLIER,
 } from "#src/sliceview/backend.js";
 
-describe("skeleton/backend chunk priority", () => {
+describe("skeleton/spatial_backend chunk priority", () => {
   it("uses the standard chunk-origin distance rule for spatial skeleton chunks", () => {
     expect(
       getSpatiallyIndexedSkeletonChunkPriority(
