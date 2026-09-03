@@ -8,17 +8,11 @@
 /**
  * Canonical zarr-vectors geometry-kind union and per-kind capability
  * table.  Centralises the decisions that were previously scattered
- * through `skeleton_chunk.ts`, `skeleton_shader_bridge.ts`, and
- * `skeleton_frontend.ts` as ad-hoc `geometryKind === "streamline" ||
+ * through `geometry_chunk.ts`, `geometry_shader_bridge.ts`, and
+ * `geometry_frontend.ts` as ad-hoc `geometryKind === "streamline" ||
  * "polyline"` checks.  Adding a new kind (e.g. a future mesh
  * geometry that fits the same chunk layout) is a one-line edit to
  * the {@link KIND_CAPABILITIES} table.
- *
- * Naming note: the type is `ZarrVectorsGeometryKind` despite the
- * `skeleton_*` filenames that surround it.  Those filenames mirror the
- * `SkeletonChunk` data structure they back; the geometry kinds they
- * support are not strictly skeletons (graphs and streamlines also
- * route through the same chunk machinery).
  */
 
 import { COLOR_BY_DIRECTION_SHADER } from "#src/skeleton/default_shader.js";
@@ -34,7 +28,7 @@ import { COLOR_BY_DIRECTION_SHADER } from "#src/skeleton/default_shader.js";
  * Aliases {@link COLOR_BY_DIRECTION_SHADER} (the datasource-neutral canonical
  * string) so the store-nominated default, the Rendering tab's "Direction"
  * preset, and the on-load `backgroundColorBy` sync are all byte-identical —
- * see that constant for why the identity matters.  `skeleton_shader_bridge.ts`
+ * see that constant for why the identity matters.  `geometry_shader_bridge.ts`
  * re-exports for callers that imported it from there before the refactor.
  */
 export const DEFAULT_STREAMLINE_FRAGMENT_MAIN = COLOR_BY_DIRECTION_SHADER;

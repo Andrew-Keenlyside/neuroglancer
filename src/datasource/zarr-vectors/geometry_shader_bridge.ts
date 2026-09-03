@@ -22,7 +22,7 @@
  *   module re-exports it for callers that imported it from here before
  *   the refactor.
  *
- * Lives in its own module (separate from `skeleton_frontend.ts`) so
+ * Lives in its own module (separate from `geometry_frontend.ts`) so
  * unit tests can import it under Node without dragging in WebGL-coupled
  * symbols from `src/skeleton/frontend.ts`.
  */
@@ -33,8 +33,6 @@ import { hasSynthesisedTangent } from "#src/datasource/zarr-vectors/geometry_kin
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import type { PackedAttributeRange } from "#src/skeleton/frontend.js";
 import { DataType } from "#src/util/data_type.js";
-
-export { DEFAULT_STREAMLINE_FRAGMENT_MAIN } from "#src/datasource/zarr-vectors/geometry_kind.js";
 
 /**
  * Build the `Map<name, VertexAttributeInfo>` the skeleton render layer

@@ -183,7 +183,7 @@ export class ZarrVectorsSpatialGeometrySourceParameters {
    * Name of a per-vertex attribute carrying a meaningful integer id per vertex
    * (from the store's `zarr_vectors.vertex_id_attribute`).  Only consulted for
    * kinds without the discrete-object model, where each vertex is its own
-   * segment; see `skeleton_chunk_download.fillPerVertexSegmentIds`.
+   * segment; see `geometry_chunk_download.fillPerVertexSegmentIds`.
    */
   vertexIdAttribute?: string;
   /**

@@ -8,7 +8,7 @@
 /**
  * Chunk-index bounds for a zarr-vectors resolution level.
  *
- * Split out of `skeleton_frontend.ts` so it can be unit-tested under Node
+ * Split out of `geometry_frontend.ts` so it can be unit-tested under Node
  * without the WebGL-coupled render-layer imports.
  */
 

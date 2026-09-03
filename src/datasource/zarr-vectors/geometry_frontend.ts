@@ -8,7 +8,7 @@
 /**
  * Frontend-side chunk source classes for zarr-vectors skeleton /
  * polyline / streamline rendering.  Each one is paired with a backend
- * class in `./skeleton_backend.ts` via a matching ``RPC_ID`` on the
+ * class in `./geometry_backend.ts` via a matching ``RPC_ID`` on the
  * parameter type.
  *
  * - `ZarrVectorsSpatialGeometrySource` — the **pass-1** chunk
@@ -86,10 +86,8 @@ import {
 
 // Re-export for callers (e.g. UI code) that need these without
 // importing the heavy WebGL-coupled symbols from `skeleton/frontend.js`.
-export {
-  DEFAULT_STREAMLINE_FRAGMENT_MAIN,
-  buildVertexAttributeMap,
-} from "#src/datasource/zarr-vectors/geometry_shader_bridge.js";
+export { DEFAULT_STREAMLINE_FRAGMENT_MAIN } from "#src/datasource/zarr-vectors/geometry_kind.js";
+export { buildVertexAttributeMap } from "#src/datasource/zarr-vectors/geometry_shader_bridge.js";
 
 /**
  * One entry in the array shape `SpatiallyIndexedSkeletonSource`
@@ -144,7 +142,7 @@ function zvWebglDataType(dt: DataType): number {
 /**
  * Build the `VertexAttributeRenderInfo[]` shape the existing
  * spatially-indexed skeleton render layer expects.  Mirrors how the
- * backend (`skeleton_backend.ts:ZarrVectorsSpatialGeometrySourceBackend
+ * backend (`geometry_backend.ts:ZarrVectorsSpatialGeometrySourceBackend
  * .download`) packs `chunk.vertexAttributes`: position (implicit, slot
  * 0), then synthesised `tangent` (streamline / polyline only), then
  * user-declared attributes in declaration order.
@@ -245,7 +243,7 @@ export class ZarrVectorsSpatialGeometrySource extends WithParameters(
     // into `chunk.vertexAttributes`: position, then a synthesised tangent
     // (streamline / polyline / graph / skeleton), then user-declared
     // attributes, then a synthesised `"segment"` column last (mirroring
-    // `skeleton_backend.ts:ZarrVectorsSpatialGeometrySourceBackend`).
+    // `geometry_backend.ts:ZarrVectorsSpatialGeometrySourceBackend`).
     this.vertexAttributes = buildZvSpatialVertexAttributes(this.parameters);
   }
 
@@ -718,7 +716,7 @@ export class ZarrVectorsMultiscaleGeometrySource extends MultiscaleSpatiallyInde
    * an affordable one.
    *
    * Counts what the backend actually packs per vertex (see `download()` in
-   * `skeleton_backend.ts`): positions, the synthesised tangent where the
+   * `geometry_backend.ts`): positions, the synthesised tangent where the
    * geometry kind has one, each declared 1-component attribute, and the
    * synthesised uint64 segment column. Edges are implicit `i -> i+1` for a
    * streamline, so there is ~1 edge per vertex, each a `uvec2` index pair.

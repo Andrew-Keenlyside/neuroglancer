@@ -1539,7 +1539,7 @@ async function buildAnnotationMetadata(
   // `makeSliceViewChunkSpecification` derives `lower/upperChunkBound`
   // from `lower/upperVoxelBound`.
   //
-  // Matches `getSliceViewSources` in `skeleton_frontend.ts` (also
+  // Matches `getSliceViewSources` in `geometry_frontend.ts` (also
   // identity) — the two paths agree about the chunk-coord convention.
   const chunkToMultiscaleTransform = matrix.createIdentity(
     Float32Array,
@@ -1720,7 +1720,7 @@ interface GeometryMetadata {
      * keeps the same `chunk_shape` at every level and drops whole objects
      * instead, so chunk size — the framework's usual proxy for detail —
      * cannot tell the levels apart. Object count can. See
-     * `getSpatialSkeletonGridSizes` in `skeleton_frontend.ts`.
+     * `getSpatialSkeletonGridSizes` in `geometry_frontend.ts`.
      */
     perLevelObjectCount: (number | undefined)[];
     /**

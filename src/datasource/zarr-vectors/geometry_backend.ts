@@ -1185,7 +1185,7 @@ export class ZarrVectorsObjectKeyedGeometrySourceBackend extends WithParameters(
    * manifest order (`deriveImplicitSequentialCrossChunkEdges`) and never
    * reads this table at all (its `vi` fields are literal `0`
    * placeholders for that convention — see the comment at
-   * `skeleton_segment_download.ts`'s call site), so fetching it
+   * `geometry_segment_download.ts`'s call site), so fetching it
    * unconditionally was pure waste: a real dataset's whole-level
    * decode can be tens of millions of records / multiple gigabytes
    * (the same issue fixed for the spatially-indexed pass-1 backend via

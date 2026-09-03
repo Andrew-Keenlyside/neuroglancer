@@ -26,7 +26,7 @@
  *
  * The output contract ({@link CrossChunkLinksTable} of records with
  * `{chunkCoords, vertexIndex}` endpoints) is unchanged, so the render path
- * (`skeleton_backend.ts` `buildBridgeRequests` / ghost-vertex insertion) is
+ * (`geometry_backend.ts` `buildBridgeRequests` / ghost-vertex insertion) is
  * untouched. `endpoint[0]` is the record's source (predecessor); `endpoint[1]`
  * is `source + offset` (successor).
  *

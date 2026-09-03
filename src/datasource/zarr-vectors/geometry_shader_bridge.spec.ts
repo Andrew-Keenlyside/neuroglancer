@@ -6,8 +6,8 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { DEFAULT_STREAMLINE_FRAGMENT_MAIN } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import {
-  DEFAULT_STREAMLINE_FRAGMENT_MAIN,
   buildVertexAttributeMap,
   zvPackedAttributeRange,
 } from "#src/datasource/zarr-vectors/geometry_shader_bridge.js";
@@ -119,7 +119,7 @@ describe("buildVertexAttributeMap — `prop_<name>()` shader bridge", () => {
   });
 
   it("ordering matches the backend's chunk.vertexAttributes packing convention", () => {
-    // The backend (skeleton_backend.ts) packs:
+    // The backend (geometry_backend.ts) packs:
     //   [tangent? , user_attr_0, user_attr_1, ...]
     // The frontend map produces:
     //   [tangent? , user_attr_0, user_attr_1, ...]
