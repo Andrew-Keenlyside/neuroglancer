@@ -16,20 +16,6 @@
 
 import "#src/layer/segmentation/style.css";
 import "#src/layer/segmentation/spatial_skeleton.css";
-import { registerSpatialSkeletonTabs } from "#src/layer/segmentation/spatial_skeleton_tabs.js";
-import {
-  buildObjectAttrColumns,
-  buildRoiGroupConfigs,
-  rebuildRoiAnnotations,
-  ROI_OVERLAY_SHADER,
-  ROI_OVERLAY_SHADER_HIDE_2D,
-  warnOnceAdmissionUnavailable,
-} from "#src/layer/segmentation/roi_channel.js";
-import {
-  findClosestSpatialSkeletonGridLevelBySpacing,
-  getSpatialSkeletonGridHistogramConfig,
-} from "#src/layer/segmentation/spatial_skeleton_grid.js";
-import { displaySpatialSkeletonSelection } from "#src/layer/segmentation/spatial_skeleton_selection.js";
 
 import type {
   AnnotationPropertySpec,
@@ -72,11 +58,25 @@ import { layerDataSourceSpecificationFromJson } from "#src/layer/layer_data_sour
 import * as json_keys from "#src/layer/segmentation/json_keys.js";
 import { registerLayerControls } from "#src/layer/segmentation/layer_controls.js";
 import {
+  buildObjectAttrColumns,
+  buildRoiGroupConfigs,
+  rebuildRoiAnnotations,
+  ROI_OVERLAY_SHADER,
+  ROI_OVERLAY_SHADER_HIDE_2D,
+  warnOnceAdmissionUnavailable,
+} from "#src/layer/segmentation/roi_channel.js";
+import {
   getNodeIdFromLayerSelectionState,
   getSegmentIdFromLayerSelectionValue,
   SpatialSkeletonHoverState,
 } from "#src/layer/segmentation/selection.js";
 import { executeSpatialSkeletonReroot } from "#src/layer/segmentation/spatial_skeleton_commands.js";
+import {
+  findClosestSpatialSkeletonGridLevelBySpacing,
+  getSpatialSkeletonGridHistogramConfig,
+} from "#src/layer/segmentation/spatial_skeleton_grid.js";
+import { displaySpatialSkeletonSelection } from "#src/layer/segmentation/spatial_skeleton_selection.js";
+import { registerSpatialSkeletonTabs } from "#src/layer/segmentation/spatial_skeleton_tabs.js";
 import {
   MeshLayer,
   MeshSource,
@@ -133,7 +133,6 @@ import type {
   SpatiallyIndexedSkeletonNode,
   SpatialSkeletonSourceState,
 } from "#src/skeleton/api.js";
-import type { VertexAttrStats } from "#src/skeleton/spatial_base.js";
 import { resolveSkeletonDefaultShader } from "#src/skeleton/default_shader.js";
 import {
   PerspectiveViewSkeletonLayer,
@@ -144,19 +143,12 @@ import {
   SliceViewPanelSkeletonLayer,
 } from "#src/skeleton/frontend.js";
 import {
-  PerspectiveViewSpatiallyIndexedSkeletonLayer,
-  SliceViewPanelSpatiallyIndexedSkeletonLayer,
-  SpatiallyIndexedSkeletonLayer,
-  SpatiallyIndexedSkeletonSource,
-  MultiscaleSpatiallyIndexedSkeletonSource,
-  computeDiagonalModelToGlobalMetersScale,
-} from "#src/skeleton/spatial_frontend.js";
-import {
   findSpatiallyIndexedSkeletonNode,
   getSpatiallyIndexedSkeletonDirectChildren,
   getSpatiallyIndexedSkeletonNodeParent,
 } from "#src/skeleton/node_traversal.js";
 import { SpatialSkeletonNodeFilterType } from "#src/skeleton/node_types.js";
+import type { VertexAttrStats } from "#src/skeleton/spatial_base.js";
 import {
   buildSpatialSkeletonGridLevels,
   selectSpatialSkeletonGridLevelByBudget,
@@ -164,6 +156,14 @@ import {
   type SpatialSkeletonGridLevel,
   type SpatialSkeletonGridSize,
 } from "#src/skeleton/spatial_chunk_sizing.js";
+import {
+  PerspectiveViewSpatiallyIndexedSkeletonLayer,
+  SliceViewPanelSpatiallyIndexedSkeletonLayer,
+  SpatiallyIndexedSkeletonLayer,
+  SpatiallyIndexedSkeletonSource,
+  MultiscaleSpatiallyIndexedSkeletonSource,
+  computeDiagonalModelToGlobalMetersScale,
+} from "#src/skeleton/spatial_frontend.js";
 import {
   editableSpatiallyIndexedSkeletonSourceSupportsAction,
   getEditableSpatiallyIndexedSkeletonSource,
@@ -212,7 +212,8 @@ import {
 } from "#src/util/color.js";
 import type { Borrowed, Owned } from "#src/util/disposable.js";
 import { RefCounted } from "#src/util/disposable.js";
-import { vec3, vec4 } from "#src/util/geom.js";
+import type { vec4 } from "#src/util/geom.js";
+import { vec3 } from "#src/util/geom.js";
 import {
   parseArray,
   parseUint64,

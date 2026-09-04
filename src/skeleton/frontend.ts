@@ -23,16 +23,6 @@ import type {
   RoiLabelField,
   RoiObjectAttrColumn,
 } from "#src/datasource/zarr-vectors/roi.js";
-import type {
-  PackedAttributeInterp,
-  PackedAttributeRange,
-} from "#src/skeleton/packed_attributes.js";
-import {
-  PACKED_ATTRIBUTE_STRIDE_UNIFORM,
-  packedAttributeAccessorCode,
-  packedAttributePropExpr,
-  packedAttributeVaryings,
-} from "#src/skeleton/packed_attributes.js";
 
 import type { HashMapUint64, HashSetUint64 } from "#src/gpu_hash/hash_table.js";
 import { GPUHashTable, HashSetShaderManager } from "#src/gpu_hash/shader.js";
@@ -68,10 +58,20 @@ import {
 } from "#src/segmentation_display_state/frontend.js";
 
 import type { SpatialSkeletonSourceState } from "#src/skeleton/api.js";
-import type { SpatiallyIndexedSkeletonChunk } from "#src/skeleton/spatial_frontend.js";
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 
 import { SKELETON_LAYER_RPC_ID } from "#src/skeleton/base.js";
+import type {
+  PackedAttributeInterp,
+  PackedAttributeRange,
+} from "#src/skeleton/packed_attributes.js";
+import {
+  PACKED_ATTRIBUTE_STRIDE_UNIFORM,
+  packedAttributeAccessorCode,
+  packedAttributePropExpr,
+  packedAttributeVaryings,
+} from "#src/skeleton/packed_attributes.js";
+import type { SpatiallyIndexedSkeletonChunk } from "#src/skeleton/spatial_frontend.js";
 import type { ChunkLayout } from "#src/sliceview/chunk_layout.js";
 
 import type { SliceViewPanel } from "#src/sliceview/panel.js";

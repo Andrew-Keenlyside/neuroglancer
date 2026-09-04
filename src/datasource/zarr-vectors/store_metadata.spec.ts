@@ -6,6 +6,8 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { parseAnnotationPropertyId } from "#src/annotation/index.js";
+import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 import {
   computeChunkIndexBounds,
   formatAttributesFragment,
@@ -16,8 +18,6 @@ import {
   savedDocumentFor,
   toAnnotationPropertyId,
 } from "#src/datasource/zarr-vectors/store_metadata.js";
-import { parseAnnotationPropertyId } from "#src/annotation/index.js";
-import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 
 // ---------------------------------------------------------------- chunk_bounds
 

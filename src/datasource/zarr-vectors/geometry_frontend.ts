@@ -38,7 +38,6 @@ import {
   type ZarrVectorsGeometryKind,
 } from "#src/datasource/zarr-vectors/base.js";
 import { ZARR_VECTORS_GET_OBJECT_NODES_RPC_ID } from "#src/datasource/zarr-vectors/base.js";
-import { computeChunkIndexBounds } from "#src/datasource/zarr-vectors/store_metadata.js";
 import {
   KIND_CAPABILITIES,
   hasSynthesisedTangent,
@@ -48,10 +47,10 @@ import {
   zvPackedAttributeRange,
 } from "#src/datasource/zarr-vectors/geometry_shader_bridge.js";
 import type { ObjectAdmission } from "#src/datasource/zarr-vectors/object_budget.js";
-import { admissionForBudget } from "#src/datasource/zarr-vectors/object_budget.js";
-import { computePyramidDensityScales } from "#src/datasource/zarr-vectors/object_budget.js";
+import { admissionForBudget , computePyramidDensityScales } from "#src/datasource/zarr-vectors/object_budget.js";
 import type { ZarrVectorsEditTarget } from "#src/datasource/zarr-vectors/spatial_skeleton_edit.js";
 import { makeZarrVectorsEditCommands } from "#src/datasource/zarr-vectors/spatial_skeleton_edit.js";
+import { computeChunkIndexBounds } from "#src/datasource/zarr-vectors/store_metadata.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
 import type { SharedKvStoreContext } from "#src/kvstore/frontend.js";
 import type {

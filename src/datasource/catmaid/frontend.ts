@@ -58,16 +58,16 @@ import type {
 } from "#src/skeleton/api.js";
 import { SkeletonSource } from "#src/skeleton/frontend.js";
 import {
-  SpatiallyIndexedSkeletonSource,
-  MultiscaleSpatiallyIndexedSkeletonSource,
-  SPATIAL_SKELETON_SOURCE_OPTIONS,
-} from "#src/skeleton/spatial_frontend.js";
-import {
   buildSpatialSkeletonGridLevels,
   sortSpatialSkeletonGridSizes,
   type SpatialSkeletonGridLevel,
   type SpatialSkeletonGridSize,
 } from "#src/skeleton/spatial_chunk_sizing.js";
+import {
+  SpatiallyIndexedSkeletonSource,
+  MultiscaleSpatiallyIndexedSkeletonSource,
+  SPATIAL_SKELETON_SOURCE_OPTIONS,
+} from "#src/skeleton/spatial_frontend.js";
 import type { SliceViewSourceOptions } from "#src/sliceview/base.js";
 import { makeSliceViewChunkSpecification } from "#src/sliceview/base.js";
 import { ChunkLayout } from "#src/sliceview/chunk_layout.js";

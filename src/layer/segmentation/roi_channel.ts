@@ -26,17 +26,17 @@
 import "#src/layer/segmentation/style.css";
 import "#src/layer/segmentation/spatial_skeleton.css";
 
-import type { Annotation, AnnotationReference } from "#src/annotation/index.js";
+import type { Annotation, AnnotationReference ,
+  LocalAnnotationSource} from "#src/annotation/index.js";
 import {
-  AnnotationType,
-  LocalAnnotationSource,
+  AnnotationType
 } from "#src/annotation/index.js";
 
 import type {
   RoiGroupConfig,
   RoiObjectAttrColumn,
 } from "#src/datasource/zarr-vectors/roi.js";
-import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
+import type { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
 
 import type { PreprocessedSegmentPropertyMap } from "#src/segmentation_display_state/property_map.js";
 

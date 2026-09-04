@@ -33,6 +33,7 @@ import svg_origin from "ikonate/icons/origin.svg?raw";
 import svg_share_android from "ikonate/icons/share-android.svg?raw";
 import { debounce } from "lodash-es";
 
+import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
 import {
   getNodeIdFromLayerSelectionState,
   getSegmentIdFromLayerSelectionValue,
@@ -69,7 +70,6 @@ import { makeDeleteButton } from "#src/widget/delete_button.js";
 import type { DependentViewContext } from "#src/widget/dependent_view_widget.js";
 import { makeIcon } from "#src/widget/icon.js";
 
-import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
 
 const SPATIAL_SKELETON_NODE_TYPE_ICONS: Record<
   SpatialSkeletonDisplayNodeType,

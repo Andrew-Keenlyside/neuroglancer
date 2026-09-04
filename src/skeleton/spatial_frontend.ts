@@ -33,7 +33,6 @@ import { ChunkState, LayerChunkProgressInfo } from "#src/chunk_manager/base.js";
 import type { ChunkManager } from "#src/chunk_manager/frontend.js";
 import { ChunkRenderLayerFrontend } from "#src/chunk_manager/frontend.js";
 import type { RoiGroupConfig } from "#src/datasource/zarr-vectors/roi.js";
-import type { PackedAttributeRange } from "#src/skeleton/packed_attributes.js";
 import { hashCombine } from "#src/gpu_hash/hash_function.js";
 import type { HashSetUint64 } from "#src/gpu_hash/hash_table.js";
 import { GPUHashTable } from "#src/gpu_hash/shader.js";
@@ -62,24 +61,45 @@ import type {
 } from "#src/renderlayer.js";
 import { update3dRenderLayerAttachment } from "#src/renderlayer.js";
 import { getVisibleSegments } from "#src/segmentation_display_state/base.js";
-
 import { registerRedrawWhenSegmentationDisplayState3DChanged } from "#src/segmentation_display_state/frontend.js";
 import { SharedWatchableValue } from "#src/shared_watchable_value.js";
 import type {
   SpatiallyIndexedSkeletonNode,
   SpatialSkeletonSourceState,
 } from "#src/skeleton/api.js";
-
-import type { VertexAttrStats } from "#src/skeleton/spatial_base.js";
-
+import type {
+  GeometryPrimitive,
+  PackedSkeletonGeometry,
+  SkeletonChunkBase,
+  SkeletonGPUGeometry,
+  SkeletonLayerDisplayState,
+  SkeletonShaderContext,
+  SkeletonShaderParameters,
+  SpatiallyIndexedSkeletonPickData,
+  VertexAttributeRenderInfo,
+  ViewSpecificSkeletonRenderingOptions,
+  VisibleChunk} from "#src/skeleton/frontend.js";
 import {
-  forEachSpatialSkeletonVolumeCell,
-  SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR,
-  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
-  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
-  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
-  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_VERTEX_ATTR_STATS_RPC_ID,
-} from "#src/skeleton/spatial_base.js";
+  ChunkWireframeHelper,
+  DEBUG_SPATIAL_SKELETON_CHUNKS,
+  DEFAULT_FRAGMENT_MAIN,
+  OVERLAY_SELECTED_FLOAT_ONE,
+  OVERLAY_SELECTED_FLOAT_ZERO,
+  RenderHelper,
+  SkeletonRenderMode,
+  freeSkeletonChunkGPUMemory,
+  getSkeletonNodeDiameter,
+  segmentAttribute,
+  selectedNodeAttribute,
+  setMouseStatePositionFromSpatialSkeletonNode,
+  tempChunkKeyToColorMap,
+  tempMat4,
+  uploadSkeletonChunkToGPU,
+  vertexPositionAttribute,
+} from "#src/skeleton/frontend.js";
+import type { PackedAttributeRange } from "#src/skeleton/packed_attributes.js";
+
+
 import {
   buildSpatiallyIndexedSkeletonOverlayGeometry,
   type SpatiallyIndexedSkeletonOverlayGeometry,
@@ -97,6 +117,16 @@ import {
   selectSpatiallyIndexedSkeletonEntriesForViewWithFallback,
   type SpatiallyIndexedSkeletonView,
 } from "#src/skeleton/source_selection.js";
+import type { VertexAttrStats } from "#src/skeleton/spatial_base.js";
+
+import {
+  forEachSpatialSkeletonVolumeCell,
+  SPATIAL_SKELETON_CHUNK_KEY_TERMINATOR,
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_ROI_EXPORT_IDS_RPC_ID,
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_RPC_ID,
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
+  SPATIALLY_INDEXED_SKELETON_RENDER_LAYER_VERTEX_ATTR_STATS_RPC_ID,
+} from "#src/skeleton/spatial_base.js";
 import {
   SpatialSkeletonDetailFocus,
   targetSpacingForCellBudget,
@@ -160,35 +190,6 @@ import {
   updateOneDimensionalTextureElement,
 } from "#src/webgl/texture_access.js";
 import type { RPC } from "#src/worker_rpc.js";
-import {
-  ChunkWireframeHelper,
-  DEBUG_SPATIAL_SKELETON_CHUNKS,
-  DEFAULT_FRAGMENT_MAIN,
-  GeometryPrimitive,
-  OVERLAY_SELECTED_FLOAT_ONE,
-  OVERLAY_SELECTED_FLOAT_ZERO,
-  PackedSkeletonGeometry,
-  RenderHelper,
-  SkeletonChunkBase,
-  SkeletonGPUGeometry,
-  SkeletonLayerDisplayState,
-  SkeletonRenderMode,
-  SkeletonShaderContext,
-  SkeletonShaderParameters,
-  SpatiallyIndexedSkeletonPickData,
-  VertexAttributeRenderInfo,
-  ViewSpecificSkeletonRenderingOptions,
-  VisibleChunk,
-  freeSkeletonChunkGPUMemory,
-  getSkeletonNodeDiameter,
-  segmentAttribute,
-  selectedNodeAttribute,
-  setMouseStatePositionFromSpatialSkeletonNode,
-  tempChunkKeyToColorMap,
-  tempMat4,
-  uploadSkeletonChunkToGPU,
-  vertexPositionAttribute,
-} from "#src/skeleton/frontend.js";
 
 export class SpatiallyIndexedSkeletonChunk
   extends SliceViewChunk

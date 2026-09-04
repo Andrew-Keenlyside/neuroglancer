@@ -32,6 +32,7 @@ import { StreamlineFilterTab } from "#src/datasource/zarr-vectors/streamline_fil
 import { StreamlineGuideTab } from "#src/datasource/zarr-vectors/streamline_guide_tab.js";
 import { TractExportTab } from "#src/datasource/zarr-vectors/tract_export_tab.js";
 
+import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
 import {
   PerspectiveViewSpatiallyIndexedSkeletonLayer,
   SliceViewPanelSpatiallyIndexedSkeletonLayer,
@@ -43,7 +44,6 @@ import { makeCachedLazyDerivedWatchableValue } from "#src/trackable_value.js";
 
 import { SpatialSkeletonEditTab } from "#src/ui/spatial_skeleton_edit_tab.js";
 
-import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
 
 export function registerSpatialSkeletonTabs(layer: SegmentationUserLayer) {
   const hideSpatialSkeletonEditTab = layer.registerDisposer(

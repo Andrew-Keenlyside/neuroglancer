@@ -4,6 +4,10 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  */
+
+import { describe, expect, it } from "vitest";
+import { FragmentIndex } from "#src/datasource/zarr-vectors/fragment_index.js";
+import type { SkeletonChunk } from "#src/datasource/zarr-vectors/geometry_chunk.js";
 import {
   admissionForBudget,
   ADMIT_ALL,
@@ -16,10 +20,6 @@ import {
   objectDepths,
   objectRank,
 } from "#src/datasource/zarr-vectors/object_budget.js";
-
-import { describe, expect, it } from "vitest";
-import { FragmentIndex } from "#src/datasource/zarr-vectors/fragment_index.js";
-import type { SkeletonChunk } from "#src/datasource/zarr-vectors/geometry_chunk.js";
 
 // ---------------------------------------------------------------- pyramid_objects
 

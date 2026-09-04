@@ -40,10 +40,6 @@ import {
   type KvStoreBasedDataSourceProvider,
 } from "#src/datasource/index.js";
 import { resolveAttributeSelection } from "#src/datasource/zarr-vectors/attribute_budget.js";
-import {
-  formatAttributesFragment,
-  parseAttributesFragment,
-} from "#src/datasource/zarr-vectors/store_metadata.js";
 import type {
   ZarrVectorsAttributeDtype,
   ZarrVectorsPyramidMode,
@@ -54,7 +50,6 @@ import {
   ZarrVectorsObjectKeyedGeometrySourceParameters,
   ZarrVectorsSpatialGeometrySourceParameters,
 } from "#src/datasource/zarr-vectors/base.js";
-import { resolveDeclaredGeometry } from "#src/datasource/zarr-vectors/store_metadata.js";
 import {
   ZarrVectorsMultiscaleGeometrySource,
   ZarrVectorsObjectKeyedGeometrySource,
@@ -62,17 +57,25 @@ import {
 import type { ZarrVectorsGeometryKind } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import { KIND_CAPABILITIES } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import {
+  OBJECT_ATTR_DTYPE_TABLE,
+  reinterpretObjectAttributeBytes,
+  reinterpretWideToBigUint64,
+  reinterpretWideToFloat32,
+} from "#src/datasource/zarr-vectors/object_attribute_bytes.js";
+import {
   levelsAreNested,
   objectDepths as computeObjectDepths,
-} from "#src/datasource/zarr-vectors/object_budget.js";
+ computePerLevelObjectCount } from "#src/datasource/zarr-vectors/object_budget.js";
 import type { ObjectGroupMembership } from "#src/datasource/zarr-vectors/object_groups.js";
 import {
   buildObjectGroupMembership,
   groupSegmentProperties,
   parseGroupCount,
 } from "#src/datasource/zarr-vectors/object_groups.js";
-import { toAnnotationPropertyId } from "#src/datasource/zarr-vectors/store_metadata.js";
-import { computePerLevelObjectCount } from "#src/datasource/zarr-vectors/object_budget.js";
+import {
+  formatAttributesFragment,
+  parseAttributesFragment,
+ resolveDeclaredGeometry , toAnnotationPropertyId } from "#src/datasource/zarr-vectors/store_metadata.js";
 import { decodeVlenBytesChunk } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import type { AutoDetectRegistry } from "#src/kvstore/auto_detect.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
@@ -94,12 +97,6 @@ import {
 } from "#src/segmentation_display_state/property_map.js";
 import { makeSliceViewChunkSpecification } from "#src/sliceview/base.js";
 import { DataType } from "#src/util/data_type.js";
-import {
-  OBJECT_ATTR_DTYPE_TABLE,
-  reinterpretObjectAttributeBytes,
-  reinterpretWideToBigUint64,
-  reinterpretWideToFloat32,
-} from "#src/datasource/zarr-vectors/object_attribute_bytes.js";
 import * as matrix from "#src/util/matrix.js";
 import type { ProgressOptions } from "#src/util/progress_listener.js";
 import { ProgressSpan } from "#src/util/progress_listener.js";
