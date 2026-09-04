@@ -16,17 +16,25 @@
 
 import "#src/layer/segmentation/style.css";
 import "#src/layer/segmentation/spatial_skeleton.css";
+import {
+  buildObjectAttrColumns,
+  buildRoiGroupConfigs,
+  rebuildRoiAnnotations,
+  ROI_OVERLAY_SHADER,
+  ROI_OVERLAY_SHADER_HIDE_2D,
+  warnOnceAdmissionUnavailable,
+} from "#src/layer/segmentation/roi_channel.js";
+import {
+  findClosestSpatialSkeletonGridLevelBySpacing,
+  getSpatialSkeletonGridHistogramConfig,
+} from "#src/layer/segmentation/spatial_skeleton_grid.js";
 import { displaySpatialSkeletonSelection } from "#src/layer/segmentation/spatial_skeleton_selection.js";
 
 import type {
-  Annotation,
   AnnotationPropertySpec,
   AnnotationReference,
 } from "#src/annotation/index.js";
-import {
-  AnnotationType,
-  LocalAnnotationSource,
-} from "#src/annotation/index.js";
+import { LocalAnnotationSource } from "#src/annotation/index.js";
 import type { CoordinateTransformSpecification } from "#src/coordinate_transform.js";
 import { emptyValidCoordinateSpace } from "#src/coordinate_transform.js";
 import type { DataSourceSpecification } from "#src/datasource/index.js";
@@ -79,9 +87,6 @@ import {
 import { getRenderLayerTransform } from "#src/render_coordinate_transform.js";
 import {
   RenderScaleHistogram,
-  numRenderScaleHistogramBins,
-  renderScaleHistogramBinSize,
-  renderScaleHistogramOrigin,
   trackableRenderScaleTarget,
 } from "#src/render_scale_statistics.js";
 import { RenderLayerRole } from "#src/renderlayer.js";
@@ -155,7 +160,6 @@ import {
 import { SpatialSkeletonNodeFilterType } from "#src/skeleton/node_types.js";
 import {
   buildSpatialSkeletonGridLevels,
-  getSpatialSkeletonGridSpacing,
   selectSpatialSkeletonGridLevelByBudget,
   SpatialSkeletonDetailFocus,
   type SpatialSkeletonGridLevel,
@@ -504,235 +508,6 @@ class LinkedSegmentationGroupState<
     super();
     this.value;
   }
-}
-
-function findClosestSpatialSkeletonGridLevelBySpacing(
-  levels: SpatialSkeletonGridLevel[],
-  spacing: number,
-): number {
-  let bestIndex = 0;
-  let bestDistance = Number.POSITIVE_INFINITY;
-  for (let i = 0; i < levels.length; ++i) {
-    const gridSpacing = getSpatialSkeletonGridSpacing(levels[i].size);
-    const distance = Math.abs(gridSpacing - spacing);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestIndex = i;
-    }
-  }
-  return bestIndex;
-}
-
-function getSpatialSkeletonGridHistogramConfig(
-  levels: SpatialSkeletonGridLevel[],
-) {
-  if (levels.length === 0) {
-    return {
-      origin: renderScaleHistogramOrigin,
-      binSize: renderScaleHistogramBinSize,
-    };
-  }
-  const logSpacings: number[] = [];
-  let minLogSpacing = Number.POSITIVE_INFINITY;
-  let maxLogSpacing = Number.NEGATIVE_INFINITY;
-  for (const level of levels) {
-    const spacing = Math.max(getSpatialSkeletonGridSpacing(level.size), 1e-6);
-    const logSpacing = Math.log2(spacing);
-    logSpacings.push(logSpacing);
-    minLogSpacing = Math.min(minLogSpacing, logSpacing);
-    maxLogSpacing = Math.max(maxLogSpacing, logSpacing);
-  }
-  if (!Number.isFinite(minLogSpacing) || !Number.isFinite(maxLogSpacing)) {
-    return {
-      origin: renderScaleHistogramOrigin,
-      binSize: renderScaleHistogramBinSize,
-    };
-  }
-  logSpacings.sort((a, b) => a - b);
-  let minDelta = Number.POSITIVE_INFINITY;
-  for (let i = 1; i < logSpacings.length; ++i) {
-    const delta = logSpacings[i] - logSpacings[i - 1];
-    if (delta > 0) minDelta = Math.min(minDelta, delta);
-  }
-  const span = maxLogSpacing - minLogSpacing;
-  // Choose a bin size that spreads the levels across (most of) the widget
-  // width.  Reserve a few bins of padding on each side so the extreme
-  // levels aren't flush against the edges.  A single level (span 0) has no
-  // meaningful spread — fall back to the default bin size.
-  const coverageBinSize =
-    span > 0
-      ? span / Math.max(numRenderScaleHistogramBins - 4, 1)
-      : renderScaleHistogramBinSize;
-  // Never use a bin so large that two adjacent levels (minDelta apart in
-  // log space) collapse into the same bin — that would merge distinct
-  // scales into one bar.  When the coverage bin size already keeps them
-  // distinct (the common case: few, well-separated pyramid levels), the
-  // coverage value wins and the bars fan out across the full axis instead
-  // of bunching into a narrow cluster in the middle.
-  const maxBinSizeForDistinctBars = Number.isFinite(minDelta)
-    ? minDelta * 0.9
-    : Number.POSITIVE_INFINITY;
-  let binSize = Math.max(
-    0.05,
-    Math.min(coverageBinSize, maxBinSizeForDistinctBars),
-  );
-  if (!Number.isFinite(binSize) || binSize <= 0) {
-    binSize = renderScaleHistogramBinSize;
-  }
-
-  const range = numRenderScaleHistogramBins * binSize;
-  const desiredPadding = binSize * 2;
-  const minOrigin = maxLogSpacing + desiredPadding - range;
-  const maxOrigin = minLogSpacing - desiredPadding;
-  const centeredOrigin = (minLogSpacing + maxLogSpacing - range) / 2;
-  const clampedOrigin = Math.min(
-    Math.max(centeredOrigin, minOrigin),
-    maxOrigin,
-  );
-  const roundedBinSize = Math.max(binSize, 1e-3);
-  const roundedOrigin =
-    Math.round(clampedOrigin / roundedBinSize) * roundedBinSize;
-  return { origin: roundedOrigin, binSize: roundedBinSize };
-}
-
-/**
- * Flatten the persisted ROI groups into the plain, structured-clone-safe form
- * the worker consumes: each group's ROI list, its colour packed to an int, and
- * its visibility. The worker unions the visible groups' passing tracts (ghost
- * shader) and attributes each passing tract the colour of its group.
- */
-function buildRoiGroupConfigs(roiFilter: RoiFilterState): RoiGroupConfig[] {
-  // Include the live label-selection preview (if any) so a staged, not-yet-
-  // committed selection ghosts/colours streamlines exactly like a real group.
-  return roiFilter.groupsForWorker().map((g) => ({
-    rois: g.rois,
-    // Pack RGBA: rgb = group colour, a = group opacity. The colour-by-group RGB
-    // override and the per-group "on" opacity both ride this single value.
-    colorPacked: packColor(
-      vec4.fromValues(g.color[0], g.color[1], g.color[2], g.opacity),
-    ),
-    visible: g.visible,
-    // Per-group unified colour-by + attribute predicates (both settable like
-    // opacity). The predicates are what let a group select by data rather than
-    // by geometry, which for a point cloud is the only kind of group there is.
-    colorBy: g.colorBy,
-    ...(g.attrFilters.length !== 0 ? { attrFilters: g.attrFilters } : {}),
-  }));
-}
-
-/**
- * Snapshot the loaded per-object numeric attributes as worker-shippable columns,
- * keyed by attribute name. Values are copied to a `Float32Array`; `ids` come
- * straight from the shared (read-only) inline id array.
- *
- * ID-space caveat: these are the segment-property map's ids. For a store with
- * `object_index_convention: "identity"` they equal the streamline segment ids
- * the passing set uses; a `"standard"` store would need re-keying through
- * `object_attributes/segment_id` first (a known follow-up — verify per dataset).
- */
-function buildObjectAttrColumns(
-  map: PreprocessedSegmentPropertyMap | undefined,
-): Map<string, RoiObjectAttrColumn> {
-  const columns = new Map<string, RoiObjectAttrColumn>();
-  const inline = map?.segmentPropertyMap.inlineProperties;
-  if (map === undefined || inline === undefined) return columns;
-  const ids = inline.ids;
-  for (const p of map.numericalProperties) {
-    columns.set(p.id, {
-      ids,
-      values: Float32Array.from(p.values as ArrayLike<number>),
-      min: Number(p.bounds[0]),
-      max: Number(p.bounds[1]),
-    });
-  }
-  return columns;
-}
-
-// The ROI overlay annotation shader: colour each region by its per-annotation
-// `color` property (set to its group's colour). Box/plane ROIs render as a
-// coloured wireframe; sphere ROIs as a translucent fill.
-const ROI_OVERLAY_SHADER = "void main() {\n  setColor(prop_color());\n}\n";
-// Same, but discard in the 2-d slice views (hide-overlays-in-2d toggle).
-const ROI_OVERLAY_SHADER_HIDE_2D =
-  "void main() {\n  if (!PROJECTION_VIEW) { discard; }\n  setColor(prop_color());\n}\n";
-
-/**
- * Mirror the ROI groups into a local annotation source so the regions draw as
- * overlays, each in its group's colour (via the source's `color` property).
- * One-way — the `RoiFilterState` is the truth; this only reflects it.
- *
- * Updates annotations in place when the ROI count is unchanged (so a slider
- * drag moves a region without a delete/re-add flicker), and rebuilds from
- * scratch on a structural change. `refs` is the running annotation list.
- */
-function rebuildRoiAnnotations(
-  source: LocalAnnotationSource,
-  roiFilter: RoiFilterState,
-  refs: AnnotationReference[],
-): void {
-  const desired: Annotation[] = [];
-  for (const group of roiFilter.groups) {
-    const color = packColor(group.color);
-    for (const roi of group.rois) {
-      const shape = roi.shape;
-      if (shape.kind === "box") {
-        desired.push({
-          type: AnnotationType.AXIS_ALIGNED_BOUNDING_BOX,
-          id: "",
-          pointA: Float32Array.from(shape.lower),
-          pointB: Float32Array.from(shape.upper),
-          properties: [color],
-        });
-      } else if (shape.kind === "ellipsoid") {
-        desired.push({
-          type: AnnotationType.ELLIPSOID,
-          id: "",
-          center: Float32Array.from(shape.center),
-          radii: Float32Array.from(shape.radii),
-          properties: [color],
-        });
-      }
-      // halfspace ROIs are not drawn (axis-aligned regions only).
-    }
-  }
-  if (refs.length === desired.length) {
-    for (let i = 0; i < desired.length; ++i) {
-      desired[i].id = refs[i].id;
-      source.update(refs[i], desired[i]);
-      source.commit(refs[i]);
-    }
-  } else {
-    for (const ref of refs) source.delete(ref);
-    refs.length = 0;
-    for (const annotation of desired) refs.push(source.add(annotation));
-  }
-}
-
-/**
- * Nothing to the object-keyed full-detail pass by default.
- *
- * It was an even-ish split while an ROI group could ask for its tracts at full
- * resolution. No group can now -- a dissection is a selection within the level
- * the layer draws -- so any reservation here is withheld from the only pass
- * that draws, which is a direct cut to how much of the tractogram fits.
- * Non-zero only if something is deliberately driving the pass-2 layer.
- */
-
-let warnedAdmissionUnavailable = false;
-function warnOnceAdmissionUnavailable(hasSource: boolean) {
-  if (warnedAdmissionUnavailable) return;
-  warnedAdmissionUnavailable = true;
-  console.warn(
-    "Object detail focus is selected but this store cannot be budgeted per " +
-      (hasSource
-        ? "object: its levels are not nested subsets of one object id space, " +
-          "or it omits object_attributes/vertex_count at some level."
-        : "object: no spatially-indexed tract source reported one.") +
-      " Object focus stays in force -- one level everywhere, its whole volume" +
-      " resident -- but the level is chosen by the whole-level memory ceiling" +
-      " rather than by which objects fit, and the levels are not drawn" +
-      " together.",
-  );
 }
 
 class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
