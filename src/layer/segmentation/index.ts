@@ -16,6 +16,7 @@
 
 import "#src/layer/segmentation/style.css";
 import "#src/layer/segmentation/spatial_skeleton.css";
+import { registerSpatialSkeletonTabs } from "#src/layer/segmentation/spatial_skeleton_tabs.js";
 import {
   buildObjectAttrColumns,
   buildRoiGroupConfigs,
@@ -51,9 +52,7 @@ import type {
   RoiObjectAttrColumn,
 } from "#src/datasource/zarr-vectors/roi.js";
 import { RoiFilterState } from "#src/datasource/zarr-vectors/roi_filter_state.js";
-import { StreamlineFilterTab } from "#src/datasource/zarr-vectors/streamline_filter_tab.js";
-import { StreamlineGuideTab } from "#src/datasource/zarr-vectors/streamline_guide_tab.js";
-import { TractExportTab } from "#src/datasource/zarr-vectors/tract_export_tab.js";
+
 import type {
   LayerActionContext,
   ManagedUserLayer,
@@ -198,7 +197,7 @@ import { SegmentDisplayTab } from "#src/ui/segment_list.js";
 import { registerSegmentSelectTools } from "#src/ui/segment_select_tools.js";
 import { registerSegmentSplitMergeTools } from "#src/ui/segment_split_merge_tools.js";
 import { DisplayOptionsTab } from "#src/ui/segmentation_display_options_tab.js";
-import { SpatialSkeletonEditTab } from "#src/ui/spatial_skeleton_edit_tab.js";
+
 import { registerSpatialSkeletonEditModeTool } from "#src/ui/spatial_skeleton_edit_tool.js";
 import { Uint64Map } from "#src/uint64_map.js";
 import { Uint64OrderedSet } from "#src/uint64_ordered_set.js";
@@ -1850,86 +1849,7 @@ export class SegmentationUserLayer extends Base {
       order: -50,
       getter: () => new SegmentDisplayTab(this),
     });
-    const hideSpatialSkeletonEditTab = this.registerDisposer(
-      makeCachedLazyDerivedWatchableValue(
-        (layers) =>
-          !layers.some(
-            (layer) =>
-              (layer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
-                layer instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer) &&
-              getSpatiallyIndexedSkeletonSource(layer.base) !== undefined,
-          ),
-        { changed: this.layersChanged, value: this.renderLayers },
-      ),
-    );
-    this.tabs.add("skeleton", {
-      label: "Skeleton",
-      order: -45,
-      getter: () => new SpatialSkeletonEditTab(this),
-      hidden: hideSpatialSkeletonEditTab,
-    });
-    // Show the Filter tab whenever a spatially-indexed skeleton render layer is
-    // present AND the ROI channel was created for it. The channel is created
-    // (setting displayState.roiPassingSegments) only for sources that opt into
-    // the filter, so this also excludes other spatially-indexed skeleton
-    // sources (e.g. CATMAID) that render tracts but cannot be filtered. Unlike
-    // the Skeleton *edit* tab, it does NOT require the skeleton-editing API,
-    // which read-only zarr-vectors tracts lack.
-    //
-    // Every zarr-vectors geometry kind opts in, points and meshes included: a
-    // dissection of a point cloud is what its attribute predicates select, and
-    // the fold knows from each chunk how to attribute geometry to objects (see
-    // `RoiFilterableChunk.perVertexObjects`).
-    const hideFilterTab = this.registerDisposer(
-      makeCachedLazyDerivedWatchableValue(
-        (layers) =>
-          this.displayState.roiPassingSegments === undefined ||
-          !layers.some(
-            (layer) =>
-              layer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
-              layer instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer,
-          ),
-        { changed: this.layersChanged, value: this.renderLayers },
-      ),
-    );
-    this.tabs.add("filter", {
-      label: "Filter",
-      order: -40,
-      getter: () => new StreamlineFilterTab(this),
-      hidden: hideFilterTab,
-    });
-    // The Filter tab's condition AND a store the export applies to. Both of the
-    // Export tab's formats are streamline-shaped -- TrackVis `.trk` is polylines
-    // by definition, and the zarr-vectors exporter reads whole tracts -- so a
-    // point-cloud or mesh store is filterable without being exportable, and
-    // offering the tab there would only lead to a job that cannot be written.
-    const hideExportTab = this.registerDisposer(
-      makeCachedLazyDerivedWatchableValue(
-        (layers) =>
-          this.displayState.roiPassingSegments === undefined ||
-          this.displayState.roiSupportsTractExport !== true ||
-          !layers.some(
-            (layer) =>
-              layer instanceof PerspectiveViewSpatiallyIndexedSkeletonLayer ||
-              layer instanceof SliceViewPanelSpatiallyIndexedSkeletonLayer,
-          ),
-        { changed: this.layersChanged, value: this.renderLayers },
-      ),
-    );
-    this.tabs.add("export", {
-      label: "Export",
-      order: -38,
-      getter: () => new TractExportTab(this),
-      hidden: hideExportTab,
-    });
-    // Shares the Filter tab's visibility condition: the guide documents that
-    // panel, so it should never appear without it.
-    this.tabs.add("filterGuide", {
-      label: "Guide",
-      order: -39,
-      getter: () => new StreamlineGuideTab(),
-      hidden: hideFilterTab,
-    });
+    registerSpatialSkeletonTabs(this);
     const hideGraphTab = this.registerDisposer(
       makeCachedDerivedWatchableValue(
         (x) => x === undefined,
