@@ -67,8 +67,8 @@ import {
   type CrossChunkLinksCaches,
   type CrossChunkLinksTable,
 } from "#src/datasource/zarr-vectors/links.js";
-import { objectRank } from "#src/datasource/zarr-vectors/object_admission.js";
-import { filterChunkByAdmittedObjects } from "#src/datasource/zarr-vectors/object_filter.js";
+import { objectRank } from "#src/datasource/zarr-vectors/object_budget.js";
+import { filterChunkByAdmittedObjects } from "#src/datasource/zarr-vectors/object_budget.js";
 import {
   ShardCellReader,
   type CellReader,

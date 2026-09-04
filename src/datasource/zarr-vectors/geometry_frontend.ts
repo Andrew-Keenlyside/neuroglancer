@@ -47,9 +47,9 @@ import {
   buildVertexAttributeMap,
   zvPackedAttributeRange,
 } from "#src/datasource/zarr-vectors/geometry_shader_bridge.js";
-import type { ObjectAdmission } from "#src/datasource/zarr-vectors/object_admission.js";
-import { admissionForBudget } from "#src/datasource/zarr-vectors/object_admission.js";
-import { computePyramidDensityScales } from "#src/datasource/zarr-vectors/pyramid_objects.js";
+import type { ObjectAdmission } from "#src/datasource/zarr-vectors/object_budget.js";
+import { admissionForBudget } from "#src/datasource/zarr-vectors/object_budget.js";
+import { computePyramidDensityScales } from "#src/datasource/zarr-vectors/object_budget.js";
 import type { ZarrVectorsEditTarget } from "#src/datasource/zarr-vectors/spatial_skeleton_edit.js";
 import { makeZarrVectorsEditCommands } from "#src/datasource/zarr-vectors/spatial_skeleton_edit.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";

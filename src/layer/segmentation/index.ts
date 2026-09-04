@@ -44,7 +44,7 @@ import {
   localEquivalencesUrl,
 } from "#src/datasource/local.js";
 import { buildRoiLabelField } from "#src/datasource/zarr-vectors/label_field.js";
-import type { ObjectAdmission } from "#src/datasource/zarr-vectors/object_admission.js";
+import type { ObjectAdmission } from "#src/datasource/zarr-vectors/object_budget.js";
 import type {
   RoiBackgroundUniforms,
   RoiGroupConfig,

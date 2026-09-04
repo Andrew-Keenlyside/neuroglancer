@@ -64,7 +64,7 @@ import { KIND_CAPABILITIES } from "#src/datasource/zarr-vectors/geometry_kind.js
 import {
   levelsAreNested,
   objectDepths as computeObjectDepths,
-} from "#src/datasource/zarr-vectors/object_admission.js";
+} from "#src/datasource/zarr-vectors/object_budget.js";
 import type { ObjectGroupMembership } from "#src/datasource/zarr-vectors/object_groups.js";
 import {
   buildObjectGroupMembership,
@@ -72,7 +72,7 @@ import {
   parseGroupCount,
 } from "#src/datasource/zarr-vectors/object_groups.js";
 import { toAnnotationPropertyId } from "#src/datasource/zarr-vectors/store_metadata.js";
-import { computePerLevelObjectCount } from "#src/datasource/zarr-vectors/pyramid_objects.js";
+import { computePerLevelObjectCount } from "#src/datasource/zarr-vectors/object_budget.js";
 import { decodeVlenBytesChunk } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import type { AutoDetectRegistry } from "#src/kvstore/auto_detect.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
