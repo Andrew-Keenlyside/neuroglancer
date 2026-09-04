@@ -38,7 +38,7 @@ import {
   type ZarrVectorsGeometryKind,
 } from "#src/datasource/zarr-vectors/base.js";
 import { ZARR_VECTORS_GET_OBJECT_NODES_RPC_ID } from "#src/datasource/zarr-vectors/base.js";
-import { computeChunkIndexBounds } from "#src/datasource/zarr-vectors/chunk_bounds.js";
+import { computeChunkIndexBounds } from "#src/datasource/zarr-vectors/store_metadata.js";
 import {
   KIND_CAPABILITIES,
   hasSynthesisedTangent,

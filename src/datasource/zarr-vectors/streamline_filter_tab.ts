@@ -65,7 +65,7 @@ import { StoreGroupPicker } from "#src/datasource/zarr-vectors/store_group_picke
 import {
   rememberSavedDocument,
   savedDocumentFor,
-} from "#src/datasource/zarr-vectors/store_provenance.js";
+} from "#src/datasource/zarr-vectors/store_metadata.js";
 import { deleteLayer, makeLayer } from "#src/layer/index.js";
 import type { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
 import {

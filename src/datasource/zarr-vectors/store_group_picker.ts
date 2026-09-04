@@ -39,7 +39,7 @@ import {
 import {
   groupIdForDocument,
   rememberSavedDocument,
-} from "#src/datasource/zarr-vectors/store_provenance.js";
+} from "#src/datasource/zarr-vectors/store_metadata.js";
 import { getRoiStoreAuth } from "#src/roi_store/credentials.js";
 import {
   getRoiGroupStore,

@@ -43,7 +43,7 @@ import { resolveAttributeSelection } from "#src/datasource/zarr-vectors/attribut
 import {
   formatAttributesFragment,
   parseAttributesFragment,
-} from "#src/datasource/zarr-vectors/attributes_fragment.js";
+} from "#src/datasource/zarr-vectors/store_metadata.js";
 import type {
   ZarrVectorsAttributeDtype,
   ZarrVectorsPyramidMode,
@@ -54,7 +54,7 @@ import {
   ZarrVectorsObjectKeyedGeometrySourceParameters,
   ZarrVectorsSpatialGeometrySourceParameters,
 } from "#src/datasource/zarr-vectors/base.js";
-import { resolveDeclaredGeometry } from "#src/datasource/zarr-vectors/declared_geometry.js";
+import { resolveDeclaredGeometry } from "#src/datasource/zarr-vectors/store_metadata.js";
 import {
   ZarrVectorsMultiscaleGeometrySource,
   ZarrVectorsObjectKeyedGeometrySource,
@@ -71,7 +71,7 @@ import {
   groupSegmentProperties,
   parseGroupCount,
 } from "#src/datasource/zarr-vectors/object_groups.js";
-import { toAnnotationPropertyId } from "#src/datasource/zarr-vectors/property_id.js";
+import { toAnnotationPropertyId } from "#src/datasource/zarr-vectors/store_metadata.js";
 import { computePerLevelObjectCount } from "#src/datasource/zarr-vectors/pyramid_objects.js";
 import { decodeVlenBytesChunk } from "#src/datasource/zarr-vectors/vlen_bytes.js";
 import type { AutoDetectRegistry } from "#src/kvstore/auto_detect.js";
