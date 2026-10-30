@@ -33,6 +33,7 @@ import {
   SliceViewPanelZarrVectorsDenseLayer,
   ZarrVectorsMultiscaleGeometrySource,
 } from "#src/datasource/zarr-vectors/dense_frontend.js";
+import { ZarrVectorsLazyPropertyMap } from "#src/datasource/zarr-vectors/frontend.js";
 import {
   DIRECTION_SHADER,
   KIND_CAPABILITIES,
@@ -44,6 +45,10 @@ import {
 } from "#src/layer/index.js";
 import type { LoadedDataSubsource } from "#src/layer/layer_data_source.js";
 import { SegmentationUserLayer } from "#src/layer/segmentation/index.js";
+import {
+  mergeSegmentPropertyMaps,
+  PreprocessedSegmentPropertyMap,
+} from "#src/segmentation_display_state/property_map.js";
 import { VolumeType } from "#src/sliceview/volume/base.js";
 import {
   makeCachedDerivedWatchableValue,
@@ -60,6 +65,8 @@ function denseSource(subsource: LoadedDataSubsource) {
 
 export class ZarrVectorsSegmentationUserLayer extends SegmentationUserLayer {
   private objectsDrawnElsewhere = new WatchableValue(false);
+  /** Identifies the latest activation, so an earlier one's properties are dropped. */
+  private propertiesToken = {};
 
   constructor(...args: ConstructorParameters<typeof SegmentationUserLayer>) {
     super(...args);
@@ -118,6 +125,41 @@ export class ZarrVectorsSegmentationUserLayer extends SegmentationUserLayer {
     return undefined;
   }
 
+  /**
+   * The base class builds its property map from what the subsources hold
+   * when they are activated; a {@link ZarrVectorsLazyPropertyMap} holds its
+   * properties only later. Rebuilds the map then, as the base class would.
+   */
+  private refreshPropertiesWhenReady(subsources: LoadedDataSubsource[]) {
+    const token = (this.propertiesToken = {});
+    const pending = subsources.flatMap((s) => {
+      const map = s.subsourceEntry.subsource.segmentPropertyMap;
+      return map instanceof ZarrVectorsLazyPropertyMap &&
+        map.inlineProperties === undefined
+        ? [map.ready]
+        : [];
+    });
+    if (pending.length === 0) return;
+    Promise.all(pending).then(
+      () => {
+        if (this.propertiesToken !== token || this.wasDisposed) return;
+        if (this.displayState.linkedSegmentationGroup.root.value !== this) {
+          return;
+        }
+        const maps = subsources.flatMap((s) => {
+          const map = s.subsourceEntry.subsource.segmentPropertyMap;
+          return map !== undefined && s.activated !== undefined ? [map] : [];
+        });
+        const merged = mergeSegmentPropertyMaps(maps);
+        this.displayState.originalSegmentationGroupState.segmentPropertyMap.value =
+          merged === undefined
+            ? undefined
+            : new PreprocessedSegmentPropertyMap(merged);
+      },
+      () => {},
+    );
+  }
+
   activateDataSubsources(subsources: Iterable<LoadedDataSubsource>) {
     const rest: LoadedDataSubsource[] = [];
     const dense: LoadedDataSubsource[] = [];
@@ -133,6 +175,7 @@ export class ZarrVectorsSegmentationUserLayer extends SegmentationUserLayer {
       rest.push(subsource);
     }
     super.activateDataSubsources(rest);
+    this.refreshPropertiesWhenReady(rest);
     this.objectsDrawnElsewhere.value = objectsElsewhere;
     let directionDefault = dense.length > 0;
     for (const loadedSubsource of dense) {

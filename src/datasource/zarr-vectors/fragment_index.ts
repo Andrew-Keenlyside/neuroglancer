@@ -39,6 +39,61 @@
 export const FRAGMENT_INDEX_MAGIC = 0x5a564647; // 'ZVFG' little-endian
 export const FRAGMENT_INDEX_VERSION = 1;
 const HEADER_BYTES = 16;
+export const FRAGMENT_HEADER_BYTES = HEADER_BYTES;
+/** `int64 start, int64 count`. */
+export const FRAGMENT_RANGE_ENTRY_BYTES = 16;
+
+/**
+ * What a reader of a chunk's fragments needs: a whole {@link FragmentIndex},
+ * or the part of one that was read.
+ */
+export interface FragmentRows {
+  readonly numFragments: number;
+  isRange(f: number): boolean;
+  range(f: number): { start: number; count: number };
+  indices(f: number): Uint32Array;
+}
+
+/**
+ * The header of a fragment-index blob, from its first 16 bytes: the counts,
+ * and where the range table starts (after the padded bitmap), so one
+ * fragment's range entry can be read by byte offset without the rest.
+ */
+export function decodeFragmentHeader(bytes: Uint8Array): {
+  numFragments: number;
+  numRangeFragments: number;
+  tableOffset: number;
+} {
+  if (bytes.byteLength < HEADER_BYTES) {
+    throw new Error(
+      `Fragment-index blob too short: ${bytes.byteLength} < ${HEADER_BYTES}`,
+    );
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, HEADER_BYTES);
+  const magic = view.getUint32(0, true);
+  const version = view.getUint16(4, true);
+  const flags = view.getUint16(6, true);
+  if (magic !== FRAGMENT_INDEX_MAGIC) {
+    throw new Error(`Bad fragment-index magic: got 0x${magic.toString(16)}`);
+  }
+  if (version !== FRAGMENT_INDEX_VERSION || flags !== 0) {
+    throw new Error(
+      `Unsupported fragment-index version ${version} / flags ${flags}`,
+    );
+  }
+  const numFragments = view.getUint32(8, true);
+  const numRangeFragments = view.getUint32(12, true);
+  if (numRangeFragments > numFragments) {
+    throw new Error(
+      `num_range_fragments (${numRangeFragments}) exceeds num_fragments (${numFragments})`,
+    );
+  }
+  return {
+    numFragments,
+    numRangeFragments,
+    tableOffset: HEADER_BYTES + bitmapPaddedLength(numFragments),
+  };
+}
 
 /** Compute the padded length of the range bitmap (multiple of 8). */
 function bitmapPaddedLength(numFragments: number): number {
@@ -74,6 +129,9 @@ export class FragmentIndex {
    */
   private popcountPrefix: Int32Array | undefined;
 
+  /** {@link rowBound}, once computed. */
+  private rowBound_: number | undefined;
+
   constructor(
     numFragments: number,
     bitmap: Uint8Array,
@@ -104,6 +162,28 @@ export class FragmentIndex {
 
   get numExplicitFragments(): number {
     return this.numFragments - this.numRangeFragments;
+  }
+
+  /**
+   * One past the highest row any fragment holds (0 for none): the chunk's
+   * row count where its fragments tile it, else a lower bound on it.
+   */
+  rowBound(): number {
+    if (this.rowBound_ === undefined) {
+      const { rangeTable, csrIndices } = this;
+      let bound = 0;
+      for (let i = 0; i < rangeTable.length; i += 2) {
+        bound = Math.max(
+          bound,
+          Number(rangeTable[i]) + Number(rangeTable[i + 1]),
+        );
+      }
+      for (let i = 0; i < csrIndices.length; ++i) {
+        bound = Math.max(bound, Number(csrIndices[i]) + 1);
+      }
+      this.rowBound_ = bound;
+    }
+    return this.rowBound_;
   }
 
   /** O(1) — a single bit lookup; does not warm the popcount cache. */

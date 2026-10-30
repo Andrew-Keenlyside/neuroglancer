@@ -41,9 +41,9 @@ function parseChunkKey(chunkKey: string): number[] {
 }
 
 /** Rows this close together are read together. */
-const ROW_GAP = 4096;
+export const ROW_GAP = 4096;
 /** Past this many reads, the whole cell is cheaper. */
-const MAX_ROW_READS = 16;
+export const MAX_ROW_READS = 16;
 
 export class LevelCells {
   private readers = new Map<string, Promise<ZarrArrayReader | undefined>>();
@@ -146,6 +146,7 @@ export class LevelCells {
     offset: number,
     length: number,
     signal: AbortSignal,
+    mergeGap?: number,
   ): Promise<Uint8Array | undefined | null> {
     const reader = await this.reader(path);
     if (reader === undefined) return undefined;
@@ -154,7 +155,20 @@ export class LevelCells {
       offset,
       length,
       signal,
+      mergeGap,
     );
+  }
+
+  /** See {@link ZarrArrayReader.readCellPrefix}. */
+  async readCellPrefix(
+    path: string,
+    chunkKey: string,
+    maxLength: number,
+    signal: AbortSignal,
+  ): Promise<Uint8Array | undefined | null> {
+    const reader = await this.reader(path);
+    if (reader === undefined) return undefined;
+    return reader.readCellPrefix(parseChunkKey(chunkKey), maxLength, signal);
   }
 
   /** Whether the array's cells can be read in parts, by byte range. */
@@ -231,20 +245,39 @@ export class LevelCells {
 
 /**
  * `rows` (sorted, distinct) as at most `maxSpans` inclusive `[first, last]`
- * spans: rows within `gap` of each other share one, then the closest spans
- * are joined until few enough remain. Joining reads rows between that no one
- * asked for, but never more than the cell holds.
+ * spans; see {@link rangeSpans}.
  */
 export function rowSpans(
   rows: readonly number[],
   gap: number,
   maxSpans: number,
 ): [number, number][] {
+  return rangeSpans(
+    rows.map((v) => [v, v] as const),
+    gap,
+    maxSpans,
+  );
+}
+
+/**
+ * `ranges` (inclusive `[first, last]`, sorted by first) as at most `maxSpans`
+ * inclusive spans: ranges within `gap` of each other share one, then the
+ * closest spans are joined until few enough remain. Joining reads rows
+ * between that no one asked for, but never more than the cell holds.
+ */
+export function rangeSpans(
+  ranges: readonly (readonly [number, number])[],
+  gap: number,
+  maxSpans: number,
+): [number, number][] {
   const spans: [number, number][] = [];
-  for (const v of rows) {
-    const last = spans[spans.length - 1];
-    if (last !== undefined && v - last[1] <= gap) last[1] = v;
-    else spans.push([v, v]);
+  for (const [first, last] of ranges) {
+    const prev = spans[spans.length - 1];
+    if (prev !== undefined && first - prev[1] <= gap) {
+      prev[1] = Math.max(prev[1], last);
+    } else {
+      spans.push([first, last]);
+    }
   }
   if (spans.length <= maxSpans) return spans;
   // Join across the largest gaps last: keep the `maxSpans - 1` widest.

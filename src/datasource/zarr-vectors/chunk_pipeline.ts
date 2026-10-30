@@ -129,6 +129,23 @@ async function fragmentOwners(
  * Sets each vertex's object values (`obj_<name>`, `obj_group`) from the
  * object it belongs to: `segmentIds` holds two uint32 per vertex.
  */
+/**
+ * Starts reading the object values {@link fillObjectValues} will put on
+ * vertices, so they are at hand when the first object's geometry is.
+ */
+export function prefetchObjectValues(
+  access: ZarrVectorsStoreAccess,
+  description: ZarrVectorsGeometryDescription,
+) {
+  const wanted = description.attributes.flatMap((a) =>
+    a.objectValue !== undefined ? [a.objectValue] : [],
+  );
+  if (wanted.length === 0 || description.objectValuesPath === undefined) return;
+  readShaderObjectValues(access, description.objectValuesPath, wanted).catch(
+    () => {},
+  );
+}
+
 export async function fillObjectValues(
   access: ZarrVectorsStoreAccess,
   description: ZarrVectorsGeometryDescription,

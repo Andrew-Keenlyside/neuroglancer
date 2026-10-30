@@ -49,6 +49,8 @@ import "#src/datasource/zarr/codec/gzip/decode.js";
 import "#src/datasource/zarr/codec/gzip/resolve.js";
 import "#src/datasource/zarr/codec/zstd/decode.js";
 import "#src/datasource/zarr/codec/zstd/resolve.js";
+import { decodeZstd } from "#src/async_computation/decode_zstd_request.js";
+import { requestAsyncComputation } from "#src/async_computation/request.js";
 import {
   decodeArray,
   registerCodec as registerDecodeCodec,
@@ -123,7 +125,16 @@ const UNSUPPORTED_CODECS = new Set([
 
 export type ZarrArrayRead = (
   path: string,
-  options: { signal?: AbortSignal; byteRange?: ByteRangeRequest },
+  options: {
+    signal?: AbortSignal;
+    byteRange?: ByteRangeRequest;
+    /**
+     * Other range reads of this key within this many bytes may be merged
+     * with this one, the bytes between discarded (`coalesceRangeReads`):
+     * for reads that cost more as requests than as bytes.
+     */
+    mergeGap?: number;
+  },
 ) => Promise<Uint8Array | undefined>;
 
 /**
@@ -475,78 +486,224 @@ export class ShardIndexCache extends AsyncLru<BigUint64Array | undefined> {
   }
 }
 
+/** A zstd frame with no content: enough to make the decoder load. */
+const EMPTY_ZSTD_FRAME = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00];
+let zstdWarmed: Promise<void> | undefined;
+
+/**
+ * Loads the zstd decoder (a worker and its module) before a cell needs it.
+ * The first decode otherwise waits for that load, about a second on a
+ * development server, on the way to the first object. Called once a store
+ * is known to use zstd; errors are ignored, the load is the point.
+ */
+export function warmZstdDecoder(): Promise<void> {
+  zstdWarmed ??= (async () => {
+    const frame = Uint8Array.from(EMPTY_ZSTD_FRAME);
+    try {
+      await requestAsyncComputation(
+        decodeZstd,
+        undefined,
+        [frame.buffer],
+        frame,
+      );
+    } catch {
+      // The decoder is loaded either way.
+    }
+  })();
+  return zstdWarmed;
+}
+
 /** Reads this close together are merged; the bytes between are discarded. */
 const COALESCE_MAX_GAP = 8 * 1024;
 /** A merged read stops growing here, so no cell waits on a huge one. */
 const COALESCE_MAX_LENGTH = 8 * 1024 * 1024;
+/**
+ * Reads issued within this long of each other are merged. Objects loading
+ * together reach the same cells a few milliseconds apart (each after its own
+ * fragment index), well under a request's round trip.
+ */
+const COALESCE_WINDOW_MS = 20;
+/**
+ * Bytes of range reads kept, per store, to answer later reads of the same
+ * bytes without a request. Objects requested in waves (the chunk manager
+ * hands out so many downloads at a time) share cells, and a wave's merged
+ * read of a cell spans most of what the next wave asks for.
+ */
+const RANGE_CACHE_BYTES = 256 * 1024 * 1024;
+/**
+ * A merged read is extended by this share of its length on each side (at
+ * most the merge gap). A wave of objects sharing a cell asks for most of a
+ * block of rows; the next wave's few objects at the block's edges are then
+ * already in the cache instead of each costing a request.
+ */
+const COALESCE_PAD_FRACTION = 0.1;
+
+/** A range of one key that was read, kept for later reads inside it. */
+interface CachedRange {
+  offset: number;
+  bytes: Uint8Array;
+  /** Last use, for eviction. */
+  used: number;
+}
+
+/**
+ * Range reads kept by key, bounded by bytes: a read inside a kept range is
+ * answered from it (with a copy), the least recently used kept ranges going
+ * first when the bound is passed.
+ */
+class RangeCache {
+  private ranges = new Map<string, CachedRange[]>();
+  private bytes = 0;
+  private clock = 0;
+
+  constructor(private readonly maxBytes: number) {}
+
+  get(path: string, offset: number, length: number): Uint8Array | undefined {
+    for (const r of this.ranges.get(path) ?? []) {
+      if (r.offset <= offset && offset + length <= r.offset + r.bytes.length) {
+        r.used = ++this.clock;
+        const from = offset - r.offset;
+        return r.bytes.slice(from, from + length);
+      }
+    }
+    return undefined;
+  }
+
+  put(path: string, offset: number, bytes: Uint8Array) {
+    if (bytes.length === 0 || bytes.length > this.maxBytes / 4) return;
+    let kept = this.ranges.get(path);
+    if (kept === undefined) this.ranges.set(path, (kept = []));
+    // Ranges this one covers are redundant now.
+    for (let i = kept.length - 1; i >= 0; --i) {
+      const r = kept[i];
+      if (
+        r.offset >= offset &&
+        r.offset + r.bytes.length <= offset + bytes.length
+      ) {
+        this.bytes -= r.bytes.length;
+        kept.splice(i, 1);
+      }
+    }
+    kept.push({ offset, bytes, used: ++this.clock });
+    this.bytes += bytes.length;
+    while (this.bytes > this.maxBytes) this.evict();
+  }
+
+  private evict() {
+    let oldestPath: string | undefined;
+    let oldest: CachedRange | undefined;
+    for (const [path, kept] of this.ranges) {
+      for (const r of kept) {
+        if (oldest === undefined || r.used < oldest.used) {
+          oldest = r;
+          oldestPath = path;
+        }
+      }
+    }
+    if (oldest === undefined || oldestPath === undefined) return;
+    const kept = this.ranges.get(oldestPath)!;
+    kept.splice(kept.indexOf(oldest), 1);
+    if (kept.length === 0) this.ranges.delete(oldestPath);
+    this.bytes -= oldest.bytes.length;
+  }
+}
 
 interface PendingRange {
   offset: number;
   length: number;
+  /** The caller's `mergeGap`, 0 if none. */
+  mergeGap: number;
   signal: AbortSignal | undefined;
   resolve: (bytes: Uint8Array | undefined) => void;
   reject: (reason: unknown) => void;
 }
 
 /**
- * Merges byte-range reads of one key issued in the same task, such as the
- * cells of one shard that several chunks ask for at once, into fewer
- * requests.  Each caller gets its own copy: decoders take over their input's
- * buffer.
+ * Merges byte-range reads of one key issued within `windowMs` of each other,
+ * such as the cells of one shard that several chunks ask for at once, or the
+ * rows of one cell that several objects own, into fewer requests. Reads
+ * within `maxGap` bytes are merged, or within a caller's own `mergeGap` where
+ * that is larger. Each caller gets its own copy: decoders take over their
+ * input's buffer.
  */
 export function coalesceRangeReads(
   read: ZarrArrayRead,
   maxGap = COALESCE_MAX_GAP,
   maxLength = COALESCE_MAX_LENGTH,
+  windowMs = COALESCE_WINDOW_MS,
+  cacheBytes = RANGE_CACHE_BYTES,
 ): ZarrArrayRead {
   let pending = new Map<string, PendingRange[]>();
   let scheduled = false;
+  const cache = new RangeCache(cacheBytes);
+  /**
+   * Merged reads on the wire, by key. A later read inside one joins it
+   * instead of asking again: objects reach a cell a few windows apart.
+   */
+  const inFlight = new Map<
+    string,
+    { start: number; end: number; join(r: PendingRange): void }[]
+  >();
 
   const issue = (path: string, group: PendingRange[]) => {
-    if (group.length === 1) {
-      const [r] = group;
-      read(path, {
-        signal: r.signal,
-        byteRange: { offset: r.offset, length: r.length },
-      }).then(r.resolve, r.reject);
-      return;
-    }
-    const start = group[0].offset;
-    const end = Math.max(...group.map((r) => r.offset + r.length));
-    // Aborted only once every caller has given up.
+    const first = group[0].offset;
+    const last = Math.max(...group.map((r) => r.offset + r.length));
+    let pad = Math.min(
+      Math.max(maxGap, ...group.map((r) => r.mergeGap)),
+      Math.floor((last - first) * COALESCE_PAD_FRACTION),
+    );
+    pad = Math.min(pad, Math.floor((maxLength - (last - first)) / 2));
+    const start = Math.max(0, first - pad);
+    const end = last + pad;
+    // Aborted only once every caller, joined ones included, has given up.
     const controller = new AbortController();
-    let live = group.length;
+    const members: PendingRange[] = [];
+    let live = 0;
     const onAbort = () => {
       if (--live === 0) controller.abort();
     };
-    for (const r of group) {
+    const join = (r: PendingRange) => {
+      members.push(r);
+      ++live;
       r.signal?.addEventListener("abort", onAbort, { once: true });
-    }
-    // A listener left on a signal that never aborts (a shared one) would
+    };
+    for (const r of group) join(r);
+    const flight = { start, end, join };
+    let flights = inFlight.get(path);
+    if (flights === undefined) inFlight.set(path, (flights = []));
+    flights.push(flight);
+    // Listeners left on a signal that never aborts (a shared one) would
     // keep the bytes reachable for as long as the signal lives.
-    const detach = () => {
-      for (const r of group) r.signal?.removeEventListener("abort", onAbort);
+    const settle = () => {
+      for (const r of members) r.signal?.removeEventListener("abort", onAbort);
+      const list = inFlight.get(path);
+      if (list !== undefined) {
+        list.splice(list.indexOf(flight), 1);
+        if (list.length === 0) inFlight.delete(path);
+      }
     };
     read(path, {
       signal: controller.signal,
       byteRange: { offset: start, length: end - start },
     }).then(
       (bytes) => {
-        detach();
-        for (const r of group) {
+        settle();
+        // Kept as read; each caller gets its own copy.
+        if (bytes !== undefined) cache.put(path, start, bytes);
+        for (const r of members) {
           const from = r.offset - start;
           if (bytes === undefined) {
             r.resolve(undefined);
-          } else if (from + r.length > bytes.length) {
-            r.reject(new Error(`${path}: short range read`));
           } else {
+            // A read past the end of the key comes back short, as it would
+            // alone; callers that need every byte check the length.
             r.resolve(bytes.slice(from, from + r.length));
           }
         }
       },
       (e) => {
-        detach();
-        for (const r of group) r.reject(e);
+        settle();
+        for (const r of members) r.reject(e);
       },
     );
   };
@@ -562,21 +719,24 @@ export function coalesceRangeReads(
       let group: PendingRange[] = [];
       let start = 0;
       let end = 0;
+      let gap = maxGap;
       for (const r of live) {
         const newEnd = Math.max(end, r.offset + r.length);
         if (
           group.length > 0 &&
-          r.offset <= end + maxGap &&
+          r.offset <= end + Math.max(gap, r.mergeGap) &&
           newEnd - start <= maxLength
         ) {
           group.push(r);
           end = newEnd;
+          gap = Math.max(maxGap, r.mergeGap);
           continue;
         }
         if (group.length > 0) issue(path, group);
         group = [r];
         start = r.offset;
         end = r.offset + r.length;
+        gap = Math.max(maxGap, r.mergeGap);
       }
       if (group.length > 0) issue(path, group);
     }
@@ -589,6 +749,8 @@ export function coalesceRangeReads(
     }
     const { signal } = options;
     signal?.throwIfAborted();
+    const kept = cache.get(path, range.offset, range.length);
+    if (kept !== undefined) return Promise.resolve(kept);
     return new Promise((resolve, reject) => {
       const onAbort = () => reject(signal!.reason);
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -598,17 +760,29 @@ export function coalesceRangeReads(
           signal?.removeEventListener("abort", onAbort);
           f(value);
         };
-      let list = pending.get(path);
-      if (list === undefined) pending.set(path, (list = []));
-      list.push({
+      const request: PendingRange = {
         ...range,
+        mergeGap: options.mergeGap ?? 0,
         signal,
         resolve: settle(resolve),
         reject: settle(reject),
-      });
+      };
+      const flight = inFlight
+        .get(path)
+        ?.find(
+          (f) =>
+            f.start <= range.offset && range.offset + range.length <= f.end,
+        );
+      if (flight !== undefined) {
+        flight.join(request);
+        return;
+      }
+      let list = pending.get(path);
+      if (list === undefined) pending.set(path, (list = []));
+      list.push(request);
       if (!scheduled) {
         scheduled = true;
-        setTimeout(flush, 0);
+        setTimeout(flush, windowMs);
       }
     });
   };
@@ -823,13 +997,15 @@ export class ZarrArrayReader {
    * Only possible for a raw array whose read chunk holds exactly one element
    * (then the payload starts 8 bytes in: element count, then its length).
    * Returns `null` when the array is not range-addressable, so callers fall
-   * back to {@link readCell}; `undefined` when the cell is empty.
+   * back to {@link readCell}; `undefined` when the cell is empty. `mergeGap`
+   * is passed to the read (see {@link ZarrArrayRead}).
    */
   async readCellRange(
     cell: ArrayLike<number>,
     offset: number,
     length: number,
     signal?: AbortSignal,
+    mergeGap?: number,
   ): Promise<Uint8Array | undefined | null> {
     const { array } = this;
     if (!this.rangeAddressable) return null;
@@ -850,6 +1026,7 @@ export class ZarrArrayReader {
     const bytes = await this.read(location.key, {
       signal,
       byteRange: { offset: start, length },
+      mergeGap,
     });
     if (bytes === undefined) return undefined;
     if (bytes.length !== length) {
@@ -858,6 +1035,37 @@ export class ZarrArrayReader {
       );
     }
     return bytes;
+  }
+
+  /**
+   * The first `maxLength` bytes of a cell's payload, or all of it when it is
+   * shorter: a cell's head, read without knowing the cell's size (a result
+   * shorter than `maxLength` IS the whole cell). `null` when the array is not
+   * range-addressable, `undefined` when the cell is empty.
+   */
+  async readCellPrefix(
+    cell: ArrayLike<number>,
+    maxLength: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array | undefined | null> {
+    if (!this.rangeAddressable) return null;
+    if (!this.mayHaveCell(cell)) return undefined;
+    const element = this.cellToElement(cell);
+    if (element === undefined) return undefined;
+    const location = await this.locate(element, signal);
+    if (location === undefined) return undefined;
+    let length = maxLength;
+    if (location.range !== undefined) {
+      length = Math.min(length, location.range.length - VLEN_SINGLE_HEADER);
+      if (length <= 0) return new Uint8Array(0);
+    }
+    return this.read(location.key, {
+      signal,
+      byteRange: {
+        offset: (location.range?.offset ?? 0) + VLEN_SINGLE_HEADER,
+        length,
+      },
+    });
   }
 
   /**

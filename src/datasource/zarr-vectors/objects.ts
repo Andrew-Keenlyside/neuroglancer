@@ -46,6 +46,7 @@ import {
   fillBytes,
   parseZarrArrayMetadata,
   parseZarrJsonText,
+  warmZstdDecoder,
   ZarrArrayReader,
 } from "#src/datasource/zarr-vectors/zarr_array.js";
 import type {
@@ -70,24 +71,109 @@ export interface ZarrVectorsObjectTable {
 }
 
 /** Opens an array, keeping 64-bit fill values exact; `undefined` if absent. */
-async function openReader(
+/**
+ * Per store: each array opened once, and each level's object table read once,
+ * however many readers of the store ask (properties, shader values, object
+ * manifests, fragment owners). Shared loads run without any one caller's
+ * signal; a caller that gives up stops waiting.
+ */
+const readerCache = new WeakMap<
+  ZarrVectorsStoreAccess,
+  Map<string, Promise<ZarrArrayReader | undefined>>
+>();
+const tableCache = new WeakMap<
+  ZarrVectorsStoreAccess,
+  Map<string, Promise<ZarrVectorsObjectTable | undefined>>
+>();
+
+function shared<T>(
+  caches: WeakMap<ZarrVectorsStoreAccess, Map<string, Promise<T>>>,
+  access: ZarrVectorsStoreAccess,
+  key: string,
+  load: () => Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  let cache = caches.get(access);
+  if (cache === undefined) caches.set(access, (cache = new Map()));
+  let promise = cache.get(key);
+  if (promise === undefined) {
+    promise = load();
+    cache.set(key, promise);
+    promise.catch(() => cache!.delete(key));
+  }
+  if (signal === undefined) return promise;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise!.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+function openReader(
   access: ZarrVectorsStoreAccess,
   path: string,
   signal?: AbortSignal,
 ): Promise<ZarrArrayReader | undefined> {
-  const bytes = await access.read(`${path}/zarr.json`, { signal });
-  if (bytes === undefined) return undefined;
-  const json = parseZarrJsonText(new TextDecoder().decode(bytes));
-  if (json?.node_type !== "array") return undefined;
-  return new ZarrArrayReader(
-    parseZarrArrayMetadata(path, json),
-    access.read,
-    access.shardIndexes,
+  return shared(
+    readerCache,
+    access,
+    path,
+    async () => {
+      const bytes = await access.read(`${path}/zarr.json`, {});
+      if (bytes === undefined) return undefined;
+      const json = parseZarrJsonText(new TextDecoder().decode(bytes));
+      if (json?.node_type !== "array") return undefined;
+      return new ZarrArrayReader(
+        parseZarrArrayMetadata(path, json),
+        access.read,
+        access.shardIndexes,
+      );
+    },
+    signal,
   );
 }
 
 /** Reads the object table of a level, or `undefined` if it has no objects. */
-export async function readObjectTable(
+export function readObjectTable(
+  access: ZarrVectorsStoreAccess,
+  levelPath: string,
+  signal?: AbortSignal,
+): Promise<ZarrVectorsObjectTable | undefined> {
+  return shared(
+    tableCache,
+    access,
+    levelPath,
+    () => loadObjectTable(access, levelPath),
+    signal,
+  );
+}
+
+/**
+ * Gives a store's readers a level's object table read elsewhere (the
+ * frontend's, sent to the worker), so they do not fetch it again.
+ */
+export function seedObjectTable(
+  access: ZarrVectorsStoreAccess,
+  levelPath: string,
+  table: ZarrVectorsObjectTable,
+) {
+  let cache = tableCache.get(access);
+  if (cache === undefined) tableCache.set(access, (cache = new Map()));
+  if (!cache.has(levelPath)) cache.set(levelPath, Promise.resolve(table));
+  if (usesZstd(table.manifestsJson)) void warmZstdDecoder();
+}
+
+function usesZstd(arrayJson: any): boolean {
+  return (
+    Array.isArray(arrayJson?.codecs) &&
+    arrayJson.codecs.some((c: any) => c?.name === "zstd")
+  );
+}
+
+async function loadObjectTable(
   access: ZarrVectorsStoreAccess,
   levelPath: string,
   signal?: AbortSignal,
@@ -112,6 +198,9 @@ export async function readObjectTable(
       : openReader(access, `${levelPath}/object_index/object_ids`, signal),
     openReader(access, `${levelPath}/object_attributes/segment_id`, signal),
   ]);
+  // The manifests (and, as zarr-vectors-py writes them, the groups and
+  // attribute columns) are zstd: have the decoder ready before they arrive.
+  if (usesZstd(manifests)) void warmZstdDecoder();
   let numObjects = Number(objectIndexAttrs.num_objects);
   if (!Number.isInteger(numObjects)) {
     numObjects = Number(manifests?.shape?.[0] ?? 0);
@@ -551,7 +640,12 @@ async function readStrings(
   const { array } = reader;
   const out = new Array<string>(count);
   if (array.elementType === "utf32") {
-    const bytes = await reader.readRows(0, count, signal);
+    const bytes = await reader.readRows(
+      0,
+      count,
+      signal,
+      PROPERTY_CHUNK_CONCURRENCY,
+    );
     const width = array.elementBytes;
     for (let i = 0; i < count; ++i) {
       out[i] = decodeUtf32(bytes.subarray(i * width, (i + 1) * width));
@@ -723,7 +817,7 @@ async function decodeAttribute(
   const type = array.elementType;
   const width = ELEMENT_BYTES[type];
   const channels = array.shape.slice(1).reduce((a, b) => a * b, 1);
-  const bytes = await reader.readRows(0, n, signal);
+  const bytes = await reader.readRows(0, n, signal, PROPERTY_CHUNK_CONCURRENCY);
 
   let missing: Uint8Array | undefined;
   if (attrs.fill_sentinel_meaning === "absent") {
@@ -747,7 +841,7 @@ async function decodeAttribute(
       maskArray.elementType !== "utf32"
     ) {
       const mask = decodeNumbers(
-        await maskReader!.readRows(0, n, signal),
+        await maskReader!.readRows(0, n, signal, PROPERTY_CHUNK_CONCURRENCY),
         maskArray.elementType as ElementType,
         n,
       );
@@ -939,6 +1033,17 @@ function rowsBySegmentId(
  * `#cell_type=L2IT`).  `chainPaths` is level 0's additive chain, level 0
  * first, over which `vertex_count` is summed.
  */
+/**
+ * How the properties' columns download: one column at a time, its chunks
+ * two at a time. They are the largest download of an open (megabytes of
+ * per-object values) and nothing drawn needs them, while the browser allows
+ * six connections to a host: taking most of them starves the geometry the
+ * layer is showing. This is a share of the connections for a background
+ * download, not a limit on anything the viewer draws.
+ */
+const PROPERTY_COLUMN_CONCURRENCY = 1;
+const PROPERTY_CHUNK_CONCURRENCY = 2;
+
 export async function readSegmentProperties(
   access: ZarrVectorsStoreAccess,
   levelPath: string,
@@ -962,24 +1067,28 @@ export async function readSegmentProperties(
   names = names.filter((n) => n !== "segment_id");
   const { numObjects } = table;
   const decoded = new Array<DecodedAttribute | undefined>(names.length);
-  await mapConcurrent(names, 8, async (name, index) => {
-    try {
-      decoded[index] = await decodeAttribute(
-        access,
-        levelPath,
-        name,
-        table,
-        chainPaths,
-        warnings,
-        signal,
-      );
-    } catch (e) {
-      signal?.throwIfAborted();
-      warnings.push(
-        `skipped object attribute ${name}: ${e instanceof Error ? e.message : e}`,
-      );
-    }
-  });
+  await mapConcurrent(
+    names,
+    PROPERTY_COLUMN_CONCURRENCY,
+    async (name, index) => {
+      try {
+        decoded[index] = await decodeAttribute(
+          access,
+          levelPath,
+          name,
+          table,
+          chainPaths,
+          warnings,
+          signal,
+        );
+      } catch (e) {
+        signal?.throwIfAborted();
+        warnings.push(
+          `skipped object attribute ${name}: ${e instanceof Error ? e.message : e}`,
+        );
+      }
+    },
+  );
   let groupTags: TagSource[] = [];
   try {
     groupTags = await readGroupTags(access, levelPath, table, warnings, signal);

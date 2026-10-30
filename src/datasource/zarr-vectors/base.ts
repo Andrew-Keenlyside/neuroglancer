@@ -98,3 +98,10 @@ export const ZARR_VECTORS_DENSE_RENDER_LAYER_RPC_ID =
   "zarr-vectors/DenseRenderLayer";
 export const ZARR_VECTORS_DENSE_RENDER_LAYER_UPDATE_SOURCES_RPC_ID =
   "zarr-vectors/DenseRenderLayer.updateSources";
+/**
+ * Frontend -> worker: a level's object table, already read on the frontend,
+ * so the worker's readers need not fetch it again
+ * (`{ storeUrl, levelPath, table }`).
+ */
+export const ZARR_VECTORS_SEED_OBJECT_TABLE_RPC_ID =
+  "zarr-vectors/seedObjectTable";

@@ -36,7 +36,10 @@ import {
   ELEMENT_BYTES,
   isElementType,
 } from "#src/datasource/zarr-vectors/dtype.js";
-import type { FragmentIndex } from "#src/datasource/zarr-vectors/fragment_index.js";
+import type {
+  FragmentIndex,
+  FragmentRows,
+} from "#src/datasource/zarr-vectors/fragment_index.js";
 import { decodeFragments } from "#src/datasource/zarr-vectors/fragment_index.js";
 import { KIND_CAPABILITIES } from "#src/datasource/zarr-vectors/geometry_kind.js";
 import type { LevelCells } from "#src/datasource/zarr-vectors/level_cells.js";
@@ -71,7 +74,7 @@ export interface DecodedChunk {
 
 /** Calls `fn` with each vertex of fragment `f`, in walk order. */
 export function forEachFragmentVertex(
-  fragments: FragmentIndex,
+  fragments: FragmentRows,
   f: number,
   fn: (vertex: number, i: number) => void,
 ) {

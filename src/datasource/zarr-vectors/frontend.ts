@@ -42,6 +42,7 @@ import {
   ZarrVectorsGeometryChunkSourceParameters,
   ZarrVectorsMeshSourceParameters,
   ZarrVectorsObjectSkeletonSourceParameters,
+  ZARR_VECTORS_SEED_OBJECT_TABLE_RPC_ID,
 } from "#src/datasource/zarr-vectors/base.js";
 import {
   attributeLayout,
@@ -53,7 +54,10 @@ import {
   meshGridOffset,
   meshLevels,
 } from "#src/datasource/zarr-vectors/mesh_lod.js";
-import type { ShaderObjectValue } from "#src/datasource/zarr-vectors/objects.js";
+import type {
+  ShaderObjectValue,
+  ZarrVectorsObjectTable,
+} from "#src/datasource/zarr-vectors/objects.js";
 import {
   chooseShaderObjectValues,
   readObjectTable,
@@ -85,6 +89,7 @@ import {
 } from "#src/kvstore/url.js";
 import { VertexPositionFormat } from "#src/mesh/base.js";
 import { MultiscaleMeshSource } from "#src/mesh/frontend.js";
+import type { InlineSegmentPropertyMap } from "#src/segmentation_display_state/property_map.js";
 import { SegmentPropertyMap } from "#src/segmentation_display_state/property_map.js";
 import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import { SkeletonSource } from "#src/skeleton/frontend.js";
@@ -197,6 +202,24 @@ function meshSubsourceEntry(
   };
 }
 
+/**
+ * Segment properties that arrive after the layer does. Their columns are the
+ * largest download of an open and nothing drawn needs them, so the layer is
+ * not kept waiting: it rebuilds its property map when `ready` resolves
+ * (`layer.ts`), and the Seg tab fills in then.
+ */
+export class ZarrVectorsLazyPropertyMap extends SegmentPropertyMap {
+  constructor(readonly ready: Promise<InlineSegmentPropertyMap | undefined>) {
+    super({ inlineProperties: undefined });
+    ready.then(
+      (properties) => {
+        this.inlineProperties = properties;
+      },
+      () => {},
+    );
+  }
+}
+
 async function buildDataSource(
   chunkManager: ChunkManager,
   context: SharedKvStoreContext,
@@ -205,10 +228,56 @@ async function buildDataSource(
   signal: AbortSignal | undefined,
 ): Promise<DataSource> {
   const access = kvStoreAccess(context.kvStoreContext, storeUrl);
+  const warnings: string[] = [];
+  const reportWarnings = () => {
+    for (const w of warnings.splice(0)) warnOnce(`${storeUrl}: ${w}`);
+  };
+  const propertiesOf = (
+    levelPath: string,
+    table: ZarrVectorsObjectTable,
+    chainPaths: string[],
+  ) =>
+    // One unreadable column is a warning, never a store that fails to open.
+    readSegmentProperties(
+      access,
+      levelPath,
+      table,
+      warnings,
+      signal,
+      chainPaths,
+    ).catch((e) => {
+      signal?.throwIfAborted();
+      warnings.push(
+        `segment properties unreadable: ${e instanceof Error ? e.message : e}`,
+      );
+      return undefined;
+    });
+  let early:
+    | {
+        levelPath: string;
+        properties: Promise<InlineSegmentPropertyMap | undefined>;
+      }
+    | undefined;
   const store = await openZarrVectorsStore(
     access,
     selectedAttributes,
     signal,
+    (levelPath, additive) => {
+      // Read while the levels' metadata loads: the subsources, properties
+      // and shader values all wait on it. Shared with the read below.
+      const table = readObjectTable(access, levelPath, signal);
+      table.catch(() => {});
+      // The properties' columns are the largest download of an open. Unless
+      // coarser levels add to level 0 (then the chain, known only once the
+      // levels are read, has a say), they can download now too.
+      if (!additive) {
+        const properties = table.then((t) =>
+          t === undefined ? undefined : propertiesOf(levelPath, t, [levelPath]),
+        );
+        properties.catch(() => {});
+        early = { levelPath, properties };
+      }
+    },
   ).catch((e) => {
     signal?.throwIfAborted();
     throw new Error(`${storeUrl}: ${e instanceof Error ? e.message : e}`, {
@@ -216,7 +285,7 @@ async function buildDataSource(
     });
   });
   const { lowerBounds, upperBounds } = store;
-  const warnings = [...store.warnings];
+  warnings.push(...store.warnings);
   // Object attributes and group membership reach shaders as per-vertex
   // `obj_<name>` / `obj_group`, after the vertex attributes.
   const description = { ...store.description };
@@ -340,6 +409,12 @@ async function buildDataSource(
       })
     : undefined;
   if (table !== undefined) {
+    // The worker's readers get the table from here, not from the store again.
+    chunkManager.rpc!.invoke(ZARR_VECTORS_SEED_OBJECT_TABLE_RPC_ID, {
+      storeUrl,
+      levelPath: levels[0].path,
+      table,
+    });
     const params = {
       storeUrl,
       description,
@@ -347,9 +422,9 @@ async function buildDataSource(
       // In an additive pyramid an object's parts sit at several levels.
       levels: levelChain(store.levels, 0).map((i) => store.levels[i]),
     };
-    subsources.push(
+    const objectEntry: Promise<DataSubsourceEntry> =
       KIND_CAPABILITIES[description.geometryKind].primitive === "triangles"
-        ? await meshSubsource(
+        ? meshSubsource(
             chunkManager,
             context,
             access,
@@ -358,7 +433,7 @@ async function buildDataSource(
             warnings,
             signal,
           )
-        : {
+        : Promise.resolve({
             id: "objects",
             default: true,
             subsource: {
@@ -373,36 +448,27 @@ async function buildDataSource(
                 },
               ),
             },
-          },
-    );
-    // One unreadable column is a warning, never a store that fails to open.
-    const properties = await readSegmentProperties(
-      access,
-      levels[0].path,
-      table,
-      warnings,
-      signal,
-      params.levels.map((level) => level.path),
-    ).catch((e) => {
-      signal?.throwIfAborted();
-      warnings.push(
-        `segment properties unreadable: ${e instanceof Error ? e.message : e}`,
-      );
-      return undefined;
+          });
+    const properties =
+      early !== undefined && early.levelPath === levels[0].path
+        ? early.properties
+        : propertiesOf(
+            levels[0].path,
+            table,
+            params.levels.map((level) => level.path),
+          );
+    subsources.push(await objectEntry);
+    // The properties follow the layer rather than holding it up.
+    subsources.push({
+      id: "properties",
+      default: true,
+      subsource: {
+        segmentPropertyMap: new ZarrVectorsLazyPropertyMap(properties),
+      },
     });
-    if (properties !== undefined) {
-      subsources.push({
-        id: "properties",
-        default: true,
-        subsource: {
-          segmentPropertyMap: new SegmentPropertyMap({
-            inlineProperties: properties,
-          }),
-        },
-      });
-    }
+    properties.then(reportWarnings, () => {});
   }
-  for (const w of warnings) warnOnce(`${storeUrl}: ${w}`);
+  reportWarnings();
   return {
     modelTransform,
     subsources,

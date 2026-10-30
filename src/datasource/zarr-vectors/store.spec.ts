@@ -20,6 +20,8 @@
  * decode to the geometry the writer was given.
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   decodeChunk,
@@ -36,6 +38,7 @@ import {
   chooseShaderObjectValues,
   readObjectTable,
   readSegmentProperties,
+  seedObjectTable,
 } from "#src/datasource/zarr-vectors/objects.js";
 import {
   chunkIndexBounds,
@@ -45,11 +48,15 @@ import {
   safeAttributeId,
 } from "#src/datasource/zarr-vectors/store.js";
 import {
+  FIXTURE_DIR,
   fixtureExpected,
   fixtureListDirectories,
   fixtureRead,
 } from "#src/datasource/zarr-vectors/test_fixtures.js";
-import { ShardIndexCache } from "#src/datasource/zarr-vectors/zarr_array.js";
+import {
+  coalesceRangeReads,
+  ShardIndexCache,
+} from "#src/datasource/zarr-vectors/zarr_array.js";
 
 const expected = fixtureExpected();
 
@@ -159,6 +166,226 @@ describe("per-object reads reproduce the writer's polylines", () => {
       expectSamePolylines(await readAllPolylines(name));
     });
   }
+});
+
+describe("objects read from their own rows", () => {
+  /** `access(store)`, recording every read. */
+  function countingAccess(store: string) {
+    const reads: { path: string; range: any; bytes: number }[] = [];
+    const base = access(store);
+    return {
+      reads,
+      access: {
+        ...base,
+        read: async (relPath: string, options: any) => {
+          const bytes = await base.read(relPath, options);
+          reads.push({
+            path: relPath,
+            range: options?.byteRange,
+            bytes: bytes?.length ?? 0,
+          });
+          return bytes;
+        },
+      },
+    };
+  }
+  const bytesUnder = (
+    reads: { path: string; bytes: number }[],
+    prefix: string,
+  ) =>
+    reads
+      .filter((r) => r.path.startsWith(prefix))
+      .reduce((n, r) => n + r.bytes, 0);
+  /** The sizes of a fixture array's cell files. */
+  const cellSizes = (store: string, array: string) => {
+    const dir = path.join(FIXTURE_DIR, `${store}.zarrvectors/0/${array}/c`);
+    const walk = (d: string): number[] =>
+      fs
+        .readdirSync(d, { withFileTypes: true })
+        .flatMap((e) =>
+          e.isDirectory()
+            ? walk(path.join(d, e.name))
+            : [fs.statSync(path.join(d, e.name)).size],
+        );
+    return walk(dir);
+  };
+  /** One whole cell, the largest. */
+  const largestCell = (store: string, array: string) =>
+    Math.max(...cellSizes(store, array));
+
+  for (const name of ["poly_raw", "poly_raw_shard"]) {
+    it(`${name}: reads one curve in less than a cell, as the whole-cell read has it`, async () => {
+      const whole = await objectReader("poly_zstd");
+      for (let id = 0; id < expected.polylines.length; ++id) {
+        const { reads, access: counted } = countingAccess(name);
+        const store = await openZarrVectorsStore(counted, undefined);
+        reads.length = 0;
+        const reader = new ObjectReader(
+          counted,
+          store.description,
+          store.levels[0],
+        );
+        const got = await reader.readSkeleton(BigInt(id), signal);
+        const want = await whole.readSkeleton(BigInt(id), signal);
+        expect(Array.from(got.positions), `object ${id}`).toEqual(
+          Array.from(want.positions),
+        );
+        expect(Array.from(got.edges), `object ${id}`).toEqual(
+          Array.from(want.edges),
+        );
+        expect(got.attributes.length).toBe(want.attributes.length);
+        got.attributes.forEach((a, k) => {
+          expect(Array.from(a), `object ${id} attribute ${k}`).toEqual(
+            Array.from(want.attributes[k]),
+          );
+        });
+        expect(got.positions.length / 3).toBe(expected.polylines[id].length);
+        expect(
+          bytesUnder(reads, "0/vertices/c/"),
+          `object ${id} vertex bytes`,
+        ).toBeLessThan(largestCell(name, "vertices"));
+        expect(
+          bytesUnder(reads, "0/vertex_attributes/fa/c/"),
+          `object ${id} attribute bytes`,
+        ).toBeLessThan(largestCell(name, "vertex_attributes/fa"));
+      }
+    });
+  }
+
+  it("measures attribute widths at open from cell headers, not whole cells", async () => {
+    const { reads, access: counted } = countingAccess("poly_raw");
+    await openZarrVectorsStore(counted, undefined);
+    const cells = reads.filter(
+      (r) =>
+        r.path.startsWith("0/vertices/c/") ||
+        r.path.startsWith("0/vertex_attributes/fa/c/"),
+    );
+    expect(cells.length).toBeGreaterThan(0);
+    for (const r of cells) {
+      expect(r.range, r.path).toBeDefined();
+      expect(r.bytes, r.path).toBeLessThanOrEqual(8);
+    }
+  });
+
+  it("reads objects loading together in one request per array and cell", async () => {
+    const { reads, access: base } = countingAccess("poly_raw");
+    const counted = { ...base, read: coalesceRangeReads(base.read) };
+    const store = await openZarrVectorsStore(counted, undefined);
+    reads.length = 0;
+    const reader = new ObjectReader(
+      counted,
+      store.description,
+      store.levels[0],
+    );
+    const skeletons = await Promise.all(
+      Array.from({ length: expected.polylines.length }, (_, id) =>
+        reader.readSkeleton(BigInt(id), signal),
+      ),
+    );
+    skeletons.forEach((s, id) => {
+      expect(s.positions.length / 3).toBe(expected.polylines[id].length);
+    });
+    const vertexRequests = reads.filter((r) =>
+      r.path.startsWith("0/vertices/c/"),
+    ).length;
+    // Four cells hold the six curves: one request each (plus the one header
+    // read that measures attribute widths); a request per curve and cell
+    // would be many more.
+    expect(vertexRequests).toBeLessThanOrEqual(
+      cellSizes("poly_raw", "vertices").length + 1,
+    );
+  });
+
+  it("reads the object table and each array's metadata once per store", async () => {
+    const { reads, access: counted } = countingAccess("poly_raw");
+    const [a, b] = await Promise.all([
+      readObjectTable(counted, "0"),
+      readObjectTable(counted, "0"),
+    ]);
+    const c = await readObjectTable(counted, "0");
+    expect(a).toBe(b);
+    expect(a).toBe(c);
+    const count = (suffix: string) =>
+      reads.filter((r) => r.path.endsWith(suffix)).length;
+    expect(count("object_index/zarr.json")).toBe(1);
+    expect(count("object_index/object_ids/zarr.json")).toBe(1);
+    expect(count("object_index/object_ids/c/0")).toBe(1);
+  });
+
+  it("reads only the asked-for entries of a large fragment index", async () => {
+    const whole = await objectReader("poly_zstd");
+    const { reads, access: counted } = countingAccess("poly_raw");
+    const store = await openZarrVectorsStore(counted, undefined);
+    reads.length = 0;
+    // A prefix the fixture's cells exceed: header and bitmap only.
+    const reader = new ObjectReader(
+      counted,
+      store.description,
+      store.levels[0],
+      {
+        fragmentPrefixBytes: 24,
+      },
+    );
+    for (let id = 0; id < expected.polylines.length; ++id) {
+      const got = await reader.readSkeleton(BigInt(id), signal);
+      const want = await whole.readSkeleton(BigInt(id), signal);
+      expect(Array.from(got.positions), `object ${id}`).toEqual(
+        Array.from(want.positions),
+      );
+      expect(Array.from(got.edges), `object ${id}`).toEqual(
+        Array.from(want.edges),
+      );
+    }
+    const indexReads = reads.filter((r) =>
+      r.path.startsWith("0/vertex_fragments/c/"),
+    );
+    expect(indexReads.length).toBeGreaterThan(0);
+    for (const r of indexReads) expect(r.range, r.path).toBeDefined();
+  });
+
+  it("uses a seeded object table instead of reading it", async () => {
+    const table = await readObjectTable(access("poly_raw"), "0");
+    const { reads, access: counted } = countingAccess("poly_raw");
+    seedObjectTable(counted, "0", table!);
+    expect(await readObjectTable(counted, "0")).toBe(table);
+    expect(reads.length).toBe(0);
+  });
+
+  it("reads a point cloud's objects from their own rows", async () => {
+    const ids: number[] = expected.point_object_ids;
+    const points: number[][] = expected.points;
+    // The three objects together fill every cell, so each is read alone.
+    const everyCell = cellSizes("pts_sparse_ids", "vertices").reduce(
+      (n, s) => n + s,
+      0,
+    );
+    for (const [k, id] of ids.entries()) {
+      const { reads, access: counted } = countingAccess("pts_sparse_ids");
+      const store = await openZarrVectorsStore(counted, undefined);
+      reads.length = 0;
+      const reader = new ObjectReader(
+        counted,
+        store.description,
+        store.levels[0],
+      );
+      const skeleton = await reader.readSkeleton(BigInt(id), signal);
+      const got = Array.from(
+        { length: skeleton.positions.length / 3 },
+        (_, v) =>
+          Array.from(skeleton.positions.subarray(3 * v, 3 * v + 3)).join(","),
+      ).sort();
+      const want = points
+        .slice(20 * k, 20 * (k + 1))
+        .map((p) => p.map((c) => Math.fround(c)).join(","))
+        .sort();
+      expect(got, `object ${id}`).toEqual(want);
+      expect(skeleton.edges.length).toBe(0);
+      // Its own 20 rows, not the 60 of every cell.
+      expect(bytesUnder(reads, "0/vertices/c/"), `object ${id}`).toBeLessThan(
+        everyCell / 2,
+      );
+    }
+  });
 });
 
 describe("dense chunks", () => {

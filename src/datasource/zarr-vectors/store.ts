@@ -399,12 +399,9 @@ function vertexSample(
       }
       const dtype = (json.attributes?.dtype ?? "float32") as ElementType;
       for (const cell of candidates) {
-        const bytes = await reader.readCell(cell);
-        if (bytes !== undefined && bytes.byteLength > 0) {
-          return {
-            cell,
-            vertices: bytes.byteLength / (3 * ELEMENT_BYTES[dtype]),
-          };
+        const length = await cellLength(reader, cell);
+        if (length > 0) {
+          return { cell, vertices: length / (3 * ELEMENT_BYTES[dtype]) };
         }
       }
       return undefined;
@@ -440,11 +437,21 @@ async function attributeWidth(
     access.read,
     access.shardIndexes,
   );
-  const bytes = await reader.readCell(found.cell);
-  if (bytes === undefined) return 1;
+  const length = await cellLength(reader, found.cell);
+  if (length === 0) return 1;
   const dtype = attributeDtype(json) as ElementType;
-  const width = bytes.byteLength / (found.vertices * ELEMENT_BYTES[dtype]);
+  const width = length / (found.vertices * ELEMENT_BYTES[dtype]);
   return Number.isInteger(width) && width >= 1 ? width : 1;
+}
+
+/**
+ * A cell's payload length, 0 if empty: from its header alone where the cell
+ * can be read by range (a whole-brain cell is tens of MB), else by reading it.
+ */
+async function cellLength(reader: ZarrArrayReader, cell: number[]) {
+  const length = await reader.cellPayloadLength(cell);
+  if (length !== null) return length;
+  return (await reader.readCell(cell))?.byteLength ?? 0;
 }
 
 /** Chooses the vertex attributes to expose and reads their metadata. */
@@ -682,6 +689,12 @@ export async function openZarrVectorsStore(
   access: ZarrVectorsStoreAccess,
   selectedAttributes: readonly string[] | undefined,
   signal?: AbortSignal,
+  /**
+   * Called with level 0's path as soon as the store is known to have an
+   * object index, before its levels are read, so the caller can start on
+   * the objects meanwhile.
+   */
+  onObjects?: (levelPath: string, additive: boolean) => void,
 ): Promise<ZarrVectorsStore> {
   const { read } = access;
   const root = await readJson(read, "zarr.json", signal);
@@ -753,6 +766,13 @@ export async function openZarrVectorsStore(
         ? 3
         : 2;
   const hasObjects = objectIndex !== undefined;
+  if (hasObjects) {
+    const required = zv.required_capabilities;
+    onObjects?.(
+      paths[0],
+      Array.isArray(required) && required.includes("additive_levels"),
+    );
+  }
   const intraLinks =
     primitive !== "points" && convention !== "implicit_sequential"
       ? intraLinksPath(linkWidth)

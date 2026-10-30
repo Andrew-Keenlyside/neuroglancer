@@ -78,7 +78,9 @@ The dense layer follows the layer's ordinary segment state: selected segments,
 segment colours, colour seed, `selectedAlpha` (2-d) / `objectAlpha` (3-d),
 `notSelectedAlpha` for everything else, and `ignoreNullVisibleSet` (an empty
 selection shows every object). Selected objects are left to `objects` /
-`meshes` while those subsources are enabled. The layer's skeleton shader and
+`meshes` while those subsources are enabled. While the layer would draw
+nothing in a view (`notSelectedAlpha` 0 with the selection drawn by
+`objects` / `meshes`, or every alpha 0) it loads no chunks for that view. The layer's skeleton shader and
 controls apply to both, with `prop_<attribute>()`, `prop_tangent()` and
 `segmentColor()`.
 
@@ -145,18 +147,18 @@ feature per store (and, where it can vary, per chunk), uses it when present,
 and otherwise does what the right-hand column says. Most features change only
 cost; an object index and directory listing also change what can be shown.
 
-| Feature                                                   | Gives                                                 | Without it                                                                                                            |
-| --------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `object_index` (`vlen_manifests_v1`/`v2`)                 | `objects` / `meshes` / `properties` subsources        | dense overview only                                                                                                   |
-| more pyramid levels                                       | dense overview level choice (`dense_lod.ts`)          | level 0 everywhere                                                                                                    |
-| mesh levels whose chunks double and that store faces      | multi-resolution meshes (`mesh_lod.ts`)               | meshes at level 0                                                                                                     |
-| level stamped `fragment_link_groups`                      | one object's faces read alone, by byte range          | whole face cells (`zvtools index-faces` stamps it)                                                                    |
-| uncompressed cells, one per stored chunk (sharded or not) | byte-range reads of rows (bridges, faces, neighbours) | whole cells                                                                                                           |
-| `sharding_indexed`                                        | ranges of one shard read together are merged          | one request per cell                                                                                                  |
-| server directory listing                                  | cross-chunk links found by listing `links/0/`         | edges: the 26 neighbours are probed; faces: missing, warned                                                           |
-| `nonempty_chunks`                                         | empty cells skipped without a request                 | a request that finds nothing                                                                                          |
-| zarr-vectors-tools `skeleton_layout`                      | skeleton layout known                                 | inferred                                                                                                              |
-| `fragment_attributes/object_id`, or ids that are rows     | each fragment's object read directly                  | taken from the level's manifests (a `segment_id` column may hold ids or rows, so it is used only where the two agree) |
+| Feature                                                   | Gives                                                                                                         | Without it                                                                                                            |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `object_index` (`vlen_manifests_v1`/`v2`)                 | `objects` / `meshes` / `properties` subsources                                                                | dense overview only                                                                                                   |
+| more pyramid levels                                       | dense overview level choice (`dense_lod.ts`)                                                                  | level 0 everywhere                                                                                                    |
+| mesh levels whose chunks double and that store faces      | multi-resolution meshes (`mesh_lod.ts`)                                                                       | meshes at level 0                                                                                                     |
+| level stamped `fragment_link_groups`                      | one object's faces read alone, by byte range                                                                  | whole face cells (`zvtools index-faces` stamps it)                                                                    |
+| uncompressed cells, one per stored chunk (sharded or not) | byte-range reads of rows (an object's own curve and its fragments' range entries, bridges, faces, neighbours) | whole cells                                                                                                           |
+| `sharding_indexed`                                        | ranges of one shard read together are merged                                                                  | one request per cell                                                                                                  |
+| server directory listing                                  | cross-chunk links found by listing `links/0/`                                                                 | edges: the 26 neighbours are probed; faces: missing, warned                                                           |
+| `nonempty_chunks`                                         | empty cells skipped without a request                                                                         | a request that finds nothing                                                                                          |
+| zarr-vectors-tools `skeleton_layout`                      | skeleton layout known                                                                                         | inferred                                                                                                              |
+| `fragment_attributes/object_id`, or ids that are rows     | each fragment's object read directly                                                                          | taken from the level's manifests (a `segment_id` column may hold ids or rows, so it is used only where the two agree) |
 
 A feature is trusted only where the data bears it out: a stamped face group
 whose rows index another fragment, or whose count does not match the
@@ -170,10 +172,13 @@ Read through each array's own `zarr.json` (`zarr_array.ts`):
 - Codecs: none, zstd, blosc, gzip, zlib, crc32c; `sharding_indexed` with the
   declared index codecs and location. Codecs and sharding may differ per
   array, as `zvtools attach` and `build_pyramid` produce.
-- Byte-range reads of one key issued together (the cells of a shard that
-  several chunks need) are merged into one request when they lie within 8 KiB
-  of each other (`coalesceRangeReads`). A server that ignores the range and
-  sends more is handled: only the asked-for bytes are kept.
+- Byte-range reads of one key issued within 20 ms of each other (the cells
+  of a shard that several chunks need, the rows of a cell that several
+  objects own) are merged into one request when they lie within 8 KiB of
+  each other, or within a reader's own larger gap (`coalesceRangeReads`);
+  a merged read is padded by a tenth and kept, so later reads inside it cost
+  nothing. A server that ignores the range and sends more is handled: only
+  the asked-for bytes are kept.
 - `chunk_grid_origin` (negative chunk coordinates), `nonempty_chunks`.
 - Positions in any float or integer dtype; vertex attributes of any numeric
   dtype with 1-4 components (from `row_shape`, else `channel_names`, else
@@ -209,8 +214,10 @@ pyramid` write), an object's faces and vertices are read alone, by byte range,
 otherwise the whole cell is read and filtered. The dense overview draws a mesh
 store's vertices and reads no faces.
 
-Caches: decoded chunks (384 MB) and raw vertex cells (128 MB) are shared by
-every reader of a store and bounded by bytes, as are cross-chunk links. The
+Caches: decoded chunks (384 MB), raw vertex cells (128 MB) and the bytes of
+byte-range reads (256 MB; objects requested in later waves find their rows in
+an earlier wave's merged read) are shared by every reader of a store and
+bounded by bytes, as are cross-chunk links. The
 worker drops a store's caches, including its shard indexes, when the last
 layer using it is removed, so a store rewritten in place is read afresh once
 its layer is removed and added again; within one layer there is no live
@@ -233,7 +240,9 @@ Not read yet (reported once in the console):
 ## Segment properties
 
 `properties` is built from level 0's `object_attributes/` (found by listing
-the directory) and its `groups` (`objects.ts`):
+the directory) and its `groups` (`objects.ts`). Its columns are the largest
+download of an open, so the layer does not wait for them: the Seg tab fills
+in when they arrive.
 
 - Numbers keep a Neuroglancer type that holds them exactly: 8-32-bit
   integers as themselves, float16/32/64 as float32, 64-bit integers that fit

@@ -163,7 +163,8 @@ describe("coalesceRangeReads", () => {
         merged("shard", { byteRange: { offset, length } }),
       ),
     );
-    expect(calls).toEqual([{ path: "shard", offset: 0, length: 5100 }]);
+    // One read, padded by a tenth past the end (nothing before offset 0).
+    expect(calls).toEqual([{ path: "shard", offset: 0, length: 5610 }]);
     results.forEach((bytes, i) => {
       const [offset, length] = ranges[i];
       expect(bytes).toEqual(data.slice(offset, offset + length));
@@ -181,6 +182,89 @@ describe("coalesceRangeReads", () => {
       merged("b", { byteRange: { offset: 0, length: 10 } }),
     ]);
     expect(calls.length).toBe(3);
+  });
+
+  it("merges reads issued within the window, and across a caller's gap", async () => {
+    const { calls, read } = source();
+    const merged = coalesceRangeReads(read, 1024);
+    const first = merged("a", { byteRange: { offset: 0, length: 10 } });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = merged("a", {
+      byteRange: { offset: 100_000, length: 10 },
+      mergeGap: 200_000,
+    });
+    // The hint reaches either way, but no further.
+    const third = merged("a", { byteRange: { offset: 400_000, length: 10 } });
+    await Promise.all([first, second, third]);
+    expect(calls).toEqual([
+      { path: "a", offset: 0, length: 110_011 },
+      { path: "a", offset: 399_999, length: 12 },
+    ]);
+    expect(await first).toEqual(data.slice(0, 10));
+    expect(await second).toEqual(data.slice(100_000, 100_010));
+  });
+
+  it("answers a read inside an earlier read from memory", async () => {
+    const { calls, read } = source();
+    const merged = coalesceRangeReads(read);
+    await Promise.all([
+      merged("a", { byteRange: { offset: 0, length: 10 } }),
+      merged("a", { byteRange: { offset: 200, length: 50 } }),
+    ]);
+    expect(calls.length).toBe(1);
+    // Inside the merged read [0, 250): no request, the right bytes, a copy.
+    const inside = await merged("a", {
+      byteRange: { offset: 100, length: 20 },
+    });
+    expect(calls.length).toBe(1);
+    expect(inside).toEqual(data.slice(100, 120));
+    const again = await merged("a", { byteRange: { offset: 100, length: 20 } });
+    expect(again!.buffer).not.toBe(inside!.buffer);
+    // Just past it, in the padding: still no request.
+    await merged("a", { byteRange: { offset: 250, length: 20 } });
+    expect(calls.length).toBe(1);
+    // Well past it: a request.
+    await merged("a", { byteRange: { offset: 300, length: 20 } });
+    expect(calls.length).toBe(2);
+  });
+
+  it("joins a read still on the wire instead of asking again", async () => {
+    const calls: { offset: number; length: number }[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const merged = coalesceRangeReads(async (_path, options) => {
+      const { offset, length } = options.byteRange as any;
+      calls.push({ offset, length });
+      await gate;
+      return data.slice(offset, offset + length);
+    });
+    const first = merged("a", { byteRange: { offset: 100, length: 1000 } });
+    // Past the window: the first read is on the wire, not pending.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(calls.length).toBe(1);
+    const second = merged("a", { byteRange: { offset: 500, length: 20 } });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(calls.length).toBe(1);
+    release();
+    expect(await first).toEqual(data.slice(100, 1100));
+    expect(await second).toEqual(data.slice(500, 520));
+  });
+
+  it("forgets the least recently used bytes past its bound", async () => {
+    const { calls, read } = source();
+    const merged = coalesceRangeReads(read, 0, 1 << 20, 20, 100);
+    await merged("a", { byteRange: { offset: 0, length: 20 } });
+    await merged("b", { byteRange: { offset: 0, length: 20 } });
+    await merged("a", { byteRange: { offset: 0, length: 20 } }); // a is recent
+    await merged("c", { byteRange: { offset: 0, length: 20 } });
+    await merged("d", { byteRange: { offset: 0, length: 20 } });
+    await merged("e", { byteRange: { offset: 0, length: 20 } }); // 100 bytes kept
+    await merged("f", { byteRange: { offset: 0, length: 20 } }); // evicts b
+    expect(calls.length).toBe(6);
+    await merged("a", { byteRange: { offset: 5, length: 5 } });
+    expect(calls.length).toBe(6);
+    await merged("b", { byteRange: { offset: 5, length: 5 } });
+    expect(calls.length).toBe(7);
   });
 
   it("passes whole-object and suffix reads straight through", async () => {
@@ -208,7 +292,7 @@ describe("coalesceRangeReads", () => {
     await expect(aborted).rejects.toBeDefined();
     expect(await kept).toEqual(data.slice(20, 30));
     expect(await alsoKept).toEqual(data.slice(40, 50));
-    expect(calls).toEqual([{ path: "shard", offset: 20, length: 30 }]);
+    expect(calls).toEqual([{ path: "shard", offset: 17, length: 36 }]);
   });
 
   it("reports a missing key to every caller", async () => {

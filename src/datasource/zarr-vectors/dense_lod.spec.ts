@@ -15,8 +15,14 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { levelDensities } from "#src/datasource/zarr-vectors/dense_lod.js";
-import { rowSpans } from "#src/datasource/zarr-vectors/level_cells.js";
+import {
+  denseLayerDraws,
+  levelDensities,
+} from "#src/datasource/zarr-vectors/dense_lod.js";
+import {
+  rangeSpans,
+  rowSpans,
+} from "#src/datasource/zarr-vectors/level_cells.js";
 import { levelChain } from "#src/datasource/zarr-vectors/store.js";
 
 const level = (vertexCount: number | undefined, chunk: number) => ({
@@ -99,6 +105,47 @@ describe("additive levels", () => {
   });
 });
 
+describe("denseLayerDraws", () => {
+  const base = {
+    visibleAlpha: 1,
+    notSelectedAlpha: 0,
+    numVisibleSegments: 7,
+    ignoreNullVisibleSet: true,
+    objectsDrawnElsewhere: true,
+  };
+  it("is false when the selection is drawn elsewhere and the rest is hidden", () => {
+    expect(denseLayerDraws(base)).toBe(false);
+  });
+  it("is true when the rest shows, or the selection is its to draw", () => {
+    expect(denseLayerDraws({ ...base, notSelectedAlpha: 0.1 })).toBe(true);
+    expect(denseLayerDraws({ ...base, objectsDrawnElsewhere: false })).toBe(
+      true,
+    );
+  });
+  it("shows everything for an empty selection, unless that is hidden too", () => {
+    expect(denseLayerDraws({ ...base, numVisibleSegments: 0 })).toBe(true);
+    expect(
+      denseLayerDraws({ ...base, numVisibleSegments: 0, visibleAlpha: 0 }),
+    ).toBe(false);
+    expect(
+      denseLayerDraws({
+        ...base,
+        numVisibleSegments: 0,
+        ignoreNullVisibleSet: false,
+      }),
+    ).toBe(false);
+  });
+  it("is false at alpha 0 everywhere", () => {
+    expect(
+      denseLayerDraws({
+        ...base,
+        visibleAlpha: 0,
+        objectsDrawnElsewhere: false,
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("rowSpans", () => {
   it("joins the closest spans until few enough remain", () => {
     const rows = Array.from({ length: 41 }, (_, i) => i * 10_000 + (i % 3));
@@ -116,6 +163,37 @@ describe("rowSpans", () => {
     expect(rowSpans([1, 5, 9000, 9001], 4096, 16)).toEqual([
       [1, 5],
       [9000, 9001],
+    ]);
+  });
+
+  it("merges whole ranges the same way", () => {
+    expect(
+      rangeSpans(
+        [
+          [0, 9],
+          [12, 20],
+          [9000, 9000],
+        ],
+        4096,
+        16,
+      ),
+    ).toEqual([
+      [0, 20],
+      [9000, 9000],
+    ]);
+    expect(
+      rangeSpans(
+        [
+          [0, 0],
+          [10000, 10010],
+          [20000, 20000],
+        ],
+        100,
+        2,
+      ),
+    ).toEqual([
+      [0, 0],
+      [10000, 20000],
     ]);
   });
 });

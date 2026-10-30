@@ -32,10 +32,15 @@ import {
   ZarrVectorsGeometryChunkSourceParameters,
   ZarrVectorsMeshSourceParameters,
   ZarrVectorsObjectSkeletonSourceParameters,
+  ZARR_VECTORS_SEED_OBJECT_TABLE_RPC_ID,
 } from "#src/datasource/zarr-vectors/base.js";
 import type { DenseChunkData } from "#src/datasource/zarr-vectors/chunk_pipeline.js";
 import { LevelPipeline } from "#src/datasource/zarr-vectors/chunk_pipeline.js";
-import { forEachDenseChunkToLoad } from "#src/datasource/zarr-vectors/dense_lod.js";
+import {
+  DRAWS_2D,
+  DRAWS_3D,
+  forEachDenseChunkToLoad,
+} from "#src/datasource/zarr-vectors/dense_lod.js";
 import {
   objectMeshLayout,
   partitionMeshFragment,
@@ -45,6 +50,8 @@ import {
   mergeSkeletons,
   ObjectReader,
 } from "#src/datasource/zarr-vectors/object_reader.js";
+import type { ZarrVectorsObjectTable } from "#src/datasource/zarr-vectors/objects.js";
+import { seedObjectTable } from "#src/datasource/zarr-vectors/objects.js";
 import type { ZarrVectorsStoreAccess } from "#src/datasource/zarr-vectors/store.js";
 import { kvStoreAccess } from "#src/datasource/zarr-vectors/store.js";
 import type { SharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
@@ -89,6 +96,22 @@ const accesses = new Map<
   { access: ZarrVectorsStoreAccess; users: number }
 >();
 
+/** Object tables the frontend sent, by store URL then level path. */
+const seededTables = new Map<string, Map<string, ZarrVectorsObjectTable>>();
+
+registerRPC(ZARR_VECTORS_SEED_OBJECT_TABLE_RPC_ID, function (x) {
+  const { storeUrl, levelPath, table } = x as {
+    storeUrl: string;
+    levelPath: string;
+    table: ZarrVectorsObjectTable;
+  };
+  let tables = seededTables.get(storeUrl);
+  if (tables === undefined) seededTables.set(storeUrl, (tables = new Map()));
+  tables.set(levelPath, table);
+  const entry = accesses.get(storeUrl);
+  if (entry !== undefined) seedObjectTable(entry.access, levelPath, table);
+});
+
 /**
  * One access (and shard-index cache) per store, shared by its sources while
  * any is alive. Dropped with the last, so a store rewritten in place is read
@@ -108,12 +131,16 @@ function storeAccess(
       users: 0,
     };
     accesses.set(storeUrl, entry);
+    for (const [levelPath, table] of seededTables.get(storeUrl) ?? []) {
+      seedObjectTable(entry.access, levelPath, table);
+    }
   }
   const used = entry;
   ++used.users;
   owner.registerDisposer(() => {
     if (--used.users === 0 && accesses.get(storeUrl) === used) {
       accesses.delete(storeUrl);
+      seededTables.delete(storeUrl);
     }
   });
   return used.access;
@@ -440,6 +467,8 @@ export class ZarrVectorsDenseRenderLayerBackend extends withChunkManager(
   localPosition: SharedWatchableValue<Float32Array>;
   renderScaleTarget2d: SharedWatchableValue<number>;
   renderScaleTarget3d: SharedWatchableValue<number>;
+  /** `DRAWS_3D` | `DRAWS_2D`: the views the layer shows anything in. */
+  drawMask: SharedWatchableValue<number>;
   densities: number[];
   chains: number[][];
 
@@ -453,6 +482,7 @@ export class ZarrVectorsDenseRenderLayerBackend extends withChunkManager(
     this.localPosition = rpc.get(options.localPosition);
     this.renderScaleTarget2d = rpc.get(options.renderScaleTarget2d);
     this.renderScaleTarget3d = rpc.get(options.renderScaleTarget3d);
+    this.drawMask = rpc.get(options.drawMask);
     this.densities = options.densities;
     this.chains = options.chains;
     const schedule = () => this.chunkManager.scheduleUpdateChunkPriorities();
@@ -460,6 +490,7 @@ export class ZarrVectorsDenseRenderLayerBackend extends withChunkManager(
       this.localPosition,
       this.renderScaleTarget2d,
       this.renderScaleTarget3d,
+      this.drawMask,
     ]) {
       this.registerDisposer(value.changed.add(schedule));
     }
@@ -509,9 +540,13 @@ export class ZarrVectorsDenseRenderLayerBackend extends withChunkManager(
       ) {
         continue;
       }
+      const { isSliceView } = state;
+      // A layer that would draw nothing in this view loads nothing for it.
+      if ((this.drawMask.value & (isSliceView ? DRAWS_2D : DRAWS_3D)) === 0) {
+        continue;
+      }
       const priorityTier = getPriorityTier(visibility);
       const basePriority = getBasePriority(visibility);
-      const { isSliceView } = state;
       const renderScaleTarget = (
         isSliceView ? this.renderScaleTarget2d : this.renderScaleTarget3d
       ).value;

@@ -49,7 +49,10 @@ import {
   setShaderControls,
 } from "#src/datasource/zarr-vectors/compat.js";
 import {
+  denseLayerDraws,
   denseLevelSpacing,
+  DRAWS_2D,
+  DRAWS_3D,
   selectDenseLevel,
 } from "#src/datasource/zarr-vectors/dense_lod.js";
 import { KIND_CAPABILITIES } from "#src/datasource/zarr-vectors/geometry_kind.js";
@@ -712,9 +715,31 @@ export interface ZarrVectorsDenseLayerOptions {
   displayState: ZarrVectorsDenseDisplayState;
 }
 
+/** The {@link DenseDrawState} of a view, from the layer's display state. */
+function denseDrawState(
+  displayState: ZarrVectorsDenseDisplayState,
+  isSliceView: boolean,
+) {
+  const groupState = displayState.segmentationGroupState.value;
+  return {
+    visibleAlpha: isSliceView
+      ? displayState.selectedAlpha.value
+      : displayState.objectAlpha.value,
+    notSelectedAlpha: displayState.notSelectedAlpha.value,
+    numVisibleSegments: getVisibleSegments(groupState).hashTable.size,
+    ignoreNullVisibleSet: displayState.ignoreNullVisibleSet.value,
+    objectsDrawnElsewhere: displayState.objectsDrawnElsewhere.value,
+  };
+}
+
 /** Shared state of the 2-D and 3-D render layers of one subsource. */
 export class ZarrVectorsDenseLayer extends RefCounted {
   backend: ChunkRenderLayerFrontend;
+  /**
+   * Which views this layer draws anything in (`DRAWS_3D` | `DRAWS_2D`),
+   * shared with the worker so a layer that shows nothing loads nothing.
+   */
+  drawMask = new WatchableValue(DRAWS_3D | DRAWS_2D);
   fallbackShaderParameters = new WatchableValue(
     getFallbackBuilderState(parseShaderUiControls(DEFAULT_FRAGMENT_MAIN)),
   );
@@ -729,12 +754,41 @@ export class ZarrVectorsDenseLayer extends RefCounted {
     this.redrawNeeded = redrawNeeded;
     const { chunkManager, displayState } = options;
     const rpc = chunkManager.rpc!;
+    const updateMask = () => {
+      this.drawMask.value =
+        (denseLayerDraws(denseDrawState(displayState, false)) ? DRAWS_3D : 0) |
+        (denseLayerDraws(denseDrawState(displayState, true)) ? DRAWS_2D : 0);
+    };
+    for (const value of [
+      displayState.objectAlpha,
+      displayState.selectedAlpha,
+      displayState.notSelectedAlpha,
+      displayState.ignoreNullVisibleSet,
+      displayState.objectsDrawnElsewhere,
+    ]) {
+      this.registerDisposer(value.changed.add(updateMask));
+    }
+    this.registerDisposer(
+      registerNested((context, groupState) => {
+        for (const value of [
+          groupState.visibleSegments,
+          groupState.temporaryVisibleSegments,
+          groupState.useTemporaryVisibleSegments,
+        ]) {
+          context.registerDisposer(value.changed.add(updateMask));
+        }
+        updateMask();
+      }, displayState.segmentationGroupState),
+    );
     const backend = (this.backend = this.registerDisposer(
       new ChunkRenderLayerFrontend(layerChunkProgressInfo),
     ));
     backend.RPC_TYPE_ID = ZARR_VECTORS_DENSE_RENDER_LAYER_RPC_ID;
     backend.initializeCounterpart(rpc, {
       chunkManager: chunkManager.rpcId,
+      drawMask: this.registerDisposer(
+        SharedWatchableValue.makeFromExisting(rpc, this.drawMask),
+      ).rpcId,
       localPosition: this.registerDisposer(
         SharedWatchableValue.makeFromExisting(rpc, displayState.localPosition),
       ).rpcId,
@@ -1028,7 +1082,9 @@ function DenseRenderLayer<
       const visibleAlpha = targetIsSliceView
         ? displayState.selectedAlpha.value
         : displayState.objectAlpha.value;
-      if (visibleAlpha <= 0 && displayState.notSelectedAlpha.value <= 0) return;
+      if (!denseLayerDraws(denseDrawState(displayState, targetIsSliceView))) {
+        return;
+      }
       const { projectionParameters } = renderContext;
       const modelMatrix = this.modelMatrix(
         attachment,

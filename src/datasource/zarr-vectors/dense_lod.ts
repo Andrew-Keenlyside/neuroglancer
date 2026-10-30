@@ -34,6 +34,42 @@ import { mat3, mat3FromMat4, prod3 } from "#src/util/geom.js";
 
 const tempMat3 = mat3.create();
 
+/** The dense layer's segment state that decides whether it draws at all. */
+export interface DenseDrawState {
+  /** `selectedAlpha` in a cross-section, `objectAlpha` in 3-d. */
+  visibleAlpha: number;
+  notSelectedAlpha: number;
+  numVisibleSegments: number;
+  ignoreNullVisibleSet: boolean;
+  /** Selected objects are drawn by the `objects` / `meshes` subsource. */
+  objectsDrawnElsewhere: boolean;
+}
+
+/**
+ * Whether the dense layer would draw anything for a view: what its shader
+ * is told (`beginLayer`), decided before any chunk is requested. Nothing
+ * shows when every vertex would be drawn at alpha 0: objects not selected
+ * at `notSelectedAlpha` 0, and the selected ones at alpha 0 or left to the
+ * `objects` / `meshes` subsource. Then no chunk is loaded.
+ */
+export function denseLayerDraws(state: DenseDrawState): boolean {
+  const {
+    visibleAlpha,
+    notSelectedAlpha,
+    numVisibleSegments,
+    ignoreNullVisibleSet,
+    objectsDrawnElsewhere,
+  } = state;
+  // An empty selection shows every object as visible.
+  if (numVisibleSegments === 0 && ignoreNullVisibleSet) return visibleAlpha > 0;
+  if (notSelectedAlpha > 0) return true;
+  return visibleAlpha > 0 && numVisibleSegments > 0 && !objectsDrawnElsewhere;
+}
+
+/** Bits of the mask the frontend shares with the chunk worker. */
+export const DRAWS_3D = 1;
+export const DRAWS_2D = 2;
+
 /**
  * Volume of a view frustum.  Neuroglancer's helper was renamed
  * (`getViewFrustrumVolume`, later `getViewFrustumVolume`), so a copy lives here.

@@ -7,10 +7,12 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  decodeFragmentHeader,
+  decodeFragments,
   FRAGMENT_INDEX_MAGIC,
   FRAGMENT_INDEX_VERSION,
+  FRAGMENT_RANGE_ENTRY_BYTES,
   FragmentIndex,
-  decodeFragments,
 } from "#src/datasource/zarr-vectors/fragment_index.js";
 
 /**
@@ -261,6 +263,56 @@ describe("decodeFragments — v1 fragment-index layout", () => {
     // Re-querying:
     expect(fi.isRange(2)).toBe(true);
     expect(fi.range(2)).toEqual({ start: 10, count: 2 });
+  });
+});
+
+describe("decodeFragmentHeader", () => {
+  it("addresses each range entry by byte offset, as the whole decode has it", () => {
+    const blob = buildBlob(
+      3,
+      [true, false, true],
+      [
+        { start: 0, count: 4 },
+        { start: 10, count: 2 },
+      ],
+      [0, 2],
+      [20, 5],
+    );
+    const head = decodeFragmentHeader(blob);
+    expect(head).toEqual({
+      numFragments: 3,
+      numRangeFragments: 2,
+      tableOffset: 16 + 8,
+    });
+    const whole = decodeFragments(blob);
+    const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+    let row = 0;
+    for (let f = 0; f < 3; ++f) {
+      if (!whole.isRange(f)) continue;
+      const at = head.tableOffset + FRAGMENT_RANGE_ENTRY_BYTES * row++;
+      expect({
+        start: Number(view.getBigInt64(at, true)),
+        count: Number(view.getBigInt64(at + 8, true)),
+      }).toEqual(whole.range(f));
+    }
+    expect(() => decodeFragmentHeader(blob.subarray(0, 8))).toThrow();
+  });
+});
+
+describe("FragmentIndex.rowBound", () => {
+  it("is one past the highest row of any fragment, range or explicit", () => {
+    const blob = buildBlob(
+      3,
+      [true, false, true],
+      [
+        { start: 0, count: 4 },
+        { start: 10, count: 2 },
+      ],
+      [0, 2],
+      [20, 5],
+    );
+    expect(decodeFragments(blob).rowBound()).toBe(21);
+    expect(decodeFragments(buildBlob(0, [], [], [0], [])).rowBound()).toBe(0);
   });
 });
 
