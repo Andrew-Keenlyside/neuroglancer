@@ -246,6 +246,12 @@ export interface ViewerOptions
   showLayerDialog: boolean;
   inputEventBindings: InputEventBindings;
   resetStateWhenEmpty: boolean;
+  /**
+   * When true, the viewer creates none of its side panels (layer list, layer
+   * controls, selection details, statistics, help, settings, tool palettes):
+   * an embedding application shows that state in its own UI instead.
+   */
+  externalSidePanels: boolean;
 }
 
 const defaultViewerOptions =
@@ -591,6 +597,7 @@ export class Viewer extends RefCounted implements ViewerState {
 
   showLayerDialog: boolean;
   resetStateWhenEmpty: boolean;
+  externalSidePanels: boolean;
 
   get inputEventMap() {
     return this.inputEventBindings.global;
@@ -655,7 +662,12 @@ export class Viewer extends RefCounted implements ViewerState {
     setViewerUiConfiguration(uiConfiguration, options);
 
     const optionsWithDefaults = { ...defaultViewerOptions, ...options };
-    const { resetStateWhenEmpty, showLayerDialog } = optionsWithDefaults;
+    const {
+      resetStateWhenEmpty,
+      showLayerDialog,
+      externalSidePanels = false,
+    } = optionsWithDefaults;
+    this.externalSidePanels = externalSidePanels;
 
     // The top bar override, like the layer panel override below, may hide the
     // top bar within what the configuration permits, but can never reveal one
@@ -801,6 +813,13 @@ export class Viewer extends RefCounted implements ViewerState {
     this.registerDisposer(
       new PlaybackManager(this.display, this.position, this.velocity),
     );
+  }
+
+  private registerSidePanel(
+    registration: Parameters<SidePanelManager["registerPanel"]>[0],
+  ): () => void {
+    if (this.externalSidePanels) return () => {};
+    return this.sidePanelManager.registerPanel(registration);
   }
 
   private updateShowBorders() {
@@ -1082,7 +1101,7 @@ export class Viewer extends RefCounted implements ViewerState {
       new SidePanelManager(this.display, this.layout.element, this.visibility),
     );
     this.registerDisposer(
-      this.sidePanelManager.registerPanel({
+      this.registerSidePanel({
         location: this.layerListPanelState.location,
         makePanel: () =>
           new LayerListPanel(
@@ -1094,14 +1113,16 @@ export class Viewer extends RefCounted implements ViewerState {
           ),
       }),
     );
+    if (!this.externalSidePanels) {
+      this.registerDisposer(
+        new LayerSidePanelManager(
+          this.sidePanelManager,
+          this.selectedLayer.addRef(),
+        ),
+      );
+    }
     this.registerDisposer(
-      new LayerSidePanelManager(
-        this.sidePanelManager,
-        this.selectedLayer.addRef(),
-      ),
-    );
-    this.registerDisposer(
-      this.sidePanelManager.registerPanel({
+      this.registerSidePanel({
         location: this.selectionDetailsState.location,
         makePanel: () =>
           new SelectionDetailsPanel(
@@ -1115,7 +1136,7 @@ export class Viewer extends RefCounted implements ViewerState {
     gridContainer.appendChild(this.sidePanelManager.element);
 
     this.registerDisposer(
-      this.sidePanelManager.registerPanel({
+      this.registerSidePanel({
         location: this.statisticsDisplayState.location,
         makePanel: () =>
           new StatisticsPanel(
@@ -1127,7 +1148,7 @@ export class Viewer extends RefCounted implements ViewerState {
     );
 
     this.registerDisposer(
-      this.sidePanelManager.registerPanel({
+      this.registerSidePanel({
         location: this.helpPanelState.location,
         makePanel: () => {
           const { inputEventBindings } = this;
@@ -1147,7 +1168,7 @@ export class Viewer extends RefCounted implements ViewerState {
     );
 
     this.registerDisposer(
-      this.sidePanelManager.registerPanel({
+      this.registerSidePanel({
         location: this.settingsPanelState.location,
         makePanel: () =>
           new ViewerSettingsPanel(
@@ -1158,9 +1179,11 @@ export class Viewer extends RefCounted implements ViewerState {
       }),
     );
 
-    this.registerDisposer(
-      new MultiToolPaletteManager(this.sidePanelManager, this.toolPalettes),
-    );
+    if (!this.externalSidePanels) {
+      this.registerDisposer(
+        new MultiToolPaletteManager(this.sidePanelManager, this.toolPalettes),
+      );
+    }
 
     const updateVisibility = () => {
       const shouldBeVisible = this.visibility.visible;
