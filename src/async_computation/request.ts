@@ -15,6 +15,7 @@
  */
 
 import type { AsyncComputationSpec } from "#src/async_computation/index.js";
+import { getAsyncComputationWorkerFactory } from "#src/worker_factories.js";
 
 let numWorkers = 0;
 const freeWorkers: Worker[] = [];
@@ -51,11 +52,13 @@ function launchWorker() {
   // Note: For compatibility with multiple bundlers, a browser-compatible URL
   // must be used with `new URL`, which means a Node.js subpath import like
   // "#src/async_computation.bundle.js" cannot be used.
-  const worker = new Worker(
-    /* webpackChunkName: "neuroglancer_async_computation" */
-    new URL("../async_computation.bundle.js", import.meta.url),
-    { type: "module" },
-  );
+  const worker =
+    getAsyncComputationWorkerFactory()?.() ??
+    new Worker(
+      /* webpackChunkName: "neuroglancer_async_computation" */
+      new URL("../async_computation.bundle.js", import.meta.url),
+      { type: "module" },
+    );
   let ready = false;
   worker.onmessage = (msg) => {
     // First message indicates worker is ready.

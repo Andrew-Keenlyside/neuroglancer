@@ -22,6 +22,7 @@ import {
 } from "#src/chunk_manager/frontend.js";
 import { RefCounted } from "#src/util/disposable.js";
 import type { GL } from "#src/webgl/context.js";
+import { getChunkWorkerFactory } from "#src/worker_factories.js";
 import { RPC } from "#src/worker_rpc.js";
 
 export class DataManagementContext extends RefCounted {
@@ -41,11 +42,13 @@ export class DataManagementContext extends RefCounted {
     // Note: For compatibility with multiple bundlers, a browser-compatible URL
     // must be used with `new URL`, which means a Node.js subpath import like
     // "#src/chunk_worker.bundle.js" cannot be used.
-    this.worker = new Worker(
-      /* webpackChunkName: "neuroglancer_chunk_worker" */
-      new URL("./chunk_worker.bundle.js", import.meta.url),
-      { type: "module" },
-    );
+    this.worker =
+      getChunkWorkerFactory()?.() ??
+      new Worker(
+        /* webpackChunkName: "neuroglancer_chunk_worker" */
+        new URL("./chunk_worker.bundle.js", import.meta.url),
+        { type: "module" },
+      );
     this.chunkQueueManager = this.registerDisposer(
       new ChunkQueueManager(
         new RPC(this.worker, /*waitUntilReady=*/ true),
