@@ -1026,6 +1026,31 @@ export class LayerManager extends RefCounted {
     this.remove(index);
   }
 
+  /**
+   * Makes `layers` the list, in that order.  Assumes ownership of a reference
+   * to each layer not already in the list; layers no longer in it are unbound
+   * (which releases the list's reference).
+   */
+  replaceManagedLayers(layers: ManagedUserLayer[]) {
+    const keep = new Set(layers);
+    const removed = this.managedLayers.filter((layer) => !keep.has(layer));
+    for (const managedLayer of layers) {
+      if (!this.layerSet.has(managedLayer)) {
+        this.updateSignalBindings(managedLayer, addSignalBinding);
+        this.layerSet.add(managedLayer);
+        managedLayer.containers.add(this);
+      }
+    }
+    this.managedLayers.length = 0;
+    this.managedLayers.push(...layers);
+    for (const managedLayer of removed) {
+      this.layerSet.delete(managedLayer);
+      this.unbindManagedLayer(managedLayer);
+    }
+    this.layersChanged.dispatch();
+    this.readyStateChanged.dispatch();
+  }
+
   reorderManagedLayer(oldIndex: number, newIndex: number) {
     const numLayers = this.managedLayers.length;
     if (
@@ -2144,6 +2169,87 @@ export abstract class LayerListSpecification extends RefCounted {
   abstract rootLayers: Borrowed<LayerManager>;
 }
 
+function normalizeLayerListSpecification(x: any): any[] {
+  if (Array.isArray(x)) return x;
+  verifyObject(x);
+  return Object.entries(x).map(([name, layerSpec]) => {
+    if (typeof layerSpec === "string") {
+      return { name, source: layerSpec };
+    }
+    verifyObject(layerSpec);
+    return { ...(layerSpec as any), name };
+  });
+}
+
+/** JSON with object keys sorted, so that equal specifications compare equal. */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, v) => {
+    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+      const sorted: Record<string, unknown> = {};
+      for (const k of Object.keys(v).sort()) sorted[k] = v[k];
+      return sorted;
+    }
+    return v;
+  });
+}
+
+/**
+ * Whether `managedLayer` can stand for `spec` unchanged: its serialized
+ * specification equals `spec`, apart from visibility, which is applied here.
+ */
+function reuseManagedLayer(managedLayer: ManagedUserLayer, spec: any) {
+  if (managedLayer.layer === null || !managedLayer.layer.isReady) return false;
+  const current = managedLayer.toJSON();
+  if (current === undefined) return false;
+  const strip = (layerSpec: any) => {
+    const { visible: _visible, archived: _archived, ...rest } = layerSpec;
+    return canonicalJson(rest);
+  };
+  if (strip(current) !== strip(spec)) return false;
+  const archived = spec.archived === true;
+  if (archived !== managedLayer.archived) return false;
+  if (!archived) managedLayer.setVisible(spec.visible !== false);
+  return true;
+}
+
+const RETIRED_LAYER_TIMEOUT_MS = 30000;
+
+/**
+ * Disposes `retired` once every layer in `waitFor` is ready (or after a
+ * timeout), keeping the data sources the retired layers hold alive meanwhile.
+ */
+function releaseWhenReady(
+  layerManager: LayerManager,
+  waitFor: ManagedUserLayer[],
+  retired: ManagedUserLayer[],
+) {
+  if (retired.length === 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let unsubscribe: (() => void) | undefined;
+  const release = () => {
+    unsubscribe?.();
+    unsubscribe = undefined;
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    for (const managedLayer of retired.splice(0)) managedLayer.dispose();
+  };
+  const ready = () =>
+    waitFor.every(
+      (managedLayer) =>
+        managedLayer.wasDisposed ||
+        managedLayer.layer === null ||
+        managedLayer.isReady() === true,
+    );
+  if (waitFor.length === 0 || ready()) {
+    release();
+    return;
+  }
+  unsubscribe = layerManager.readyStateChanged.add(() => {
+    if (ready()) release();
+  });
+  timer = setTimeout(release, RETIRED_LAYER_TIMEOUT_MS);
+}
+
 export class TopLevelLayerListSpecification extends LayerListSpecification {
   get rpc() {
     return this.chunkManager.rpc!;
@@ -2186,56 +2292,84 @@ export class TopLevelLayerListSpecification extends LayerListSpecification {
     this.layerManager.clear();
   }
 
+  /**
+   * Restores the layer list incrementally.
+   *
+   * A layer whose specification is unchanged, or differs only in visibility,
+   * is kept as it is.  Any other layer is replaced, and the layers it replaces
+   * (or that are removed) stay alive, unbound, until the new layers are ready:
+   * data sources they share are then not released and fetched again.  So
+   * restoring a state that differs from the current one in a single layer, or
+   * only outside the layer list, reloads nothing else.
+   */
   restoreState(x: any) {
-    this.layerManager.clear();
-    let layerSpecs: any[];
-    if (!Array.isArray(x)) {
-      verifyObject(x);
-      layerSpecs = Object.entries(x).map(([name, layerSpec]) => {
-        if (typeof layerSpec === "string") {
-          return { name, source: layerSpec };
-        }
-        verifyObject(layerSpec);
-        return { ...(layerSpec as any), name };
-      });
-    } else {
-      layerSpecs = x;
+    const layerSpecs = normalizeLayerListSpecification(x);
+    const { layerManager } = this;
+    const previous = new Map<string, ManagedUserLayer>();
+    for (const managedLayer of layerManager.managedLayers) {
+      if (!previous.has(managedLayer.name)) {
+        previous.set(managedLayer.name, managedLayer);
+      }
     }
+    const next: ManagedUserLayer[] = [];
+    const kept = new Set<ManagedUserLayer>();
+    const usedNames = new Set<string>();
     const layersToRestore: { managedLayer: ManagedUserLayer; spec: any }[] = [];
     for (const layerSpec of layerSpecs) {
       verifyObject(layerSpec);
-      const name = this.layerManager.getUniqueLayerName(
-        verifyObjectProperty(layerSpec, "name", verifyString),
+      const requestedName = verifyObjectProperty(
+        layerSpec,
+        "name",
+        verifyString,
       );
+      const old = previous.get(requestedName);
+      if (
+        old !== undefined &&
+        !kept.has(old) &&
+        reuseManagedLayer(old, layerSpec)
+      ) {
+        kept.add(old);
+        next.push(old);
+        usedNames.add(requestedName);
+        continue;
+      }
+      let name = requestedName;
+      for (let suffix = 1; usedNames.has(name); ++suffix) {
+        name = requestedName + suffix;
+      }
+      usedNames.add(name);
       const managedLayer = new ManagedUserLayer(name, this);
       try {
         initializeLayerFromSpecNoRestoreState(managedLayer, layerSpec);
-        this.layerManager.addManagedLayer(managedLayer);
+        next.push(managedLayer);
         layersToRestore.push({ managedLayer, spec: layerSpec });
       } catch (e) {
         managedLayer.dispose();
         const msg = new StatusMessage();
         msg.setErrorMessage(
-          `Error creating layer ${JSON.stringify(name)}: ` +
-            (e instanceof Error)
-            ? e.message
-            : "" + e,
+          `Error creating layer ${JSON.stringify(name)}: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
     }
+    const retired = layerManager.managedLayers
+      .filter((managedLayer) => !kept.has(managedLayer))
+      .map((managedLayer) => managedLayer.addRef());
+    layerManager.replaceManagedLayers(next);
     for (const { managedLayer, spec } of layersToRestore) {
       try {
         completeUserLayerInitialization(managedLayer, spec);
       } catch (e) {
         const msg = new StatusMessage();
         msg.setErrorMessage(
-          `Error creating layer ${JSON.stringify(name)}: ` +
-            (e instanceof Error)
-            ? e.message
-            : "" + e,
+          `Error creating layer ${JSON.stringify(managedLayer.name)}: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
     }
+    releaseWhenReady(
+      layerManager,
+      layersToRestore.map(({ managedLayer }) => managedLayer),
+      retired,
+    );
   }
 
   add(layer: ManagedUserLayer, index?: number | undefined) {
