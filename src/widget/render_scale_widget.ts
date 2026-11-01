@@ -139,7 +139,8 @@ export class RenderScaleWidget extends RefCounted {
     );
 
     const getTargetValue = (event: MouseEvent) => {
-      const position = (event.offsetX / canvas.width) * this.histogram.numBins;
+      const [start, end] = this.binWindow;
+      const position = start + (event.offsetX / canvas.width) * (end - start);
       return getRenderScaleFromHistogramOffset(
         position,
         this.histogram.logScaleOrigin,
@@ -191,6 +192,31 @@ export class RenderScaleWidget extends RefCounted {
     this.target.reset();
   }
 
+  /**
+   * The bins shown, [start, end): the levels' range and the target, with a
+   * margin, so the levels spread across the width.  Kept while what is
+   * drawn stays inside, so it does not jump about.
+   */
+  binWindow: [number, number] = [0, 0];
+
+  /** The last levels drawn, kept to show (greyed) while the layer is hidden. */
+  private lastData: Uint32Array | undefined;
+  private lastScales: Map<number, number> | undefined;
+
+  private updateBinWindow(lo: number, hi: number) {
+    const { numBins } = this.histogram;
+    const [start, end] = this.binWindow;
+    const span = Math.max(2, hi - lo);
+    const margin = Math.max(1, span * 0.25);
+    const wanted: [number, number] = [
+      Math.max(0, lo - margin),
+      Math.min(numBins, hi + margin),
+    ];
+    const inside = lo >= start && hi <= end;
+    const tooWide = end - start > (wanted[1] - wanted[0]) * 2;
+    if (!inside || tooWide) this.binWindow = wanted;
+  }
+
   updateView() {
     const { ctx } = this;
     const { canvas } = this;
@@ -208,18 +234,59 @@ export class RenderScaleWidget extends RefCounted {
 
     const { numBins } = this.histogram;
 
-    function binToCanvasX(bin: number) {
-      return (bin * width) / numBins;
-    }
-
     ctx.clearRect(0, 0, width, height);
 
     const { histogram } = this;
     // histogram.begin(this.frameNumberCounter.frameNumber);
-    const { value: histogramData, spatialScales } = histogram;
+    let { value: histogramData, spatialScales } = histogram;
 
     if (!histogram.visibility.visible) {
       histogramData.fill(0);
+    }
+
+    // Which bins hold anything; while none do (the layer is hidden or not
+    // drawn), the last levels seen are shown greyed, and the target can
+    // still be set against them.
+    let lo = Infinity;
+    let hi = -Infinity;
+    const occupied = (data: Uint32Array, rows: number) => {
+      lo = Infinity;
+      hi = -Infinity;
+      for (let bin = 0; bin < numBins; ++bin) {
+        for (let row = 0; row < rows; ++row) {
+          const index = row * numBins * 2 + bin;
+          if (data[index] + data[index + numBins] > 0) {
+            lo = Math.min(lo, bin);
+            hi = Math.max(hi, bin + 1);
+            break;
+          }
+        }
+      }
+    };
+    occupied(histogramData, spatialScales.size);
+    const inactive = lo === Infinity;
+    if (!inactive) {
+      this.lastData = histogramData.slice();
+      this.lastScales = new Map(spatialScales);
+    } else if (this.lastData !== undefined && this.lastScales !== undefined) {
+      histogramData = this.lastData;
+      spatialScales = this.lastScales;
+      occupied(histogramData, spatialScales.size);
+    }
+    const targetBin = getRenderScaleHistogramOffset(
+      targetValue,
+      this.histogram.logScaleOrigin,
+      this.histogram.binSize,
+    );
+    if (lo === Infinity) {
+      lo = targetBin - 2;
+      hi = targetBin + 2;
+    }
+    this.updateBinWindow(Math.min(lo, targetBin), Math.max(hi, targetBin + 1));
+    const [windowStart, windowEnd] = this.binWindow;
+
+    function binToCanvasX(bin: number) {
+      return ((bin - windowStart) * width) / (windowEnd - windowStart);
     }
 
     const sortedSpatialScales = Array.from(spatialScales.keys());
@@ -313,7 +380,11 @@ export class RenderScaleWidget extends RefCounted {
     }`;
 
     const spatialScaleColors = sortedSpatialScales.map((spatialScale) => {
-      const saturation = spatialScale === hoverSpatialScale ? 0.5 : 1;
+      const saturation = inactive
+        ? 0
+        : spatialScale === hoverSpatialScale
+          ? 0.5
+          : 1;
       let hue;
       if (Number.isFinite(spatialScale)) {
         hue = (((Math.log2(spatialScale) * 0.1) % 1) + 1) % 1;
@@ -352,6 +423,18 @@ export class RenderScaleWidget extends RefCounted {
         ctx.fillStyle = spatialScaleColors[spatialScaleIndex][0];
         ctx.fillRect(xStart, ySplit, xEnd - xStart, yStart - ySplit);
       }
+    }
+
+    if (inactive) {
+      ctx.fillStyle = "rgba(255, 255, 255, 0.55)";
+      ctx.font = "11px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(
+        this.lastData === undefined ? "inactive: not drawn" : "inactive",
+        width / 2,
+        height / 2,
+      );
     }
 
     {
