@@ -227,6 +227,19 @@ function handleThrowIfMissing<Key>(
   throw error;
 }
 
+// Origins whose HEAD responses the browser cannot read (status 0): a bucket
+// whose CORS configuration allows GET but not HEAD, as Google Cloud Storage
+// buckets often do.  Stat uses a one-byte GET for them from then on.
+const originsWithoutHead = new Set<string>();
+
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
 export async function stat<Key>(
   store: ReadableKvStore<Key>,
   key: Key,
@@ -235,20 +248,31 @@ export async function stat<Key>(
   fetchOkImpl: FetchOk = fetchOk,
 ): Promise<StatResponse | undefined> {
   // First try HEAD request.
-  try {
-    const response = await fetchOkImpl(url, {
-      method: "HEAD",
-      signal: options.signal,
-      progressListener: options.progressListener,
-    });
-    if (wasRedirectedToDirectoryListing(url, response)) return undefined;
-    return { totalSize: getBodyLength(response.headers) };
-  } catch (e) {
-    if (
-      e instanceof HttpError &&
-      (e.status === 405 /* method not allowed */ ||
-        e.status === 501) /* not implemented */
-    ) {
+  const origin = originOf(url);
+  if (!originsWithoutHead.has(origin)) {
+    try {
+      const response = await fetchOkImpl(url, {
+        method: "HEAD",
+        signal: options.signal,
+        progressListener: options.progressListener,
+      });
+      if (wasRedirectedToDirectoryListing(url, response)) return undefined;
+      return { totalSize: getBodyLength(response.headers) };
+    } catch (e) {
+      if (
+        e instanceof HttpError &&
+        e.status === 0 &&
+        !options.signal?.aborted
+      ) {
+        // A network or CORS failure: CORS that allows GET only makes HEAD
+        // responses unreadable.  The one-byte GET below tells which it was.
+        originsWithoutHead.add(origin);
+      } else if (
+        // 405: method not allowed; 501: not implemented.
+        !(e instanceof HttpError && (e.status === 405 || e.status === 501))
+      ) {
+        return handleThrowIfMissing(store, key, options, e);
+      }
       // HEAD may not be supported, use GET with one byte range instead.
       //
       // For example,
@@ -260,8 +284,6 @@ export async function stat<Key>(
       // some do anyway:
       //
       // https://github.com/google/neuroglancer/issues/704
-    } else {
-      return handleThrowIfMissing(store, key, options, e);
     }
   }
 
