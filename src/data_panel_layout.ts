@@ -253,22 +253,76 @@ function addDisplayDimensionsWidget(
   );
 }
 
+/**
+ * A switch shown beside "Sections" in every 3-D panel, for something an
+ * embedding application or plugin draws there (e.g. a volume rendering).
+ */
+export interface PerspectivePanelToggle {
+  label: string;
+  title?: string;
+  value: TrackableBoolean;
+}
+
+const perspectivePanelToggles: PerspectivePanelToggle[] = [];
+const perspectivePanelTogglesChanged = new NullarySignal();
+
+/** Adds a switch to the 3-D panels' controls; returns its removal. */
+export function addPerspectivePanelToggle(toggle: PerspectivePanelToggle) {
+  perspectivePanelToggles.push(toggle);
+  perspectivePanelTogglesChanged.dispatch();
+  return () => {
+    const index = perspectivePanelToggles.indexOf(toggle);
+    if (index === -1) return;
+    perspectivePanelToggles.splice(index, 1);
+    perspectivePanelTogglesChanged.dispatch();
+  };
+}
+
+function makeToggleLabel(
+  context: RefCounted,
+  text: string,
+  value: TrackableBoolean,
+  title?: string,
+) {
+  const checkbox = context.registerDisposer(
+    new TrackableBooleanCheckbox(value),
+  );
+  checkbox.element.className =
+    "perspective-panel-show-slice-views neuroglancer-noselect";
+  const label = document.createElement("label");
+  label.className = "perspective-panel-toggle neuroglancer-noselect";
+  if (title !== undefined) label.title = title;
+  label.appendChild(document.createTextNode(text));
+  label.appendChild(checkbox.element);
+  return label;
+}
+
 function addShowSliceViewsCheckbox(
   layout: DataDisplayLayout,
   panel: PerspectivePanel,
 ) {
   addPanelControl(layout, panel, (context) => {
-    const checkbox = context.registerDisposer(
-      new TrackableBooleanCheckbox(panel.viewer.showSliceViews),
-    );
-    checkbox.element.className =
+    const container = document.createElement("div");
+    container.className =
       "perspective-panel-show-slice-views neuroglancer-noselect";
-    const label = document.createElement("label");
-    label.className =
-      "perspective-panel-show-slice-views neuroglancer-noselect";
-    label.appendChild(document.createTextNode("Sections"));
-    label.appendChild(checkbox.element);
-    return label;
+    let extras = new RefCounted();
+    const update = () => {
+      extras.dispose();
+      extras = new RefCounted();
+      removeChildren(container);
+      for (const toggle of perspectivePanelToggles) {
+        container.appendChild(
+          makeToggleLabel(extras, toggle.label, toggle.value, toggle.title),
+        );
+      }
+      container.appendChild(
+        makeToggleLabel(extras, "Sections", panel.viewer.showSliceViews),
+      );
+    };
+    update();
+    context.registerDisposer(perspectivePanelTogglesChanged.add(update));
+    context.registerDisposer(() => extras.dispose());
+    return container;
   });
 }
 

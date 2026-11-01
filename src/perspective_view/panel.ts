@@ -148,6 +148,25 @@ void emit(vec4 color, highp uint pickId) {
 `,
 ];
 
+/**
+ * Where the sections may show in a 3-D panel, in its display coordinates,
+ * for one frame: e.g. only on the faces of a cut an embedding application
+ * draws through a volume.  Undefined shows them everywhere.
+ */
+export type PerspectiveSectionClip = (
+  renderContext: PerspectiveViewRenderContext,
+) =>
+  | { lower: Float32Array | number[]; upper: Float32Array | number[] }
+  | undefined;
+
+let perspectiveSectionClip: PerspectiveSectionClip | undefined;
+
+export function setPerspectiveSectionClip(
+  clip: PerspectiveSectionClip | undefined,
+) {
+  perspectiveSectionClip = clip;
+}
+
 export function perspectivePanelEmit(builder: ShaderBuilder) {
   builder.addOutputBuffer("vec4", "out_color", OffscreenTextures.COLOR);
   builder.addOutputBuffer("highp vec4", "out_z", OffscreenTextures.Z);
@@ -1424,6 +1443,7 @@ export class PerspectivePanel extends RenderedDataPanel {
     } = renderContext;
 
     const showSliceViews = this.viewer.showSliceViews.value;
+    const clipBox = perspectiveSectionClip?.(renderContext);
     for (const [sliceView, unconditional] of this.sliceViews) {
       if (!unconditional && !showSliceViews) {
         continue;
@@ -1447,6 +1467,10 @@ export class PerspectivePanel extends RenderedDataPanel {
       mat[0] = sliceViewWidth / 2.0;
       mat[5] = -sliceViewHeight / 2.0;
       mat4.multiply(mat, sliceViewInvViewMatrix, mat);
+      const clip =
+        clipBox === undefined
+          ? undefined
+          : { ...clipBox, quadToClipSpace: mat4.clone(mat) };
       mat4.multiply(mat, viewProjectionMat, mat);
       const backgroundColor = tempVec4;
       const crossSectionBackgroundColor =
@@ -1464,6 +1488,7 @@ export class PerspectivePanel extends RenderedDataPanel {
         0,
         1,
         1,
+        clip,
       );
     }
   }

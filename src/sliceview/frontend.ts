@@ -723,6 +723,20 @@ export class SliceViewChunk extends Chunk {
 /**
  * Helper for rendering a SliceView that has been pre-rendered to a texture.
  */
+/**
+ * A box a section is drawn within (elsewhere it is left out), and the map
+ * from the section's quad ([-1, 1]^2) to the box's coordinates.
+ */
+export interface SectionClip {
+  quadToClipSpace: mat4;
+  lower: Float32Array | number[];
+  upper: Float32Array | number[];
+}
+
+const kIdentityMat4 = mat4.create();
+const kNoClipLower = new Float32Array([-1e38, -1e38, -1e38]);
+const kNoClipUpper = new Float32Array([1e38, 1e38, 1e38]);
+
 export class SliceViewRenderHelper extends RefCounted {
   private copyVertexPositionsBuffer;
 
@@ -747,8 +761,17 @@ export class SliceViewRenderHelper extends RefCounted {
     builder.addUniform("vec4", "uBackgroundColor");
     builder.addUniform("mat4", "uProjectionMatrix");
     builder.addUniform("vec4", "uTextureCoordinateAdjustment");
+    // Where the section may show (see SectionClip), in the coordinates
+    // uQuadToClipSpace maps the quad to.
+    builder.addUniform("highp mat4", "uQuadToClipSpace");
+    builder.addUniform("highp vec3", "uClipLower");
+    builder.addUniform("highp vec3", "uClipUpper");
+    builder.addVarying("highp vec3", "vClipPosition");
     builder.require(emitter);
     const glsl_fragmentMainStart = `
+if (any(lessThan(vClipPosition, uClipLower)) || any(greaterThan(vClipPosition, uClipUpper))) {
+  discard;
+}
 vec4 sampledColor = texture(uSampler, vTexCoord);
 if (sampledColor.a == 0.0) {`;
     let glsl_fragmentMainEnd: string;
@@ -772,6 +795,7 @@ emit(sampledColor * uColorFactor, 0u);
     builder.setVertexMain(`
 vTexCoord = uTextureCoordinateAdjustment.xy + 0.5 * (aVertexPosition.xy + 1.0) * uTextureCoordinateAdjustment.zw;
 gl_Position = uProjectionMatrix * aVertexPosition;
+vClipPosition = (uQuadToClipSpace * aVertexPosition).xyz;
 `);
   }
 
@@ -813,6 +837,7 @@ gl_Position = uProjectionMatrix * aVertexPosition;
     yStart: number,
     xEnd: number,
     yEnd: number,
+    clip?: SectionClip,
   ) {
     const { gl, textureCoordinateAdjustment } = this;
     textureCoordinateAdjustment[0] = xStart;
@@ -842,6 +867,13 @@ gl_Position = uProjectionMatrix * aVertexPosition;
       shader.uniform("uTextureCoordinateAdjustment"),
       textureCoordinateAdjustment,
     );
+    gl.uniformMatrix4fv(
+      shader.uniform("uQuadToClipSpace"),
+      false,
+      clip?.quadToClipSpace ?? kIdentityMat4,
+    );
+    gl.uniform3fv(shader.uniform("uClipLower"), clip?.lower ?? kNoClipLower);
+    gl.uniform3fv(shader.uniform("uClipUpper"), clip?.upper ?? kNoClipUpper);
 
     const aVertexPosition = shader.attribute("aVertexPosition");
     this.copyVertexPositionsBuffer.bindToVertexAttrib(

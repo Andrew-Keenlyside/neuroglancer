@@ -48,7 +48,7 @@ function countControls(element: HTMLElement) {
       ".neuroglancer-display-dimensions-widget",
     ).length,
     sectionsCheckbox: element.querySelectorAll(
-      "label.perspective-panel-show-slice-views",
+      "div.perspective-panel-show-slice-views",
     ).length,
   };
 }
