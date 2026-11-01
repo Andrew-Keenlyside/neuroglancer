@@ -20,14 +20,18 @@ import type { FetchOk } from "#src/util/http_request.js";
 import type { StringMemoize } from "#src/util/memoize.js";
 import type { ProgressOptions } from "#src/util/progress_listener.js";
 
+// Google Cloud Storage's XML API answers with the first, without its
+// trailing slash; the comparison ignores one.
 const EXPECTED_XML_NAMESPACE_URIS = [
-  "http://doc.s3.amazonaws.com/2006-03-01/",
-  "http://s3.amazonaws.com/doc/2006-03-01/",
+  "http://doc.s3.amazonaws.com/2006-03-01",
+  "http://s3.amazonaws.com/doc/2006-03-01",
 ];
 
 function isValidListObjectsResponse(documentElement: Element): boolean {
+  const namespaceURI = documentElement.namespaceURI?.replace(/\/$/, "");
   return (
-    EXPECTED_XML_NAMESPACE_URIS.includes(documentElement.namespaceURI!) &&
+    namespaceURI !== undefined &&
+    EXPECTED_XML_NAMESPACE_URIS.includes(namespaceURI) &&
     documentElement.localName === "ListBucketResult"
   );
 }
