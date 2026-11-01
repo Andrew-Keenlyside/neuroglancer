@@ -72,6 +72,22 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string): Promise<Blob> {
   });
 }
 
+/**
+ * Draws on top of each screenshot, in the viewer canvas's pixel coordinates
+ * (the context is translated for the crop): e.g. labels an embedding
+ * application shows over the views as HTML, which the canvas does not hold.
+ */
+export type ScreenshotOverlay = (
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+) => void;
+
+let screenshotOverlay: ScreenshotOverlay | undefined;
+
+export function setScreenshotOverlay(overlay: ScreenshotOverlay | undefined) {
+  screenshotOverlay = overlay;
+}
+
 async function extractViewportScreenshot(
   viewer: Viewer,
   viewportBounds: PanelViewport,
@@ -92,6 +108,15 @@ async function extractViewportScreenshot(
   const ctx = screenshotCanvas.getContext("2d");
   if (!ctx) throw new Error("Failed to get canvas context");
   ctx.drawImage(img, 0, 0);
+  if (screenshotOverlay !== undefined) {
+    ctx.save();
+    ctx.translate(-viewportBounds.left, -viewportBounds.top);
+    try {
+      screenshotOverlay(ctx, viewer.display.canvas);
+    } finally {
+      ctx.restore();
+    }
+  }
 
   const croppedBlob = await canvasToBlob(screenshotCanvas, "image/png");
   return croppedBlob;
