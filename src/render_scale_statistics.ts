@@ -98,6 +98,35 @@ export class RenderScaleHistogram {
    */
   fakeChunkCount = 0;
 
+  /**
+   * Every level (spatial scale) declared by the layer or seen in a frame,
+   * kept across frames, so a widget can lay out all of them, not only those
+   * drawn now.
+   */
+  levels = new Set<number>();
+
+  /**
+   * The size of a screen pixel in spatial-scale units (spatial scale over
+   * render scale), from the last finite entry: where the target render
+   * scale falls among the levels.
+   */
+  pixelSize: number | undefined;
+
+  /** Sets the layer's levels (spatial scales), for example every scale of a multiscale volume. */
+  declareLevels(spatialScales: Iterable<number>) {
+    const levels = new Set(
+      Array.from(spatialScales).filter((s) => Number.isFinite(s)),
+    );
+    if (
+      levels.size === this.levels.size &&
+      Array.from(levels).every((s) => this.levels.has(s))
+    ) {
+      return;
+    }
+    this.levels = levels;
+    this.changed.dispatch();
+  }
+
   begin(frameNumber: number) {
     if (frameNumber !== this.frameNumber) {
       this.value.fill(0);
@@ -126,6 +155,15 @@ export class RenderScaleHistogram {
     renderOnly = false,
   ) {
     let { spatialScales, numHistogramRows, value } = this;
+    if (
+      !renderOnly &&
+      Number.isFinite(spatialScale) &&
+      Number.isFinite(renderScale) &&
+      renderScale > 0
+    ) {
+      this.levels.add(spatialScale);
+      this.pixelSize = spatialScale / renderScale;
+    }
     let spatialScaleIndex = spatialScales.get(spatialScale);
     if (spatialScaleIndex === undefined) {
       spatialScaleIndex = spatialScales.size;
@@ -158,4 +196,10 @@ export class RenderScaleHistogram {
       this.fakeChunkCount = this.fakeChunkCount + notPresentCount;
     }
   }
+}
+
+/** The middle of a voxel's three sizes: the spatial scale the slice views give a level. */
+export function medianVoxelSize(size: ArrayLike<number>): number {
+  const [a, b, c] = [size[0], size[1], size[2]];
+  return Math.max(Math.min(a, b), Math.min(Math.max(a, b), c));
 }

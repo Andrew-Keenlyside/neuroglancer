@@ -139,6 +139,12 @@ export class RenderScaleWidget extends RefCounted {
     );
 
     const getTargetValue = (event: MouseEvent) => {
+      const axis = this.resolutionAxis;
+      if (this.byResolution && axis !== undefined) {
+        const log =
+          axis.lo + (event.offsetX / canvas.width) * (axis.hi - axis.lo);
+        return 2 ** log / axis.pixelSize;
+      }
       const [start, end] = this.binWindow;
       const position = start + (event.offsetX / canvas.width) * (end - start);
       return getRenderScaleFromHistogramOffset(
@@ -217,7 +223,164 @@ export class RenderScaleWidget extends RefCounted {
     if (!inside || tooWide) this.binWindow = wanted;
   }
 
+  /**
+   * Draws the levels by resolution (see `byResolution`); false when there
+   * are no levels with a finite spatial scale or no pixel size yet, for the
+   * render-scale layout to draw instead.
+   */
+  private updateViewByResolution(): boolean {
+    const { ctx, canvas, histogram } = this;
+    const { numBins, spatialScales, value: data, pixelSize } = histogram;
+    const visible = histogram.visibility.visible;
+    // Present and not-present chunks per level, this frame.
+    const counts = new Map<number, [number, number]>();
+    if (visible) {
+      for (const [scale, row] of spatialScales) {
+        let present = 0;
+        let notPresent = 0;
+        for (let bin = 0; bin < numBins; ++bin) {
+          present += data[row * numBins * 2 + bin];
+          notPresent += data[row * numBins * 2 + numBins + bin];
+        }
+        counts.set(scale, [present, notPresent]);
+      }
+    }
+    const levels = Array.from(histogram.levels).sort((a, b) => a - b);
+    if (levels.length === 0 || pixelSize === undefined) return false;
+
+    const width = (canvas.width = canvas.offsetWidth);
+    const height = (canvas.height = canvas.offsetHeight);
+    ctx.clearRect(0, 0, width, height);
+    const targetValue = this.target.value;
+    const hoverValue = this.hoverTarget.value;
+
+    // The axis: the levels' range, with half a level's step each side.
+    const logs = levels.map((s) => Math.log2(s));
+    const step =
+      levels.length > 1
+        ? (logs[logs.length - 1] - logs[0]) / (levels.length - 1)
+        : 1;
+    const lo = logs[0] - Math.max(step, 0.5) / 2;
+    const hi = logs[logs.length - 1] + Math.max(step, 0.5) / 2;
+    this.resolutionAxis = { lo, hi, pixelSize };
+    const toX = (log: number) => ((log - lo) / (hi - lo)) * width;
+    const barWidth = Math.max(3, Math.min(24, (width / levels.length) * 0.6));
+
+    let maxCount = 1;
+    let totalPresent = 0;
+    let totalNotPresent = 0;
+    for (const [scale, [present, notPresent]] of counts) {
+      if (!Number.isFinite(scale)) continue;
+      maxCount = Math.max(maxCount, present + notPresent);
+      totalPresent += present;
+      totalNotPresent += notPresent;
+    }
+    const yScale = (height - 2) / Math.log(1 + maxCount);
+
+    // The level under the mouse.
+    let hoverLevel: number | undefined;
+    if (hoverValue !== undefined) {
+      const x = toX(Math.log2(hoverValue[0] * pixelSize));
+      let best = barWidth;
+      for (let i = 0; i < levels.length; ++i) {
+        const d = Math.abs(toX(logs[i]) - x);
+        if (d <= best) {
+          best = d;
+          hoverLevel = levels[i];
+        }
+      }
+    }
+
+    const tempColor = vec3.create();
+    for (let i = 0; i < levels.length; ++i) {
+      const level = levels[i];
+      const [present, notPresent] = counts.get(level) ?? [0, 0];
+      const total = present + notPresent;
+      const x = Math.round(toX(logs[i]) - barWidth / 2);
+      if (total === 0) {
+        // A level not drawn now: a stub, so every level shows.
+        ctx.fillStyle = level === hoverLevel ? "#888" : "#555";
+        ctx.fillRect(x, height - 3, Math.round(barWidth), 3);
+        continue;
+      }
+      const hue = (((Math.log2(level) * 0.1) % 1) + 1) % 1;
+      const saturation = level === hoverLevel ? 0.5 : 1;
+      const top = height - Math.log(1 + total) * yScale;
+      const split = top + (notPresent / total) * (height - top);
+      hsvToRgb(tempColor, hue, saturation, 0.5);
+      ctx.fillStyle = serializeColor(tempColor);
+      ctx.fillRect(
+        x,
+        Math.round(top),
+        Math.round(barWidth),
+        Math.round(split - top),
+      );
+      hsvToRgb(tempColor, hue, saturation, 1);
+      ctx.fillStyle = serializeColor(tempColor);
+      ctx.fillRect(
+        x,
+        Math.round(split),
+        Math.round(barWidth),
+        height - Math.round(split),
+      );
+    }
+
+    const line = (value: number, colour: string) => {
+      const x = Math.min(
+        width - 1,
+        Math.max(0, toX(Math.log2(value * pixelSize))),
+      );
+      ctx.fillStyle = colour;
+      ctx.fillRect(Math.floor(x), 0, 1, height);
+    };
+    line(targetValue, "#fff");
+    if (hoverValue !== undefined) line(hoverValue[0], "#888");
+
+    if (!visible) {
+      ctx.fillStyle = "rgba(255, 255, 255, 0.55)";
+      ctx.font = "11px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("not drawn", width / 2, height / 2);
+    }
+
+    const shown = hoverValue === undefined ? targetValue : hoverValue[0];
+    this.legendRenderScale.textContent = `${formatPixelNumber(shown)} ${this.unitOfTarget}`;
+    const spatial = hoverLevel ?? shown * pixelSize;
+    this.legendSpatialScale.textContent = formatScaleWithUnitAsString(
+      spatial,
+      "m",
+      {
+        precision: 2,
+        elide1: false,
+      },
+    );
+    const [present, notPresent] =
+      hoverLevel !== undefined
+        ? (counts.get(hoverLevel) ?? [0, 0])
+        : [totalPresent, totalNotPresent - histogram.fakeChunkCount];
+    this.legendChunks.textContent = `${present}/${present + notPresent}`;
+    return true;
+  }
+
+  /**
+   * Whether the levels are laid out by resolution: each level (spatial
+   * scale) keeps its place across the width however the view zooms, every
+   * level is shown (those not drawn now as stubs), and the target (the
+   * resolution the view asks for: the target render scale times the size of
+   * a screen pixel) is the line that moves.  Otherwise, as Neuroglancer
+   * draws it, by render scale.
+   */
+  protected byResolution = true;
+
+  /** The resolution layout's axis: log2 spatial scale at the left and right edges, and the pixel size. */
+  private resolutionAxis:
+    | { lo: number; hi: number; pixelSize: number }
+    | undefined;
+
   updateView() {
+    if (this.byResolution && this.updateViewByResolution()) return;
+    this.resolutionAxis = undefined;
     const { ctx } = this;
     const { canvas } = this;
     const width = (canvas.width = canvas.offsetWidth);
@@ -469,6 +632,7 @@ export class RenderScaleWidget extends RefCounted {
 
 export class VolumeRenderingRenderScaleWidget extends RenderScaleWidget {
   protected unitOfTarget = "samples";
+  protected byResolution = false;
 
   getWheelMoveValue(event: WheelEvent) {
     return -event.deltaY;

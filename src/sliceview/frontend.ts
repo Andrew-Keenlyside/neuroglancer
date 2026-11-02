@@ -39,6 +39,7 @@ import {
   getChunkTransformParameters,
   getLayerDisplayDimensionMapping,
 } from "#src/render_coordinate_transform.js";
+import { medianVoxelSize } from "#src/render_scale_statistics.js";
 import {
   DerivedProjectionParameters,
   SharedProjectionParameters,
@@ -597,6 +598,12 @@ export class SliceView extends Base {
         layer.addSource(tsource.source, tsource.chunkTransform);
       }
     }
+    // Every level, so the resolution histogram shows those not drawn now too.
+    layer.renderScaleHistogram?.declareLevels(
+      transformedSources.flatMap((scales) =>
+        scales.map((tsource) => medianVoxelSize(tsource.effectiveVoxelSize)),
+      ),
+    );
     return transformedSources;
   }
 }
