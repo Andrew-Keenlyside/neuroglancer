@@ -113,13 +113,29 @@ export interface DataDisplayLayout extends RefCounted {
   container: DataPanelLayoutContainer;
 }
 
-type NamedAxes = "xy" | "xz" | "yz";
+export type NamedAxes = "xy" | "xz" | "yz";
 
 const AXES_RELATIVE_ORIENTATION = new Map<NamedAxes, quat | undefined>([
   ["xy", undefined],
   ["xz", quat.rotateX(quat.create(), quat.create(), Math.PI / 2)],
   ["yz", quat.rotateY(quat.create(), quat.create(), Math.PI / 2)],
 ]);
+
+/**
+ * Sets the fixed rotation of a named cross-section panel ("xy", "xz", "yz")
+ * relative to the shared cross-section orientation (undefined for none).
+ * An application can then show the panels in another convention, such as
+ * the axial, coronal and sagittal views of neuroimaging viewers.  It
+ * applies to panels made afterwards: re-make the layout to see it.
+ */
+export function setNamedPanelOrientation(axes: NamedAxes, peerToSelf: quat | undefined) {
+  AXES_RELATIVE_ORIENTATION.set(axes, peerToSelf === undefined ? undefined : quat.clone(peerToSelf));
+}
+
+/** The fixed rotation of a named cross-section panel (see setNamedPanelOrientation). */
+export function getNamedPanelOrientation(axes: NamedAxes): quat | undefined {
+  return AXES_RELATIVE_ORIENTATION.get(axes);
+}
 
 const oneSquareSymbol = "◻";
 
