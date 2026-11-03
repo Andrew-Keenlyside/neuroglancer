@@ -130,6 +130,17 @@ class RenderHelper extends RefCounted {
     builder.addUniform("highp vec4", "uColor");
     builder.addUniform("highp mat4", "uProjection");
     builder.addUniform("highp uint", "uPickID");
+    // Colour `rgb` at opacity `alpha`, as the panel composites it: a
+    // cross-section blends with SRC_ALPHA, ONE_MINUS_SRC_ALPHA (straight
+    // alpha); the 3-d view's transparent pass (weighted blended OIT) takes
+    // colour premultiplied by alpha.  Premultiplied colour in a cross-section
+    // is multiplied by alpha twice and darkens before it fades; straight
+    // colour in 3-d comes out divided by alpha.
+    builder.addFragmentCode(`
+void emitSkeletonColor(vec3 rgb, float alpha) {
+  emit(vec4(${this.targetIsSliceView ? "rgb" : "rgb * alpha"}, alpha), uPickID);
+}
+`);
   }
 
   edgeShaderGetter;
@@ -183,14 +194,13 @@ vec4 segmentColor() {
   return uColor;
 }
 void emitRGBA(vec4 color) {
-  color.a *= uColor.a;
-  emit(vec4(color.rgb * color.a, color.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), uPickID);
+  emitSkeletonColor(color.rgb, color.a * uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()});
 }
 void emitRGB(vec3 color) {
-  emit(vec4(color * uColor.a, uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), uPickID);
+  emitRGBA(vec4(color, 1.0));
 }
 void emitDefault() {
-  emit(vec4(uColor.rgb, uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), uPickID);
+  emitRGB(uColor.rgb);
 }
 `);
           builder.addFragmentCode(glsl_COLORMAPS);
@@ -254,17 +264,14 @@ vec4 segmentColor() {
 }
 void emitRGBA(vec4 color) {
   color.a *= uColor.a;
-  color.rgb *= color.a;
-  vec4 borderColor = color;
-  vec4 circleColor = getCircleColor(color, borderColor);
-  emit(circleColor, uPickID);
+  vec4 circleColor = getCircleColor(color, color);
+  emitSkeletonColor(circleColor.rgb, circleColor.a);
 }
 void emitRGB(vec3 color) {
   emitRGBA(vec4(color, 1.0));
 }
 void emitDefault() {
-  vec4 circleColor = getCircleColor(uColor, uColor);
-  emit(circleColor, uPickID);
+  emitRGB(uColor.rgb);
 }
 `);
           builder.addFragmentCode(glsl_COLORMAPS);
@@ -351,6 +358,7 @@ void emitDefault() {
     nodeShader: ShaderProgram,
     skeletonChunk: SkeletonChunk,
     projectionParameters: { width: number; height: number },
+    drawNodes = true,
   ) {
     const { vertexAttributes } = this;
     const numAttributes = vertexAttributes.length;
@@ -386,10 +394,11 @@ void emitDefault() {
       gl.disableVertexAttribArray(aVertexIndex);
     }
 
-    // Draw nodes - this is performed also in line render mode
-    // so that there are no visible gaps between the edges
-    // as the point size is set to the line width
-    {
+    // Draw nodes.  In line render mode too where nothing is blended, so
+    // that there are no visible gaps between the edges as the point size is
+    // set to the line width; where colour is blended a node would add its
+    // colour over the edges' a second time and show as a dot.
+    if (drawNodes) {
       nodeShader.bind();
       initializeCircleShader(nodeShader, projectionParameters, {
         featherWidthInPixels: this.targetIsSliceView ? 1.0 : 0.0,
@@ -573,10 +582,17 @@ export class SkeletonLayer extends RefCounted {
     );
     if (modelMatrix === undefined) return;
     let pointDiameter: number;
+    let drawNodes: boolean;
     if (renderOptions.mode.value === SkeletonRenderMode.LINES_AND_POINTS) {
       pointDiameter = Math.max(5, lineWidth * 2);
+      drawNodes = true;
     } else {
       pointDiameter = lineWidth;
+      // Nodes fill the gaps between edges only where nothing is blended: a
+      // cross-section always blends, the 3-d view where transparent.
+      drawNodes =
+        !renderHelper.targetIsSliceView &&
+        !(layer as { isTransparent?: boolean }).isTransparent;
     }
 
     const edgeShaderResult = renderHelper.edgeShaderGetter(
@@ -652,6 +668,7 @@ export class SkeletonLayer extends RefCounted {
           nodeShader,
           skeleton,
           renderContext.projectionParameters,
+          drawNodes,
         );
       },
     );
